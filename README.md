@@ -1,152 +1,152 @@
 ![ISC Logo](http://iscracingteam.com/wp-content/uploads/2022/03/Picture5.jpg)
 
-# IFS08 - DV_AMI
+# IFS08 - DV_PIPELINE
 
-Firmware embebido para el **Autonomous Mission Indicator (AMI)** del IFS08, desarrollado en STM32H7 con micro-ROS.
+Embedded firmware for the **Driverless Pipeline** of the IFS08.
 
 ---
 
-## Primeros pasos
+## Getting started
 
-1. Crea una cuenta en GitHub si aún no tienes una.
-2. Descarga e instala [GitHub Desktop](https://desktop.github.com/) (básico) o [Git CLI](https://git-scm.com/book/en/v2/Getting-Started-Installing-Git) (avanzado).
+1. Create a GitHub account if you don't have one yet.
+2. Download and install [GitHub Desktop](https://desktop.github.com/) (beginner) or [Git CLI](https://git-scm.com/book/en/v2/Getting-Started-Installing-Git) (advanced).
 
-   - Si es la primera vez que utilizas GitHub Desktop, asegúrate de leer el [Manual del usuario](https://help.github.com/desktop/guides/).
-   - Si estás usando Git por primera vez, empieza con un tutorial. Hay muchos disponibles en línea:
-     - [Tutorial de Git](https://git-scm.com/docs/gittutorial)
+   - If this is your first time using GitHub Desktop, make sure to read the [User Manual](https://help.github.com/desktop/guides/).
+   - If this is your first time using Git, start with a tutorial. There are many available online:
+     - [Git Tutorial](https://git-scm.com/docs/gittutorial)
      - [Atlassian Git Tutorial](https://www.atlassian.com/git/tutorials/)
-   - Guarda una copia de [GitHub's Git Cheat Sheet](https://services.github.com/kit/downloads/github-git-cheat-sheet.pdf) como referencia.
+   - Keep a copy of [GitHub's Git Cheat Sheet](https://services.github.com/kit/downloads/github-git-cheat-sheet.pdf) handy as a reference.
 
-3. Clona este repositorio en tu ordenador:
-   - SSH: `git@github.com:isc-fs/IFS08-DV_AMI.git`
-   - HTTPS: `https://github.com/isc-fs/IFS08-DV_AMI.git`
+3. Clone this repository to your machine:
+   - SSH: `git@github.com:isc-fs/IFS08-DV_PIPELINE.git`
+   - HTTPS: `https://github.com/isc-fs/IFS08-DV_PIPELINE.git`
 
 ---
 
-## Cómo trabajamos con este repositorio
+## How we work with this repository
 
-### Ramas principales
+### Main branches
 
-El repositorio tiene dos ramas permanentes:
+The repository has two permanent branches:
 
-**`main`** es la rama de producción. Contiene únicamente código validado que puede flashearse en el coche. Nunca trabajes directamente sobre ella.
+**`main`** is the production branch. It contains only validated code that can be flashed onto the car. Never work directly on it.
 
-**`dev`** es la rama de desarrollo. Es el punto de integración donde converge el trabajo de todos. Tampoco trabajes directamente sobre ella — todos los cambios llegan a través de una rama de trabajo.
+**`dev`** is the development branch. It is the integration point where everyone's work comes together. Never work directly on it either — all changes arrive through a feature branch.
 
 ```
-main  ──────────────────●──────────────────────●──▶  (solo releases validados)
+main  ──────────────────●──────────────────────●──▶  (validated releases only)
                         ↑                      ↑
-dev   ──────●───●───●───●───●───●───●───●───●──●──▶  (integración continua)
+dev   ──────●───●───●───●───●───●───●───●───●──●──▶  (continuous integration)
             ↑   ↑       ↑   ↑   ↑       ↑   ↑
           feat/1 fix/1 feat/2 fix/2   feat/3 fix/3
 ```
 
-### Ramas de trabajo
+### Feature branches
 
-Todo el trabajo — ya sea una nueva funcionalidad o una corrección de errores — se realiza en una **rama de trabajo** creada desde `dev`. Cuando el trabajo está listo, se abre un Pull Request hacia `dev`, se revisa, se fusiona y la rama se elimina.
+All work — whether a new feature or a bug fix — is done on a **feature branch** created from `dev`. When the work is ready, a Pull Request is opened toward `dev`, reviewed, merged, and the branch is deleted.
 
-Hay dos tipos de rama, cada uno con su propio contador numérico independiente:
+There are two branch types, each with its own independent numeric counter:
 
 ```
-feat/<n>   →  nueva funcionalidad  (feat/1, feat/2, feat/3 ...)
-fix/<n>    →  corrección de error  (fix/1,  fix/2,  fix/3  ...)
+feat/<n>   →  new functionality  (feat/1, feat/2, feat/3 ...)
+fix/<n>    →  bug fix            (fix/1,  fix/2,  fix/3  ...)
 ```
 
-Los contadores de `feat` y `fix` son independientes: `feat/2` y `fix/2` pueden existir al mismo tiempo sin conflicto.
+The `feat` and `fix` counters are independent: `feat/2` and `fix/2` can exist at the same time with no conflict.
 
-### Seguimiento del historial de ramas
+### Tracking branch history
 
-Las ramas se eliminan tras fusionarse para mantener el repositorio limpio. El historial de cada rama se conserva en **GitHub Issues**.
+Feature branches are deleted after merging to keep the repository clean. The history of each branch is preserved in **GitHub Issues**.
 
-Cada rama tiene un issue asociado. El issue lleva una **etiqueta** (`feat` o `fix`) y su título incluye el número de la rama, por ejemplo: `[feat/3] Añadir broadcast CAN para el estado de misión`. Cuando la rama se fusiona y elimina, el issue se cierra — convirtiéndose en un registro permanente de todo el trabajo realizado.
+Every branch has one associated issue. The issue carries a **label** (`feat` or `fix`) and its title includes the branch number, for example: `[feat/3] Add CAN broadcast for mission state`. When the branch is merged and deleted, the issue is closed — becoming a permanent record of all the work done.
 
-Para ver qué ramas están activas: filtra los issues por etiqueta y estado `open`.
-Para consultar el historial completo: filtra por etiqueta y estado `closed`.
-El número para la siguiente rama de cada tipo es el último issue cerrado de ese tipo más uno.
+To see which branches are currently active: filter issues by label and status `open`.
+To browse the full history: filter by label and status `closed`.
+The number for the next branch of each type is the last closed issue of that type plus one.
 
-> Ejemplo: si el último issue cerrado con etiqueta `feat` es `[feat/4] ...`, la siguiente rama de funcionalidad será `feat/5`.
+> Example: if the last closed issue with label `feat` is `[feat/4] ...`, the next feature branch will be `feat/5`.
 
 ---
 
-## Automatización
+## Automation
 
-El repositorio incluye un workflow de GitHub Actions que gestiona los issues de seguimiento de forma automática. No es necesario configurar nada — funciona para todos los desarrolladores desde el momento en que crean una rama.
+The repository includes a GitHub Actions workflow that manages tracking issues automatically. No setup is required — it works for every developer as soon as they create a branch.
 
-### Creación automática del issue
+### Automatic issue creation
 
-Cuando se publica una rama `feat/*` o `fix/*` en GitHub, el workflow abre automáticamente un issue con:
+When a `feat/*` or `fix/*` branch is pushed to GitHub, the workflow automatically opens an issue with:
 
-- El título `[feat/N]` o `[fix/N]` correspondiente
-- La etiqueta correcta (`feat` o `fix`)
-- Una plantilla con secciones para describir el trabajo y añadir notas
-- El nombre del desarrollador que creó la rama
+- The corresponding `[feat/N]` or `[fix/N]` title
+- The correct label (`feat` or `fix`)
+- A template with sections for describing the work and adding notes
+- The name of the developer who created the branch
 
-### Aviso de número incorrecto
+### Wrong number warning
 
-Si el número de la rama no es el siguiente esperado (ya sea demasiado bajo o demasiado alto), el issue mostrará un aviso indicando cuál es el número correcto y pidiendo que se recree la rama con el nombre adecuado.
+If the branch number is not the next expected one (either too low or too high), the issue will display a warning indicating the correct number and asking the developer to delete and recreate the branch with the right name.
 
-### Descripción automática desde el primer commit
+### Auto-fill description from first commit
 
-Cuando el desarrollador realiza su primer commit y lo publica, el workflow actualiza automáticamente la sección *"¿Qué hace esta rama?"* del issue con el mensaje de ese commit.
+When the developer makes their first commit and pushes it, the workflow automatically updates the *"What does this branch do?"* section of the issue with that commit message.
 
-- Si el desarrollador edita el issue manualmente antes de hacer el primer push, el workflow no sobreescribirá la descripción.
-- Solo se actualiza una vez — los commits posteriores no modifican el issue.
+- If the developer manually edits the issue before pushing their first commit, the workflow will not overwrite the description.
+- The description is only updated once — subsequent commits do not modify the issue.
 
 ---
 
-## Flujo de trabajo paso a paso
+## Step-by-step workflow
 
-### 1. Crear la rama
+### 1. Create the branch
 
 ```bash
-# Asegúrate de estar en una dev actualizada
+# Make sure you are on an up-to-date dev
 git checkout dev
 git pull origin dev
 
-# Crea tu rama usando el siguiente número disponible para su tipo
-# (último issue cerrado de ese tipo + 1)
-git checkout -b feat/5    # o fix/3, según el contador de ese tipo
+# Create your branch using the next available number for its type
+# (last closed issue of that type + 1)
+git checkout -b feat/5    # or fix/3, depending on that type's counter
 ```
 
-> Para saber qué número usar: ve a **Issues → filtra por etiqueta `feat` o `fix` → ordena por más reciente** y lee el último número.
+> To find the right number: go to **Issues → filter by label `feat` or `fix` → sort by newest** and read the last number.
 
-### 2. Publicar la rama
+### 2. Push the branch
 
 ```bash
 git push origin feat/5
 ```
 
-El issue de seguimiento se abrirá automáticamente en GitHub en unos segundos.
+The tracking issue will be opened automatically on GitHub within seconds.
 
-### 3. Trabajar y hacer commits
+### 3. Work and commit
 
 ```bash
-# Realiza tus cambios y haz commit con un mensaje descriptivo
+# Make your changes and commit with a clear, descriptive message
 git add .
-git commit -m "descripción clara de lo que hace este commit"
+git commit -m "short description of what this commit does"
 
-# Publica los cambios
+# Push the changes
 git push origin feat/5
 ```
 
-El mensaje de tu **primer commit** se usará automáticamente para rellenar la descripción del issue.
+The message of your **first commit** will be used to automatically fill in the issue description.
 
-### 4. Abrir un Pull Request
+### 4. Open a Pull Request
 
-Cuando el trabajo esté listo, abre un Pull Request en GitHub desde tu rama hacia `dev`. En la descripción del PR escribe `Closes #<número-de-issue>` para que el issue se cierre automáticamente al fusionarse.
+When the work is ready, open a Pull Request on GitHub from your branch toward `dev`. In the PR description write `Closes #<issue-number>` so the issue closes automatically when the PR is merged.
 
-Antes de solicitar la revisión, comprueba que:
-- El código compila sin errores ni avisos
-- Has probado el cambio en el banco si corresponde
-- El PR apunta a `dev`, no a `main`
+Before requesting a review, check that:
+- The code compiles with no errors or warnings
+- You have tested the change on the bench if applicable
+- The PR targets `dev`, not `main`
 
-### 5. Revisión y fusión
+### 5. Review and merge
 
-Otro miembro del equipo revisará el PR. Una vez aprobado, se fusiona en `dev` y la rama se elimina. El issue quedará cerrado como registro permanente.
+Another team member will review the PR. Once approved, it is merged into `dev` and the branch is deleted. The issue will be closed as a permanent record.
 
-### 6. Fusión en main
+### 6. Merging into main
 
-Cuando `dev` tiene un conjunto de cambios validados listos para el coche, un responsable abre un Pull Request desde `dev` hacia `main`. Esto solo ocurre tras la validación completa del firmware (HIL/banco).
+When `dev` holds a set of validated changes that are ready for the car, a responsible team member opens a Pull Request from `dev` into `main`. This only happens after full firmware validation (HIL/bench).
 
 ---
 
