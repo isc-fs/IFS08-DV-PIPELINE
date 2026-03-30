@@ -10,7 +10,6 @@ on:
 jobs:
   open-issue:
     runs-on: ubuntu-latest
-    # Only fire on the first push (branch creation), not subsequent pushes
     if: github.event.created == true
     permissions:
       issues: write
@@ -20,11 +19,8 @@ jobs:
         id: parse
         run: |
           BRANCH="${{ github.ref_name }}"
-
-          # Extract type (feat or fix) and number
           TYPE=$(echo "$BRANCH" | cut -d'/' -f1)
           NUMBER=$(echo "$BRANCH" | cut -d'/' -f2)
-
           echo "branch=$BRANCH"   >> "$GITHUB_OUTPUT"
           echo "type=$TYPE"       >> "$GITHUB_OUTPUT"
           echo "number=$NUMBER"   >> "$GITHUB_OUTPUT"
@@ -37,7 +33,6 @@ jobs:
             const type   = '${{ steps.parse.outputs.type }}';
             const number = parseInt('${{ steps.parse.outputs.number }}', 10);
 
-            // Ensure the label exists (creates it if missing)
             const labelColor = type === 'feat' ? '0075ca' : 'e4e669';
             try {
               await github.rest.issues.getLabel({
@@ -54,7 +49,6 @@ jobs:
               });
             }
 
-            // Find the highest branch number already used for this type
             const issues = await github.paginate(github.rest.issues.listForRepo, {
               owner: context.repo.owner,
               repo:  context.repo.repo,
@@ -70,7 +64,6 @@ jobs:
             }
             const nextCorrect = maxNumber + 1;
 
-            // Build warning block if the branch number is wrong
             let warningBlock = '';
             if (number !== nextCorrect) {
               warningBlock = [
@@ -82,7 +75,6 @@ jobs:
               ].join('\n');
             }
 
-            // Open the tracking issue
             const { data: issue } = await github.rest.issues.create({
               owner:  context.repo.owner,
               repo:   context.repo.repo,
@@ -112,9 +104,23 @@ jobs:
 
             console.log(`Issue #${issue.number} created: ${issue.html_url}`);
 
+            // If the initial push already included commits, fill the description immediately
+            const commits = context.payload.commits;
+            if (commits && commits.length > 0) {
+              const firstMessage = commits[0].message.trim();
+              const placeholder = '<!-- Fill in a short description of the goal of this branch -->';
+              const updatedBody = issue.body.replace(placeholder, firstMessage);
+              await github.rest.issues.update({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: issue.number,
+                body:         updatedBody,
+              });
+              console.log(`Issue description filled from initial push: "${firstMessage}"`);
+            }
+
   update-issue-description:
     runs-on: ubuntu-latest
-    # Only fire on subsequent pushes (not branch creation), and only when there are commits
     if: github.event.created == false
     permissions:
       issues: write
@@ -143,7 +149,6 @@ jobs:
 
             const firstMessage = commits[0].message.trim();
 
-            // Find the open issue for this branch
             const { data: issues } = await github.rest.issues.listForRepo({
               owner:    context.repo.owner,
               repo:     context.repo.repo,
@@ -158,7 +163,6 @@ jobs:
               return;
             }
 
-            // Only update if the developer has not already filled in the description
             const placeholder = '<!-- Fill in a short description of the goal of this branch -->';
             if (!branchIssue.body.includes(placeholder)) {
               console.log('Description already filled in, skipping.');
