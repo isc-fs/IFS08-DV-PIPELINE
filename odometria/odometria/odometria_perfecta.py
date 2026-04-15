@@ -9,10 +9,6 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
-from sensor_msgs.msg import Image
-from sensor_msgs.msg import CameraInfo
-from cv_bridge import CvBridge
-
 from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 

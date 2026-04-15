@@ -69,11 +69,11 @@ class Cone_Detection(Node):
         self.n_conos = 0
 
     def listener_callback(self, msg):
-        ###Wiki de FSDS
-        points = np.array(
-            np.frombuffer(msg.data, dtype=np.float32), dtype=np.dtype("f4")
-        )
-        point_cloud = np.reshape(points, (int(points.shape[0] / 3), 3))
+        # Parse PointCloud2 using point_step to handle any field layout (xyz, xyz+padding, xyzi, etc.)
+        floats_per_point = msg.point_step // 4  # bytes per point / 4 bytes per float32
+        num_points = msg.width * msg.height
+        raw = np.frombuffer(msg.data, dtype=np.float32).reshape(num_points, floats_per_point)
+        point_cloud = raw[:, :3]  # take only x, y, z
 
         conos = []
         try:  ###A veces da error de division por cero. El try: es para evitar que crashe
