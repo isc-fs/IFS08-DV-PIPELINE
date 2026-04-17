@@ -218,7 +218,7 @@ class Control(Node):
         if velocity_command_value > 0:
             command_msg.throttle = velocity_command_value
         else:
-            command_msg.brake = velocity_command_value
+            command_msg.brake = -velocity_command_value
 
         # Normalise steering to the expected command range and publish the command
         self.steering = -limited_steering_angle
