@@ -96,24 +96,30 @@ class Plan_Path(Node):
 
     def listener_callback(self, msg):
         self.mapa = msg
-        # global_cones, car_position, car_direction = load_data()
-        # self.path_planner = PathPlanner(MissionTypes.trackdrive)
         global_cones = [numpy.zeros((0, 2)) for _ in range(5)]
-        l = []
+        left_cones = []   # blue (ConeTypes.LEFT)
+        right_cones = []  # yellow (ConeTypes.RIGHT)
+        unknown_cones = []
+
         for marker in self.mapa.markers:
+            x = float(marker.pose.position.x)
+            y = float(marker.pose.position.y)
+            r = marker.color.r
+            g = marker.color.g
+            b = marker.color.b
+            if b > 0.8 and r < 0.2 and g < 0.2:
+                left_cones.append((x, y))
+            elif r > 0.8 and g > 0.8 and b < 0.2:
+                right_cones.append((x, y))
+            else:
+                unknown_cones.append((x, y))
 
-            # self.get_logger().info('jajaj'+str(marker.pose.position.x)+'ajaj'+str(marker.pose.position.y)+str(type(marker.pose.position.x)))
-            l.append(
-                (
-                    float(marker.pose.position.x) + 0.0,
-                    float(marker.pose.position.y) + 0.0,
-                )
-            )
-            pass
-
-        # print(numpy.array(l))
-
-        global_cones[ConeTypes.UNKNOWN] = numpy.array(l)
+        if left_cones:
+            global_cones[ConeTypes.LEFT] = numpy.array(left_cones)
+        if right_cones:
+            global_cones[ConeTypes.RIGHT] = numpy.array(right_cones)
+        if unknown_cones:
+            global_cones[ConeTypes.UNKNOWN] = numpy.array(unknown_cones)
         # print(global_cones)
 
         # global_cones is a sequence that contains 5 numpy arrays with shape (N, 2),
