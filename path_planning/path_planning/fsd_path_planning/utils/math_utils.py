@@ -11,6 +11,18 @@ from typing import Tuple, TypeVar, cast
 
 import numpy as np
 from numba import jit
+from numba.core.caching import IndexDataCacheFile as _IndexDataCacheFile
+
+# Patch numba's cache save to silently drop unpicklable types (numba 0.65 + Python 3.10
+# incompatibility: Optional/tuple return types produce generator objects that can't be
+# pickled, which propagates as a TypeError and aborts the compilation).
+_orig_cache_save = _IndexDataCacheFile.save
+def _patched_cache_save(self, *args, **kwargs):
+    try:
+        return _orig_cache_save(self, *args, **kwargs)
+    except TypeError:
+        pass
+_IndexDataCacheFile.save = _patched_cache_save
 
 T = TypeVar("T")
 
@@ -641,6 +653,9 @@ def circle_fit(coords: np.ndarray, max_iter: int = 99) -> np.ndarray:
         x, y = x_new, y_new
 
     det = x * x - x * Mz + Cov_xy
+    if abs(det) < 1e-10:
+        # Collinear points — straight path, return very large radius
+        return np.array([0.0, 0.0, 1e6])
     X_center = (Mxz * (Myy - x) - Myz * Mxy) / det / 2.0
     Y_center = (Myz * (Mxx - x) - Mxz * Mxy) / det / 2.0
 
