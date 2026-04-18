@@ -45,32 +45,24 @@ def final_cone_result_rt(data, model=DBSCAN):
 
     if len(data) == 0:
         return []
-    print(f"[DEBUG] Input points: {len(data)}, Z range: {data[:,2].min():.3f} to {data[:,2].max():.3f}")
     labels, clean_data, def_coefs = clustering_separation_rt(data, model)
     if len(labels) == 0:
-        print(f"[DEBUG] No outliers after RANSAC (all points classified as ground)")
         return []
-    print(f"[DEBUG] After RANSAC: {len(clean_data)} outlier points, plane coefs: {def_coefs}")
     separated_data = [
         np.array(clean_data[labels == label]) for label in np.unique(labels)
     ]
-    print(f"[DEBUG] DBSCAN clusters: {len(separated_data)}")
     cone_positions = []
     for cone in separated_data:
-
         if len(cone) > 3:
             v = np.array([0, 0, -1 * def_coefs[0]])
             w = np.array(def_coefs[1:])
             lidar_distance_to_floor = np.dot(v, w) / np.linalg.norm(w)
-            # cone_positions.append((np.mean(cone[:, 0]), np.mean(cone[:, 1])))
             clean_cone = cone[cone[:, 2] > 0.04 + lidar_distance_to_floor]
             if len(clean_cone) == 0:
-                print(f"[DEBUG] Cluster {len(cone)} pts filtered empty (floor_dist={lidar_distance_to_floor:.3f}, z range: {cone[:,2].min():.3f} to {cone[:,2].max():.3f}, threshold={0.04+lidar_distance_to_floor:.3f})")
                 continue
-            ### ATENCION: el solver es SLSQP porque en los benchmarks es el que es el mas rapido
-            # L-BFGS-P tambien era bastante rapido, pero no he comparado rendimiento entre ellos
             params = cone_fit_2params(clean_cone, solver="SLSQP")
-            print(f"[DEBUG] Cone fit: c={params[2]:.2f} d={params[3]:.2f} pos=({params[0]:.1f},{params[1]:.1f})")
+            if not np.isfinite(params).all():
+                continue
             if (
                 params[2] < 9.0
                 and params[2] > 2.5
@@ -78,7 +70,6 @@ def final_cone_result_rt(data, model=DBSCAN):
                 and params[3] > 0.1
             ):
                 cone_positions.append((params[0], params[1]))
-    print(f"[DEBUG] Final cone detections: {len(cone_positions)}")
     return cone_positions
 
 

@@ -86,30 +86,20 @@ class Publicar_Mapa(Node):
         if len(msg.markers) == 0:  ###Si no se han detectado conos parar
             return
 
-        ###Retroceder tiempo de medicion de lidar 30ms
-        t_ofset = 30000000
-        if msg.markers[0].header.stamp.nanosec - t_ofset < 0:
-            msg.markers[0].header.stamp.sec = msg.markers[0].header.stamp.sec - 1
-            msg.markers[0].header.stamp.nanosec = (
-                msg.markers[0].header.stamp.nanosec - t_ofset + 1000000000
-            )
-        else:
-            msg.markers[0].header.stamp.nanosec = (
-                msg.markers[0].header.stamp.nanosec - t_ofset
-            )
-
         try:  ###Generar Objeto de transformada entre Odom y el coche
             t = self.tf_buffer.lookup_transform(
-                "odom", "fsds/FSCar", msg.markers[0].header.stamp
-            )  # Coger tiempo del escaneo para interpolar
+                "odom", "fsds/FSCar", rclpy.time.Time()
+            )
         except TransformException as ex:
+            self.get_logger().warn(f"TF lookup failed: {ex}")
             return
 
         try:  ###Generar Objeto de transformada entre coche y odom. Transformada inversa
             t_inv = self.tf_buffer.lookup_transform(
-                "fsds/FSCar", "odom", msg.markers[0].header.stamp
-            )  # Coger tiempo del escaneo para interpolar
+                "fsds/FSCar", "odom", rclpy.time.Time()
+            )
         except TransformException as ex:
+            self.get_logger().warn(f"TF inverse lookup failed: {ex}")
             return
 
         for (
