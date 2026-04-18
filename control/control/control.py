@@ -172,10 +172,7 @@ class Control(Node):
         # Collect path points that lie ahead of the vehicle to use as local reference
         forward_path_points = self.get_points_ahead(front_axle_pose)
         if not forward_path_points:
-            # self.get_logger().info(
-            #     "No forward path points available, publishing neutral command"
-            # )
-            command_msg.throttle = 0.0
+            command_msg.brake = 1.0
             self.command_publisher.publish(command_msg)
             return
 
