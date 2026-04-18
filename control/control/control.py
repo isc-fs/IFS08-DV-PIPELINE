@@ -271,7 +271,7 @@ class Control(Node):
             distance = np.sqrt(dx * dx + dy * dy)
             angle_to_point = np.arctan2(dy, dx)
 
-            if abs(wrap_to_pi(vehicle_heading - angle_to_point)) < np.pi / 2:
+            if abs(wrap_to_pi(vehicle_heading - angle_to_point)) < np.pi * 3 / 4:
                 points_with_distances.append((point, distance))
 
         # Sort points by distance and return only points
