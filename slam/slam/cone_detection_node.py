@@ -79,7 +79,8 @@ class Cone_Detection(Node):
         try:  ###A veces da error de division por cero. El try: es para evitar que crashe
             conos = final_cone_result_rt(point_cloud)
         except Exception as e:
-            self.get_logger().error("error")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
             pass
         self.get_logger().debug(str(len(conos)))
         markerArray = MarkerArray()
