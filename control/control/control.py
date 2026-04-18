@@ -220,8 +220,13 @@ class Control(Node):
         else:
             command_msg.brake = -velocity_command_value
 
-        # Normalise steering to the expected command range and publish the command
-        self.steering = -limited_steering_angle
+        # Gate steering: don't apply Stanley steering until the car is moving.
+        # At near-zero speed the cross-track term saturates to max lock, causing
+        # the car to spin before it has any forward momentum.
+        if abs(self.velocity) < 0.5:
+            self.steering = 0.0
+        else:
+            self.steering = -limited_steering_angle
         command_msg.steering = self.steering / np.deg2rad(self.max_steering_ang)
 
         self.command_publisher.publish(command_msg)
