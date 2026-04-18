@@ -38,7 +38,7 @@ class Control(Node):
     def _setup_publishers(self) -> None:
         """Create the publishers responsible for emitting vehicle commands."""
         self.command_publisher = self.create_publisher(
-            ControlCommand, "/fsds/control_command", self.QUEUE_SIZE
+            ControlCommand, "/control_command", self.QUEUE_SIZE
         )
 
     def _setup_subscribers(self) -> None:

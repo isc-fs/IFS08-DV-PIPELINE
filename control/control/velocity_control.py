@@ -26,7 +26,7 @@ class VelocityControl:
         max_normal_acceleration: float = 7,
         throttle_max: float = 0.4,
         brake_max: float = 0.4,
-        smoothing_factor: float = 0.05,
+        smoothing_factor: float = 0.3,
     ) -> None:
         """
         Initialize the velocity controller with PID and feedforward gains.
