@@ -3,7 +3,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import rclpy
-from fs_msgs.msg import ControlCommand
+from fs_msgs.msg import ControlCommand, FinishedSignal
 from geometry_msgs.msg import TransformStamped, TwistWithCovarianceStamped
 from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
@@ -58,6 +58,12 @@ class Control(Node):
             self.odometry_callback,
             self.QUEUE_SIZE,
         )
+        self.finished_subscriber = self.create_subscription(
+            FinishedSignal,
+            "/signal/finished",
+            self.finished_callback,
+            self.QUEUE_SIZE,
+        )
 
     def _setup_tf(self) -> None:
         """Construct the TF buffer and listener used to query frame transforms."""
@@ -70,6 +76,10 @@ class Control(Node):
         self.velocity: float = 0.0
         self.lateral_velocity: float = 0.0
         self.steering: float = 0.0
+        # Once the referee declares the event finished we latch full brake and
+        # ignore subsequent path updates; the latch is cleared only when the
+        # node is restarted (which happens every new Start Session).
+        self.finished: bool = False
 
     def _setup_timer(self) -> None:
         """Schedule the periodic execution of the control loop callback."""
@@ -137,9 +147,25 @@ class Control(Node):
         """Record the lateral component of velocity supplied by odometry."""
         self.lateral_velocity = msg.twist.twist.linear.y
 
+    def finished_callback(self, msg: FinishedSignal) -> None:
+        """Latch the finished flag once the referee ends the event."""
+        if not self.finished:
+            self.get_logger().info("Event finished — latching full brake")
+        self.finished = True
+
     def control_loop_callback(self) -> None:
         """Run the primary control algorithm responsible for steering and speed."""
         command_msg = ControlCommand()
+
+        # After the event finishes, hold the car at full brake. This runs
+        # before the transform/path lookups so control keeps braking even if
+        # SLAM or path planning drift after the finish gate.
+        if self.finished:
+            command_msg.brake = 1.0
+            command_msg.throttle = 0.0
+            command_msg.steering = 0.0
+            self.command_publisher.publish(command_msg)
+            return
 
         # Pull the latest vehicle pose transform; a missing transform aborts this tick
         odom_to_vehicle, vehicle_to_odom = self.get_transforms()
