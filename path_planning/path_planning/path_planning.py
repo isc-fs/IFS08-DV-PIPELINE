@@ -92,6 +92,24 @@ class Plan_Path(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.path_planner = PathPlanner(MissionTypes.trackdrive)
+
+        # Pre-warm numba JIT with dummy cones so the first live callback isn't
+        # blocked for 30+ s of compilation. While JIT is running, Python can't
+        # service SIGTERM; if the pipeline is stopped mid-JIT (Start Session
+        # stops and restarts the pipeline), the launcher escalates to SIGKILL
+        # and Plan_Path dies with exit code -9. Paying the JIT cost here keeps
+        # the spin loop responsive from the first message onward.
+        try:
+            warmup_cones = [numpy.zeros((0, 2)) for _ in range(5)]
+            warmup_cones[ConeTypes.LEFT] = numpy.array([[0.0, 1.5], [5.0, 1.5]])
+            warmup_cones[ConeTypes.RIGHT] = numpy.array([[0.0, -1.5], [5.0, -1.5]])
+            self.path_planner.calculate_path_in_global_frame(
+                warmup_cones, numpy.array([0.0, 0.0]), numpy.array([1.0, 0.0])
+            )
+            self.get_logger().info("Plan_Path: numba JIT warmup complete")
+        except Exception as ex:
+            # Warmup failure is non-fatal — we'd rather launch degraded than not at all.
+            self.get_logger().warn(f"Plan_Path: JIT warmup failed (non-fatal): {ex}")
         # global_cones, car_position, car_direction = load_data()
 
     def listener_callback(self, msg):
