@@ -108,12 +108,21 @@ class Control(Node):
     def _init_params(self) -> None:
         """Declare the ROS parameters that configure the controller gains."""
 
-        # Stanley controller parameters
-        self.declare_parameter("control_gain", 4.0)
+        # Stanley controller parameters.
+        #   control_gain: was 4.0; reduced because the old wheelbase default of
+        #     3.0 m was ~2× the real FS car value and was artificially inflating
+        #     the projected cross-track error, effectively amplifying this gain.
+        #   steering_damp_gain: doubled to smooth high-frequency oscillation
+        #     observed on straights.
+        self.declare_parameter("control_gain", 2.5)
         self.declare_parameter("softening_gain", 6.0)
         self.declare_parameter("yaw_rate_gain", 0.0)
-        self.declare_parameter("steering_damp_gain", 0.5)
-        # TODO: check wheelbase param
+        self.declare_parameter("steering_damp_gain", 1.0)
+        # Wheelbase for the Stanley front-axle projection. FSG T 8 requires
+        # >= 1525 mm, typical designs sit around 1.5–1.7 m. Was hardcoded to
+        # 3.0 m via the controller's Python default — completely wrong and
+        # skewed every cross-track calculation. Now explicit and tunable.
+        self.declare_parameter("wheelbase", 1.55)
 
         # Max steering angle
         self.declare_parameter("max_steering_ang", 25.0)
@@ -131,6 +140,7 @@ class Control(Node):
         self.softening_gain = self.get_parameter("softening_gain").value
         self.yaw_rate_gain = self.get_parameter("yaw_rate_gain").value
         self.steering_damp_gain = self.get_parameter("steering_damp_gain").value
+        self.wheelbase = self.get_parameter("wheelbase").value
 
         self.max_steering_ang = self.get_parameter("max_steering_ang").value
 
@@ -148,6 +158,7 @@ class Control(Node):
             yaw_rate_gain=self.yaw_rate_gain,
             steering_damp_gain=self.steering_damp_gain,
             max_steer=np.deg2rad(self.max_steering_ang),
+            wheelbase=self.wheelbase,
         )
         self.velocity_controller = VelocityControl(
             self.Kp_vel, self.Ki_vel, self.Kd_vel, self.Fg

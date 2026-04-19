@@ -14,12 +14,12 @@ class StanleyController:
 
     def __init__(
         self,
-        control_gain=4.0,
+        control_gain=2.5,
         softening_gain=6.0,
         yaw_rate_gain=0.0,
-        steering_damp_gain=0.5,
+        steering_damp_gain=1.0,
         max_steer=np.deg2rad(25),
-        wheelbase=3.0,
+        wheelbase=1.55,  # FSG T 8 minimum is 1525 mm; real cars ~1.5–1.7 m
         path_x=None,
         path_y=None,
         path_yaw=None,
