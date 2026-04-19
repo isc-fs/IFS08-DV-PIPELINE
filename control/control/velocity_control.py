@@ -27,6 +27,7 @@ class VelocityControl:
         throttle_max: float = 0.4,
         brake_max: float = 0.4,
         smoothing_factor: float = 0.3,
+        target_decel: float = 3.0,
     ) -> None:
         """
         Initialize the velocity controller with PID and feedforward gains.
@@ -56,6 +57,10 @@ class VelocityControl:
             smoothing_factor  # Smoothing factor for target speed
         )
         self.filtered_target_speed: float = 0.0  # Exponentially filtered target speed
+        # Deceleration used when planning an approach-to-stop at the end of the
+        # perceived path. v_stop_cap = sqrt(2 * target_decel * d_remaining).
+        # Kept conservative (3 m/s² ≈ 0.3 g) to match brake_max ≤ 0.4.
+        self.target_decel: float = target_decel
 
     def get_feedforward_value(self, next_points: list[list[float]]) -> float:
         """
@@ -257,6 +262,7 @@ class VelocityControl:
         velocity_measurement: float,
         next_points: list[list[float]],
         crosstrack_error: float,
+        distance_to_path_end: float = None,
     ) -> tuple[float, float]:
         """
         Compute the throttle/brake command using PID control with feedforward.
@@ -280,6 +286,14 @@ class VelocityControl:
         """
         # Calculate base target speed from path curvature (feedforward term)
         feedforward_value = self.get_feedforward_value(next_points)
+
+        # Approach-to-stop: cap target by the kinematic braking limit so the
+        # car naturally decelerates as the perceived path runs out (finish of
+        # an acceleration / autocross run, or just when SLAM loses cones).
+        # v² = 2·a·d gives the max speed from which we can still stop in d.
+        if distance_to_path_end is not None and distance_to_path_end >= 0.0:
+            v_stop_cap = float(np.sqrt(2.0 * self.target_decel * distance_to_path_end))
+            feedforward_value = min(feedforward_value, v_stop_cap)
 
         # Reduce target speed if cross-track error is significant (> 0.2m)
         # Uses quadratic penalty to aggressively slow down when off-track

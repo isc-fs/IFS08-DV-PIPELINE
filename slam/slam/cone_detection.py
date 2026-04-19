@@ -69,7 +69,16 @@ def final_cone_result_rt(data, model=DBSCAN):
                 and params[3] < 0.6
                 and params[3] > 0.1
             ):
-                cone_positions.append((params[0], params[1]))
+                # Cluster height (z-span, metres) — used downstream to separate
+                # big-orange cones (datasheet 505 mm) from small blue/yellow/
+                # small-orange cones (325 mm). Computed on the ground-removed
+                # cluster so the RANSAC-plane clipping doesn't truncate it.
+                height = (
+                    float(clean_cone[:, 2].max() - clean_cone[:, 2].min())
+                    if len(clean_cone) > 0
+                    else 0.0
+                )
+                cone_positions.append((params[0], params[1], height))
     return cone_positions
 
 
@@ -267,7 +276,12 @@ def compare_data_to_processed(data):
         data (np.ndarray): los datos
     """
     for d in data:
-        x, y = zip(*final_cone_result_rt(d))
+        # final_cone_result_rt now returns (x, y, height); discard height here.
+        results = final_cone_result_rt(d)
+        if not results:
+            continue
+        x = [r[0] for r in results]
+        y = [r[1] for r in results]
         plt.scatter(x, y, marker="*")
         clustering_separation(d, plot=True)
 
