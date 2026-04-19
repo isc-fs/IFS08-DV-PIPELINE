@@ -57,9 +57,15 @@ class Cone_Detection(Node):
     """
 
     # Cluster-height threshold separating big-orange cones (505 mm tall per
-    # DS Table 1) from small blue/yellow/orange cones (325 mm). The midpoint
-    # leaves generous margin for LiDAR vertical-quantization noise.
-    BIG_ORANGE_HEIGHT_THRESHOLD_M = 0.4
+    # DS Table 1) from small blue/yellow/orange cones (325 mm). Live-measured
+    # distributions at close range (start-gate sampling, 2026-04-19):
+    #   small cones:  0.19–0.25 m
+    #   big orange:   0.43–0.46 m
+    # Gap of ~0.18 m between the two. Threshold sits in that gap, biased
+    # toward the small-cone side so that long-range big cones — whose
+    # measured height compresses with distance because fewer vertical LiDAR
+    # channels hit them — still classify correctly.
+    BIG_ORANGE_HEIGHT_THRESHOLD_M = 0.30
 
     def __init__(self):
         super().__init__("Cone_Detection")

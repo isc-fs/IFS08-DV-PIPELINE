@@ -98,6 +98,13 @@ class Control(Node):
         self.start_gate_travel_m: float = 10.0
         self.initial_position: Optional[Tuple[float, float]] = None
         self.distance_traveled: float = 0.0
+        # Latched stop target in the traveled-distance reference frame. Once
+        # we've sighted a big-orange finish gate the target locks in: the
+        # car must stop when self.distance_traveled reaches this value.
+        # Prevents the late-stage FoV dropout from unlatching the cap and
+        # letting the car re-accelerate into the barrier past the gate.
+        # Monotonic minimum — refinements can only pull the target closer.
+        self.latched_stop_traveled: Optional[float] = None
 
     def _setup_timer(self) -> None:
         """Schedule the periodic execution of the control loop callback."""
@@ -188,20 +195,34 @@ class Control(Node):
 
     def _compute_orange_stop_distance(self) -> Optional[float]:
         """Distance from vehicle to the Stop Area target derived from the
-        big-orange finish-gate markers. Only active after the car has
-        travelled far enough from its starting pose to have cleared the
-        start gate — before that, any orange ahead is assumed to be the
-        start gate and we don't brake for it. Cones are already in car
-        frame, so forward distance is just position.x."""
+        big-orange finish-gate markers.
+
+        Only active after the car has travelled far enough from its
+        starting pose to have cleared the start gate — before that, any
+        orange ahead is assumed to be the start gate and we don't brake.
+
+        Once a finish gate is sighted, we LATCH the stop target in the
+        car's traveled-distance frame. Subsequent detections can only pull
+        it closer (take the min). That stays sticky even when the oranges
+        leave the LiDAR FoV in the last few metres before the gate — the
+        previous implementation released the cap at that point and the
+        velocity controller re-accelerated into the barrier."""
         if self.distance_traveled < self.start_gate_travel_m:
             return None
-        if not self.orange_cones:
+
+        # Refine the latch from the current orange detection (use closest
+        # forward cone — see earlier note about barrier false-positives).
+        if self.orange_cones:
+            forwards_ahead = [ox for ox, _ in self.orange_cones if ox > 0.0]
+            if forwards_ahead:
+                candidate = self.distance_traveled + min(forwards_ahead) + self.stop_margin_m
+                if self.latched_stop_traveled is None or candidate < self.latched_stop_traveled:
+                    self.latched_stop_traveled = candidate
+
+        if self.latched_stop_traveled is None:
             return None
-        # position.x > 0 = ahead of the vehicle in fsds/FSCar convention.
-        max_forward = max((ox for ox, _ in self.orange_cones), default=0.0)
-        if max_forward <= 0.0:
-            return None
-        return max_forward + self.stop_margin_m
+        remaining = self.latched_stop_traveled - self.distance_traveled
+        return max(0.0, remaining)
 
     def control_loop_callback(self) -> None:
         """Run the primary control algorithm responsible for steering and speed."""
@@ -279,6 +300,22 @@ class Control(Node):
             np.hypot(cx - self.initial_position[0], cy - self.initial_position[1])
         )
 
+        # Calibration-period diagnostic: log orange-stop state once a second so
+        # we can reconstruct what the autonomous-stop gate saw during a run.
+        # Remove once the kinematic cap is validated end-to-end.
+        now_ns = self.get_clock().now().nanoseconds
+        if not hasattr(self, "_last_log_ns") or (now_ns - self._last_log_ns) > 1_000_000_000:
+            self._last_log_ns = now_ns
+            fwds = [ox for ox, _ in self.orange_cones if ox > 0.0]
+            min_fwd = f"{min(fwds):.1f}m" if fwds else "n/a"
+            max_fwd = f"{max(fwds):.1f}m" if fwds else "n/a"
+            latch = f"{self.latched_stop_traveled:.1f}m" if self.latched_stop_traveled is not None else "none"
+            self.get_logger().info(
+                f"AUTOSTOP: traveled={self.distance_traveled:.1f}m "
+                f"orange_n={len(self.orange_cones)} min_fwd={min_fwd} max_fwd={max_fwd} "
+                f"latch={latch} v={self.velocity:.1f}m/s"
+            )
+
         # Distance to the stop target for the velocity controller's kinematic
         # cap. Order of preference:
         #   1. Big-orange finish gate (farthest orange ahead + 3 m margin).
@@ -301,11 +338,26 @@ class Control(Node):
             )
         )
 
-        # Acceleration and braking are limited inside the velocity controller
+        # Acceleration and braking are limited inside the velocity controller.
+        # Explicit zero on the opposite channel so we never send throttle and
+        # brake together (FS rule D 10.1.7 / safety).
         if velocity_command_value > 0:
             command_msg.throttle = velocity_command_value
+            command_msg.brake = 0.0
         else:
+            command_msg.throttle = 0.0
             command_msg.brake = -velocity_command_value
+
+        # If we're at or past the latched stop target, force full brake +
+        # zero throttle unconditionally. Keeps the car pinned inside the
+        # Stop Area regardless of how the velocity PID is currently
+        # tracking — rules require a reliable hold, not a rolling coast.
+        if (
+            self.latched_stop_traveled is not None
+            and self.distance_traveled >= self.latched_stop_traveled - 1.0
+        ):
+            command_msg.throttle = 0.0
+            command_msg.brake = 1.0
 
         # Gate steering: don't apply Stanley steering until the car is moving.
         # At near-zero speed the cross-track term saturates to max lock, causing
