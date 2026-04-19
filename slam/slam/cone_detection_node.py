@@ -56,10 +56,21 @@ class Cone_Detection(Node):
     a que compile cada vez que hay que probar
     """
 
+    # Cluster-height threshold separating big-orange cones (505 mm tall per
+    # DS Table 1) from small blue/yellow/orange cones (325 mm). The midpoint
+    # leaves generous margin for LiDAR vertical-quantization noise.
+    BIG_ORANGE_HEIGHT_THRESHOLD_M = 0.4
+
     def __init__(self):
         super().__init__("Cone_Detection")
         # Publicar
         self.publisher_MarkerArray = self.create_publisher(MarkerArray, "Conos_raw", 10)
+        # Dedicated stream of big-orange cones (the FS finish-line markers).
+        # Kept separate from /Conos_raw so SLAM's blue/yellow classifier
+        # doesn't need to learn about orange, and so downstream consumers
+        # (autonomous-stop logic in the control node) can subscribe without
+        # filtering the whole cone list. Positions are in the car frame.
+        self.publisher_Orange = self.create_publisher(MarkerArray, "Conos_Orange", 10)
         # Subscribir
         self.subscription = self.create_subscription(
             PointCloud2, "/fsds/lidar/Lidar1", self.listener_callback, QOS_LATEST
@@ -86,9 +97,20 @@ class Cone_Detection(Node):
         markerArray = MarkerArray()
 
         ###Aprovechar el metodo MarkerArray() para mandar resultados de final_cone_result_rt()
+        orangeArray = MarkerArray()
         i = 0
-        for a, b in conos:
-            self.get_logger().debug("x: " + str(a) + " Y: " + str(b))
+        orange_i = 0
+        for entry in conos:
+            # Backward compat: old return shape was (x, y); new is (x, y, height).
+            if len(entry) >= 3:
+                a, b, height = float(entry[0]), float(entry[1]), float(entry[2])
+            else:
+                a, b = float(entry[0]), float(entry[1])
+                height = 0.0
+            is_big_orange = height > self.BIG_ORANGE_HEIGHT_THRESHOLD_M
+            self.get_logger().debug(
+                f"x: {a} Y: {b} h: {height:.2f} big_orange={is_big_orange}"
+            )
             marker = Marker()
             marker.pose.position.x = a
             marker.pose.position.y = b
@@ -107,7 +129,9 @@ class Cone_Detection(Node):
             marker.header.stamp = msg.header.stamp
             marker.scale.x = 0.1
             marker.scale.y = 0.1
-            marker.scale.z = 0.1
+            # Encode measured cluster height on scale.z so downstream consumers
+            # can distinguish big orange from small without re-measuring.
+            marker.scale.z = max(0.1, height)
             marker.color.a = 1.0
             marker.color.r = 1.0
             marker.color.g = 0.0
@@ -119,7 +143,35 @@ class Cone_Detection(Node):
 
             markerArray.markers.append(marker)
 
+            if is_big_orange:
+                # Same pose, distinct marker list, orange colour for RViz.
+                orange = Marker()
+                orange.header.frame_id = "fsds/FSCar"
+                orange.header.stamp = msg.header.stamp
+                orange.type = Marker.CUBE
+                orange.action = 3 if orange_i == 0 else Marker.ADD
+                orange.pose.position.x = a
+                orange.pose.position.y = b
+                orange.pose.position.z = 0.0
+                orange.pose.orientation.w = 1.0
+                orange.scale.x = 0.3
+                orange.scale.y = 0.3
+                orange.scale.z = max(0.1, height)
+                orange.color.a = 1.0
+                orange.color.r = 1.0
+                orange.color.g = 0.5
+                orange.color.b = 0.0
+                orange.id = orange_i
+                orange_i += 1
+                orangeArray.markers.append(orange)
+
         self.publisher_MarkerArray.publish(markerArray)
+        # Publish even when the current scan has no big-orange cones so
+        # downstream consumers don't keep a stale cache when the gate exits
+        # the LiDAR FoV at close range (the sensor is mounted 1.4 m forward
+        # of the car, so cones at the start gate leave the ±60° H-FOV before
+        # the car has physically passed them).
+        self.publisher_Orange.publish(orangeArray)
 
 
 """

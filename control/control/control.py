@@ -6,6 +6,7 @@ import rclpy
 from fs_msgs.msg import ControlCommand
 from geometry_msgs.msg import TransformStamped, TwistWithCovarianceStamped
 from nav_msgs.msg import Odometry, Path
+from visualization_msgs.msg import MarkerArray
 from rclpy.node import Node
 from rclpy.time import Time
 from tf2_ros import TransformException
@@ -58,6 +59,16 @@ class Control(Node):
             self.odometry_callback,
             self.QUEUE_SIZE,
         )
+        # Big-orange cones detected by Cone_Detection on measured cluster
+        # height (505 mm big-orange vs 325 mm small — see DS Table 1). Cones
+        # are published in the fsds/FSCar frame, i.e. already vehicle-
+        # relative, so forward distance is just position.x.
+        self.orange_subscriber = self.create_subscription(
+            MarkerArray,
+            "/Conos_Orange",
+            self.orange_callback,
+            self.QUEUE_SIZE,
+        )
 
     def _setup_tf(self) -> None:
         """Construct the TF buffer and listener used to query frame transforms."""
@@ -70,6 +81,23 @@ class Control(Node):
         self.velocity: float = 0.0
         self.lateral_velocity: float = 0.0
         self.steering: float = 0.0
+        # Big-orange cones in the current LiDAR frame (fsds/FSCar), i.e. the
+        # position is already relative to the vehicle: x is forward distance.
+        # Replaced wholesale on every MarkerArray message from Cone_Detection
+        # (including empty messages), so this never goes stale.
+        self.orange_cones: List[Tuple[float, float]] = []
+        # Margin past the orange gate centroid into the Stop Area. FS rules
+        # require the car to stop at least 3 m after the finish line.
+        self.stop_margin_m: float = 3.0
+        # Start-gate-passed heuristic: treat orange ahead as a finish / lap
+        # marker only after the car has driven at least this far from its
+        # initial odom pose. Acceleration's start gate is ~7 m long, so 10 m
+        # of travel reliably clears it. The latch-on-behind approach failed
+        # because the LiDAR (mounted 1.4 m forward on the car) loses start-
+        # gate cones out of its ±60° H-FOV before they ever reach x < 0.
+        self.start_gate_travel_m: float = 10.0
+        self.initial_position: Optional[Tuple[float, float]] = None
+        self.distance_traveled: float = 0.0
 
     def _setup_timer(self) -> None:
         """Schedule the periodic execution of the control loop callback."""
@@ -136,6 +164,33 @@ class Control(Node):
     def odometry_callback(self, msg: Odometry) -> None:
         """Record the lateral component of velocity supplied by odometry."""
         self.lateral_velocity = msg.twist.twist.linear.y
+
+    def orange_callback(self, msg: MarkerArray) -> None:
+        """Cache the current frame's big-orange cones (car-relative coords)."""
+        # Skip the sentinel DELETEALL marker Cone_Detection prepends
+        # (marker.action == 3) — it carries no real position.
+        self.orange_cones = [
+            (float(m.pose.position.x), float(m.pose.position.y))
+            for m in msg.markers
+            if m.action != 3
+        ]
+
+    def _compute_orange_stop_distance(self) -> Optional[float]:
+        """Distance from vehicle to the Stop Area target derived from the
+        big-orange finish-gate markers. Only active after the car has
+        travelled far enough from its starting pose to have cleared the
+        start gate — before that, any orange ahead is assumed to be the
+        start gate and we don't brake for it. Cones are already in car
+        frame, so forward distance is just position.x."""
+        if self.distance_traveled < self.start_gate_travel_m:
+            return None
+        if not self.orange_cones:
+            return None
+        # position.x > 0 = ahead of the vehicle in fsds/FSCar convention.
+        max_forward = max((ox for ox, _ in self.orange_cones), default=0.0)
+        if max_forward <= 0.0:
+            return None
+        return max_forward + self.stop_margin_m
 
     def control_loop_callback(self) -> None:
         """Run the primary control algorithm responsible for steering and speed."""
@@ -204,10 +259,34 @@ class Control(Node):
                 self.steering,
             )
         )
+        # Update the travelled-distance counter used by the orange stop gate.
+        cx = float(odom_to_vehicle.transform.translation.x)
+        cy = float(odom_to_vehicle.transform.translation.y)
+        if self.initial_position is None:
+            self.initial_position = (cx, cy)
+        self.distance_traveled = float(
+            np.hypot(cx - self.initial_position[0], cy - self.initial_position[1])
+        )
+
+        # Distance to the stop target for the velocity controller's kinematic
+        # cap. Order of preference:
+        #   1. Big-orange finish gate (farthest orange ahead + 3 m margin).
+        #      This is the FS Driverless Spec definition of the Stop Area.
+        #      Only active once the car has driven past the start gate.
+        #   2. Fallback: last pose of the perceived path — handles SLAM
+        #      dropouts and events with no orange ahead.
+        distance_to_path_end = self._compute_orange_stop_distance()
+        if distance_to_path_end is None and self.path.poses:
+            last_pose = self.path.poses[-1].pose.position
+            dx = last_pose.x - float(odom_to_vehicle.transform.translation.x)
+            dy = last_pose.y - float(odom_to_vehicle.transform.translation.y)
+            distance_to_path_end = float(np.hypot(dx, dy))
+
         # Compute the required longitudinal command given the target profile
         velocity_command_value, velocity_ref = (
             self.velocity_controller.get_control_value(
-                self.velocity, forward_path_points, crosstrack_error
+                self.velocity, forward_path_points, crosstrack_error,
+                distance_to_path_end=distance_to_path_end,
             )
         )
 
