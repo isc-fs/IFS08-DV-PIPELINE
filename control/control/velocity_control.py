@@ -25,9 +25,9 @@ class VelocityControl:
         max_speed: float = 10,
         max_normal_acceleration: float = 7,
         throttle_max: float = 0.4,
-        brake_max: float = 0.4,
+        brake_max: float = 1.0,
         smoothing_factor: float = 0.3,
-        target_decel: float = 3.0,
+        target_decel: float = 6.0,
     ) -> None:
         """
         Initialize the velocity controller with PID and feedforward gains.
@@ -57,9 +57,11 @@ class VelocityControl:
             smoothing_factor  # Smoothing factor for target speed
         )
         self.filtered_target_speed: float = 0.0  # Exponentially filtered target speed
-        # Deceleration used when planning an approach-to-stop at the end of the
-        # perceived path. v_stop_cap = sqrt(2 * target_decel * d_remaining).
-        # Kept conservative (3 m/s² ≈ 0.3 g) to match brake_max ≤ 0.4.
+        # Deceleration used when planning an approach-to-stop at the end of
+        # the perceived path. v_stop_cap = sqrt(2 * target_decel * d_remaining).
+        # Set aggressive (6 m/s² ≈ 0.6 g) so the car actually executes a
+        # hard brake into the Stop Area per FS rules (DS Figure 2 / D 10.1.7
+        # USS), instead of rolling gently past the finish into the barrier.
         self.target_decel: float = target_decel
 
     def get_feedforward_value(self, next_points: list[list[float]]) -> float:
