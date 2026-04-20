@@ -6,6 +6,7 @@ import rclpy
 from fs_msgs.msg import ControlCommand
 from geometry_msgs.msg import TransformStamped, TwistWithCovarianceStamped
 from nav_msgs.msg import Odometry, Path
+from std_msgs.msg import Empty
 from visualization_msgs.msg import MarkerArray
 from rclpy.node import Node
 from rclpy.time import Time
@@ -41,6 +42,16 @@ class Control(Node):
         self.command_publisher = self.create_publisher(
             ControlCommand, "/control_command", self.QUEUE_SIZE
         )
+        # One-shot, latched: bridge picks this up to engage the real-car EBS
+        # analog (setCarControls 0 0 1 + disableApiControl in UE5). Once
+        # fired the bridge drops any further ControlCommand so the brake
+        # cannot be released by a residual autonomy message.
+        ebs_qos = rclpy.qos.QoSProfile(
+            depth=1,
+            durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+        )
+        self.ebs_publisher = self.create_publisher(Empty, "/signal/ebs", ebs_qos)
 
     def _setup_subscribers(self) -> None:
         """Subscribe to the topics providing path, velocity, and odometry feedback."""
@@ -105,6 +116,7 @@ class Control(Node):
         # letting the car re-accelerate into the barrier past the gate.
         # Monotonic minimum — refinements can only pull the target closer.
         self.latched_stop_traveled: Optional[float] = None
+        self.ebs_requested: bool = False
 
     def _setup_timer(self) -> None:
         """Schedule the periodic execution of the control loop callback."""
@@ -210,13 +222,26 @@ class Control(Node):
         if self.distance_traveled < self.start_gate_travel_m:
             return None
 
-        # Refine the latch from the current orange detection (use closest
-        # forward cone — see earlier note about barrier false-positives).
+        # Refine the latch from the current orange detection (closest forward
+        # cone). Require at least 5 m of forward distance to weed out LiDAR
+        # returns off the car's own structure (wheels / aero at close range
+        # measure tall enough to trip the big-orange height threshold).
+        ORANGE_MIN_FORWARD_M = 5.0
+        # The INITIAL latch must land at least this far along the travelled-
+        # distance axis. Prevents the residual start-gate oranges from
+        # latching the stop way before the finish (they were still being
+        # reported near the car after the start-gate-travel check cleared).
+        # Finish gates on any reasonable event are comfortably beyond 30 m
+        # from spawn; refinements after latching can pull the target in.
+        MIN_INITIAL_LATCH_TRAVELED_M = 30.0
         if self.orange_cones:
-            forwards_ahead = [ox for ox, _ in self.orange_cones if ox > 0.0]
+            forwards_ahead = [ox for ox, _ in self.orange_cones if ox > ORANGE_MIN_FORWARD_M]
             if forwards_ahead:
                 candidate = self.distance_traveled + min(forwards_ahead) + self.stop_margin_m
-                if self.latched_stop_traveled is None or candidate < self.latched_stop_traveled:
+                if self.latched_stop_traveled is None:
+                    if candidate >= MIN_INITIAL_LATCH_TRAVELED_M:
+                        self.latched_stop_traveled = candidate
+                elif candidate < self.latched_stop_traveled:
                     self.latched_stop_traveled = candidate
 
         if self.latched_stop_traveled is None:
@@ -348,16 +373,23 @@ class Control(Node):
             command_msg.throttle = 0.0
             command_msg.brake = -velocity_command_value
 
-        # If we're at or past the latched stop target, force full brake +
-        # zero throttle unconditionally. Keeps the car pinned inside the
-        # Stop Area regardless of how the velocity PID is currently
-        # tracking — rules require a reliable hold, not a rolling coast.
+        # If we're at or past the latched stop target, engage EBS: publish
+        # one /signal/ebs message, then the bridge applies
+        # setCarControls 0 0 1 + disableApiControl on UE5 (equivalent to
+        # real-car EBS). Any subsequent setCarControls is silently dropped
+        # by the bridge, so the brake stays latched for good regardless of
+        # what we publish next. Still emit brake=1 / throttle=0 locally as
+        # a safety net for the tick or two before disableApiControl lands.
         if (
             self.latched_stop_traveled is not None
             and self.distance_traveled >= self.latched_stop_traveled - 1.0
         ):
             command_msg.throttle = 0.0
             command_msg.brake = 1.0
+            if not self.ebs_requested:
+                self.ebs_publisher.publish(Empty())
+                self.ebs_requested = True
+                self.get_logger().info("EBS requested — autonomous stop engaged")
 
         # Gate steering: don't apply Stanley steering until the car is moving.
         # At near-zero speed the cross-track term saturates to max lock, causing
