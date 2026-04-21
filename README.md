@@ -2,7 +2,7 @@
 
 # IFS08 - DV_PIPELINE
 
-Embedded firmware for the **Driverless Pipeline** of the IFS08.
+**Driverless Pipeline** of the IFS08.
 
 ---
 
