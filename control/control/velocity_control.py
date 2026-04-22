@@ -27,7 +27,7 @@ class VelocityControl:
         throttle_max: float = 0.4,
         brake_max: float = 1.0,
         smoothing_factor: float = 0.3,
-        target_decel: float = 6.0,
+        target_decel: float = 1.9,
     ) -> None:
         """
         Initialize the velocity controller with PID and feedforward gains.
@@ -59,10 +59,20 @@ class VelocityControl:
         self.filtered_target_speed: float = 0.0  # Exponentially filtered target speed
         # Deceleration used when planning an approach-to-stop at the end of
         # the perceived path. v_stop_cap = sqrt(2 * target_decel * d_remaining).
-        # Set aggressive (6 m/s² ≈ 0.6 g) so the car actually executes a
-        # hard brake into the Stop Area per FS rules (DS Figure 2 / D 10.1.7
-        # USS), instead of rolling gently past the finish into the barrier.
+        # Calibrated to the sim's measured braking deceleration under
+        # setCarControls 0 0 1 (~2.3 m/s² measured on the acceleration
+        # event). A more ambitious value would leave the velocity
+        # controller thinking it had more room than it actually does.
         self.target_decel: float = target_decel
+        # Stop-approach monotonic cap. Once the kinematic cap brings the
+        # target speed below this level, subsequent ticks can only pull it
+        # DOWN, never back up. Resets to inf whenever we're clearly far
+        # from any stop (d_remaining > 15m). This prevents the "release
+        # brake" glitch when SLAM's path-end fallback (d≈0) hands off to a
+        # freshly-latched orange finish gate farther ahead (d≈9m), which
+        # would otherwise cause the controller to un-brake and accelerate
+        # into the Stop Area.
+        self._stop_approach_cap: float = float("inf")
 
     def get_feedforward_value(self, next_points: list[list[float]]) -> float:
         """
@@ -296,6 +306,16 @@ class VelocityControl:
         if distance_to_path_end is not None and distance_to_path_end >= 0.0:
             v_stop_cap = float(np.sqrt(2.0 * self.target_decel * distance_to_path_end))
             feedforward_value = min(feedforward_value, v_stop_cap)
+            # Monotonic-decrease lock once we're inside the approach zone.
+            # Far from any stop the lock resets so the car can resume full
+            # speed on a new stretch.
+            if distance_to_path_end < 15.0:
+                self._stop_approach_cap = min(self._stop_approach_cap, feedforward_value)
+                feedforward_value = self._stop_approach_cap
+            else:
+                self._stop_approach_cap = float("inf")
+        else:
+            self._stop_approach_cap = float("inf")
 
         # Reduce target speed if cross-track error is significant (> 0.2m)
         # Uses quadratic penalty to aggressively slow down when off-track
