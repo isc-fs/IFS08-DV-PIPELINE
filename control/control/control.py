@@ -98,12 +98,18 @@ class Control(Node):
         # (including empty messages), so this never goes stale.
         self.orange_cones: List[Tuple[float, float]] = []
         # Distance past the closest forward big-orange cone where the car
-        # should target the end of its braking. Calibrated with the sim's
-        # ~1.7-2 m/s² regen-only decel: a 3 m margin was landing the car
-        # short of the desired stop zone (finish cones at y≈82, landed
-        # ~84.8 m). Raising to 5 m shifts the latch outward by 2 m so the
-        # car lands inside the post-finish Stop Area.
-        self.stop_margin_m: float = 5.0
+        # should target the end of its braking.
+        #
+        # History:
+        #   - Hydraulic-brake era: 3 m was landing ~84.8 m (1 m past y=82
+        #     finish cones).
+        #   - fix/21 with the broken drag-only "EBS": raised to 5 m so
+        #     the car would reach the Stop Area before coasting to a stop.
+        #   - fix/22 with real regen + all-four EBS: the car now has
+        #     plenty of brake authority, so 5 m pushed the landing back
+        #     to ~89 m. 3 m lands the car inside the 1 m Stop Area
+        #     again.
+        self.stop_margin_m: float = 3.0
         # Start-gate-passed heuristic: treat orange ahead as a finish / lap
         # marker only after the car has driven at least this far from its
         # initial odom pose. Acceleration's start gate is ~7 m long, so 10 m
@@ -378,14 +384,11 @@ class Control(Node):
             command_msg.brake = -velocity_command_value
 
         # EBS trigger: safety net. Primary stopping is done by the velocity
-        # controller's kinematic cap; EBS fires only when the car is close
-        # enough to the latched stop AND fast enough that we can't brake
-        # in time without full EBS assist. Once fired, the bridge applies
-        # setCarControls 0 0 1 + disableApiControl — subsequent commands
-        # are silently dropped so the brake stays latched regardless of
-        # what we publish next. We still emit brake=1 / throttle=0 locally
-        # as a safety net for the tick or two before disableApiControl
-        # lands on UE5.
+        # controller's regen cap; EBS fires only when the car is close
+        # enough to the latched stop AND fast enough that we can't finish
+        # braking on regen alone. Once fired the bridge calls `activateEbs`
+        # which clamps the handbrake on all four wheels and locks out
+        # future control inputs until reset.
         #
         # The 25 m remaining-distance gate is deliberate: the latch starts
         # coarse (one far-sighted orange cone → ~89 m) and only refines
@@ -393,17 +396,15 @@ class Control(Node):
         # around traveled=70 m. Triggering EBS before that refinement
         # locks in a stale, too-far stop target and the car halts short.
         #
-        # ebs_decel = 1.9 m/s² is calibrated to observed behavior:
-        #   run A  v=9.9 @ 75 m  → stop 96.4 m → 2.3 m/s²
-        #   run B  v=9.4 @ 58 m  → stop 92.6 m → 1.64 m/s²
-        #   run C  v=9.1 @ 58 m  → stop 79.3 m → 1.94 m/s²
-        # This is by design, not a tuning gap: the IFS-08 has no hydraulic
-        # service brake. Braking is motor regen + EBS, and regen is
-        # throttled aggressively for battery care — ~1.5-2 m/s² is the
-        # operating envelope. When the team settles on a production regen
-        # current the sim's braking should be extended to model it
-        # explicitly (torque-limited regen + separate EBS channel).
-        ebs_decel = 1.9
+        # ebs_decel = 11 m/s² is calibrated to fix/22's all-four-wheel
+        # EBS bench (bench_ebs_rpc.py: v=17 m/s → 0 in 12.3 m, avg
+        # -11.03 m/s². Previously the "EBS" path was effectively a drag
+        # coast (~2 m/s²) because of the keyboard-override bug that
+        # fix/22 eliminated — the old 1.9 m/s² constant here was
+        # compensating for that broken path, not for real EBS behavior.
+        # Pneumatic full-lock is tire-grip-limited, so 11 m/s² is the
+        # physical ceiling; the 0.5 m safety margin absorbs tick latency.
+        ebs_decel = 11.0
         ebs_remaining = (
             self.latched_stop_traveled - self.distance_traveled
             if self.latched_stop_traveled is not None

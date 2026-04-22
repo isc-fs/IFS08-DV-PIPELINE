@@ -27,7 +27,7 @@ class VelocityControl:
         throttle_max: float = 0.4,
         brake_max: float = 1.0,
         smoothing_factor: float = 0.3,
-        target_decel: float = 1.9,
+        target_decel: float = 3.0,
     ) -> None:
         """
         Initialize the velocity controller with PID and feedforward gains.
@@ -59,10 +59,13 @@ class VelocityControl:
         self.filtered_target_speed: float = 0.0  # Exponentially filtered target speed
         # Deceleration used when planning an approach-to-stop at the end of
         # the perceived path. v_stop_cap = sqrt(2 * target_decel * d_remaining).
-        # Calibrated to the sim's measured braking deceleration under
-        # setCarControls 0 0 1 (~2.3 m/s² measured on the acceleration
-        # event). A more ambitious value would leave the velocity
-        # controller thinking it had more room than it actually does.
+        # Calibrated against fix/22's regen brake model: constant-power
+        # regen gives ~1.5 m/s² at high speed rising to ~9 m/s² as v
+        # drops (tire-limited rear axle). 3.0 m/s² is the effective
+        # equivalent-constant decel measured on bench_accel.py BRAKE
+        # phase (v=17 m/s → 0 over ~29 m → v²/(2·dx) ≈ 4.97 m/s² avg,
+        # biased down to leave headroom for the velocity controller's
+        # PID lag and EBS safety margin).
         self.target_decel: float = target_decel
         # Stop-approach monotonic cap. Once the kinematic cap brings the
         # target speed below this level, subsequent ticks can only pull it
