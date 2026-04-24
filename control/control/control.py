@@ -147,11 +147,12 @@ class Control(Node):
         self.declare_parameter("softening_gain", 6.0)
         self.declare_parameter("yaw_rate_gain", 0.0)
         self.declare_parameter("steering_damp_gain", 1.0)
-        # Wheelbase for the Stanley front-axle projection. FSG T 8 requires
-        # >= 1525 mm, typical designs sit around 1.5–1.7 m. Was hardcoded to
-        # 3.0 m via the controller's Python default — completely wrong and
-        # skewed every cross-track calculation. Now explicit and tunable.
-        self.declare_parameter("wheelbase", 1.55)
+        # Wheelbase for the Stanley front-axle projection. Authoritative
+        # value from the IFS-08 Susp_Geometry sheet (CAD): 1600 mm. Matches
+        # MODEL_IFS_08/SIMSCAPE and the chassis hardpoint data; the
+        # previous 1550 mm was a vintage estimate, and the Chaos default
+        # of 3000 mm was outright wrong.
+        self.declare_parameter("wheelbase", 1.60)
 
         # Max steering angle
         self.declare_parameter("max_steering_ang", 25.0)
