@@ -52,6 +52,17 @@ class Control(Node):
             reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
         )
         self.ebs_publisher = self.create_publisher(Empty, "/signal/ebs", ebs_qos)
+        # Companion topic: tell the bridge to clear its latched EBS flag so a
+        # fresh session always starts with controls accepted. Without this, an
+        # autonomous-stop at the end of session N (line ~424 below) would
+        # leave the bridge dropping every setCarControls in session N+1 until
+        # the user manually restarted ros_stack. Published once below; the
+        # bridge listens with the same TRANSIENT_LOCAL QoS so a
+        # subscription-after-publish still picks it up.
+        self.ebs_reset_publisher = self.create_publisher(
+            Empty, "/signal/ebs_reset", ebs_qos
+        )
+        self.ebs_reset_publisher.publish(Empty())
 
     def _setup_subscribers(self) -> None:
         """Subscribe to the topics providing path, velocity, and odometry feedback."""
