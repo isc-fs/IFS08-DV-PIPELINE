@@ -163,7 +163,13 @@ class Control(Node):
         #     `desired ≈ 0` so output ≈ 0 was coincidentally correct.
         #     Autocross with curved paths surfaced it immediately — car drove
         #     dead-straight through every curve until off-track.
-        self.declare_parameter("control_gain", 2.5)
+        # control_gain lowered from 2.5 → 1.0 after first autocross test:
+        # at v=3 m/s with cross-track error of 2 m, the cross-track term
+        #   atan2(k * e, k_soft + v) = atan2(5, 9) ≈ 29°
+        # saturated max_steer (25°) → full lock → car turned too aggressively
+        # one direction. With k=1.0 the same case gives ~12°, much gentler.
+        # Tune up only if the car under-corrects on cleaner tracks.
+        self.declare_parameter("control_gain", 1.0)
         self.declare_parameter("softening_gain", 6.0)
         self.declare_parameter("yaw_rate_gain", 0.0)
         self.declare_parameter("steering_damp_gain", 0.0)
