@@ -17,13 +17,22 @@ class StanleyController:
         control_gain=2.5,
         softening_gain=6.0,
         yaw_rate_gain=0.0,
-        steering_damp_gain=1.0,
+        steering_damp_gain=0.0,
         max_steer=np.deg2rad(25),
         wheelbase=1.55,  # FSG T 8 minimum is 1525 mm; real cars ~1.5–1.7 m
         path_x=None,
         path_y=None,
         path_yaw=None,
     ):
+        # NOTE on `steering_damp_gain` semantics: the formula in
+        # `stanley_control` below is
+        #   output = desired - k_damp * (desired - prev)
+        #         = (1 - k_damp) * desired + k_damp * prev
+        # so k_damp = 0 → use desired (no damping), k_damp = 1.0 → output = prev
+        # (controller fully overridden by its own previous output, locking at 0
+        # since `prev` is fed back). Anything between is an exponential blend.
+        # Counter-intuitive name — "more damp" gives less controller authority,
+        # not "more smoothing." Keep ≤ 0.5 if you ever turn this on.
         """
         Stanley Controller
 

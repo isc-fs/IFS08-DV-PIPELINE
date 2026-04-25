@@ -152,12 +152,21 @@ class Control(Node):
         #   control_gain: was 4.0; reduced because the old wheelbase default of
         #     3.0 m was ~2× the real FS car value and was artificially inflating
         #     the projected cross-track error, effectively amplifying this gain.
-        #   steering_damp_gain: doubled to smooth high-frequency oscillation
-        #     observed on straights.
+        #   steering_damp_gain: was 1.0 — but the formula in
+        #     StanleyController.stanley_control() is:
+        #         output = desired - k_damp * (desired - prev)
+        #               = (1 - k_damp) * desired + k_damp * prev
+        #     so k_damp = 1.0 makes output = prev, which starts at 0 and is
+        #     fed back as the next "prev", locking steering at 0 forever.
+        #     Set to 0.0 (no damping) until we see the oscillation return.
+        #     Acceleration didn't expose this because a straight path gives
+        #     `desired ≈ 0` so output ≈ 0 was coincidentally correct.
+        #     Autocross with curved paths surfaced it immediately — car drove
+        #     dead-straight through every curve until off-track.
         self.declare_parameter("control_gain", 2.5)
         self.declare_parameter("softening_gain", 6.0)
         self.declare_parameter("yaw_rate_gain", 0.0)
-        self.declare_parameter("steering_damp_gain", 1.0)
+        self.declare_parameter("steering_damp_gain", 0.0)
         # Wheelbase for the Stanley front-axle projection. Authoritative
         # value from the IFS-08 Susp_Geometry sheet (CAD): 1600 mm. Matches
         # MODEL_IFS_08/SIMSCAPE and the chassis hardpoint data; the
@@ -442,7 +451,15 @@ class Control(Node):
         if abs(self.velocity) < 0.5:
             self.steering = 0.0
         else:
-            self.steering = -limited_steering_angle
+            # Sign convention: Stanley returns positive when the path is to the
+            # right of the car (front_axle_vector = (sin yaw, -cos yaw) points
+            # right). UE5's `setSteeringInput` is positive=right too, so we
+            # forward Stanley's output as-is. The previous `-limited_steering_angle`
+            # was a leftover compensation from when the cross-track sign was
+            # mistakenly assumed standard-Stanford (positive = path-left); empirically
+            # the negation drove the car the wrong way through every curve in
+            # autocross.
+            self.steering = limited_steering_angle
         command_msg.steering = self.steering / np.deg2rad(self.max_steering_ang)
 
         self.command_publisher.publish(command_msg)
