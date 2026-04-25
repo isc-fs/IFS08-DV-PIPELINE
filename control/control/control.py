@@ -457,15 +457,30 @@ class Control(Node):
         if abs(self.velocity) < 0.5:
             self.steering = 0.0
         else:
-            # Sign convention: Stanley returns positive when the path is to the
-            # right of the car (front_axle_vector = (sin yaw, -cos yaw) points
-            # right). UE5's `setSteeringInput` is positive=right too, so we
-            # forward Stanley's output as-is. The previous `-limited_steering_angle`
-            # was a leftover compensation from when the cross-track sign was
-            # mistakenly assumed standard-Stanford (positive = path-left); empirically
-            # the negation drove the car the wrong way through every curve in
-            # autocross.
-            self.steering = limited_steering_angle
+            # Sign convention reasoning (corrected after live drive in fix/46
+            # validation):
+            #
+            #   The Stanley implementation in StanleyController follows the
+            #   Stanford-paper convention where the OUTPUT semantics are
+            #   "positive = LEFT turn" (CCW). The cross-track formula's
+            #   `front_axle_vector = (sin yaw, -cos yaw)` points to the car's
+            #   right, so a path on the LEFT of the car gives a positive
+            #   `crosstrack_error` — and the formula then returns a positive
+            #   `crosstrack_steering_error` meaning "turn LEFT toward the
+            #   path." Same with `yaw_error`: positive when path heads more
+            #   CCW than vehicle, meaning "turn LEFT." Both terms agree.
+            #
+            #   UE5's `setSteeringInput` uses the opposite convention:
+            #   positive = RIGHT. So we MUST negate Stanley's output to
+            #   match UE5.
+            #
+            #   fix/43 mistakenly dropped this negation thinking the
+            #   front_axle_vector pointing right meant the OUTPUT was
+            #   "positive=right". It isn't — that vector is just the
+            #   reference frame for measuring crosstrack, the output
+            #   convention is still standard-Stanley. Re-instating the
+            #   negation here.
+            self.steering = -limited_steering_angle
         command_msg.steering = self.steering / np.deg2rad(self.max_steering_ang)
 
         self.command_publisher.publish(command_msg)
