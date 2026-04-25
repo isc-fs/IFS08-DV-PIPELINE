@@ -27,7 +27,8 @@ import rclpy
 from rclpy.node import Node
 
 from tf2_ros import TransformBroadcaster
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped, Point, PointStamped
+from tf2_geometry_msgs import do_transform_point
 
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs.msg import LaserScan
@@ -111,6 +112,46 @@ class Publicar_Mapa(Node):
 
         self.mapa.actualizar_mapa()
         self.mapa.generar_trazas(t, t_inv)
+
+        # Spatial blue/yellow classification, applied AFTER generar_trazas.
+        #
+        # `actualizar_mapa` initialises every cone with color='ns' (unknown);
+        # `generar_trazas` then walks the closest blue + closest yellow chain
+        # (by repeated nearest-neighbour) and tags those cones along the way.
+        # That algorithm is fragile — a single missing detection breaks the
+        # chain, leaving the rest of the cones tagged 'ns'. The path planner
+        # (path_planning.py:130-135) classifies by RGB and routes 'ns' →
+        # `unknown_cones`, where fsd_path_planning has to internally guess
+        # left vs right; under motion that guess flips and the centreline
+        # destabilises.
+        #
+        # Override here with a simple position-based rule:
+        #   vehicle frame (REP-103: +X forward, +Y left, +Z up)
+        #   cone.y_rel > tol     → left  → 'Azul'
+        #   cone.y_rel < -tol    → right → 'Amarillo'
+        #   |cone.y_rel| < tol   → 'ns'  (centreline ambiguity)
+        #
+        # The cone's ODOM-frame position (cono.x, cono.y) is transformed back
+        # into vehicle frame using t_inv. Reference cones picked by
+        # generar_trazas keep their 'ref' tag for the visualiser.
+        #
+        # This is purely position-based — for the on-car target a
+        # vision-based color classifier is needed. Tracked separately.
+        CENTRELINE_TOL_M = 0.4
+        for cono in self.mapa.conos:
+            if cono.color == 'ref':
+                continue  # keep reference tags for visualisation
+            try:
+                p = Point(x=cono.x, y=cono.y, z=0.0)
+                p_rel = do_transform_point(PointStamped(point=p), t_inv).point
+            except Exception:
+                continue
+            if p_rel.y > CENTRELINE_TOL_M:
+                cono.color = 'Azul'
+            elif p_rel.y < -CENTRELINE_TOL_M:
+                cono.color = 'Amarillo'
+            else:
+                cono.color = 'ns'
 
         markerArray = MarkerArray()
 
