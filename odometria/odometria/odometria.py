@@ -64,8 +64,17 @@ class PosicionNode(Node):
         self.odom_pub = self.create_publisher(Odometry, "odom", 10)
 
         # Suscripciones
+        # /gss is BEST_EFFORT on the publisher side — match here so the
+        # subscription actually connects (RELIABLE↔BEST_EFFORT is a hard
+        # incompatibility in ROS 2).
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+        sensor_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         self.gss_subscriber = self.create_subscription(
-            TwistWithCovarianceStamped, "/fsds/gss", self.gss_callback, 10
+            TwistWithCovarianceStamped, "/fsds/gss", self.gss_callback, sensor_qos
         )
         self.control_command_sub = self.create_subscription(
             ControlCommand, "/fsds/control_command", self.control_command_callback, 10

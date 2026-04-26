@@ -28,12 +28,20 @@ class Publicar_TF(Node):
         # Publicacion
         self.tf_broadcaster = TransformBroadcaster(self)
 
+        # /testing_only/odom is BEST_EFFORT on the publisher side — match
+        # here or the subscription silently fails to connect.
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+        sensor_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         # Subscricion
         self.posicion = self.create_subscription(
             Odometry,
             "/fsds/testing_only/odom",  ##Mensaje de Odometria---Mas adelante cambiar a estimacion VREL
             self.listener_callback,
-            10,
+            sensor_qos,
         )
 
     def listener_callback(self, odom):

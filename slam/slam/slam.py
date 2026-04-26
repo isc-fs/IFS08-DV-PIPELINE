@@ -125,19 +125,24 @@ class Publicar_Mapa(Node):
         # left vs right; under motion that guess flips and the centreline
         # destabilises.
         #
-        # Override here with a simple position-based rule:
-        #   vehicle frame (REP-103: +X forward, +Y left, +Z up)
-        #   cone.y_rel > tol     → left  → 'Azul'
-        #   cone.y_rel < -tol    → right → 'Amarillo'
-        #   |cone.y_rel| < tol   → 'ns'  (centreline ambiguity)
+        # Override here with a simple sign-based rule (vehicle frame,
+        # REP-103: +Y = left of car):
+        #   cone.y_rel > 0   → left  → 'Azul'
+        #   cone.y_rel ≤ 0   → right → 'Amarillo'
         #
-        # The cone's ODOM-frame position (cono.x, cono.y) is transformed back
-        # into vehicle frame using t_inv. Reference cones picked by
+        # The cone's ODOM-frame position (cono.x, cono.y) is transformed
+        # back into vehicle frame using t_inv. Reference cones picked by
         # generar_trazas keep their 'ref' tag for the visualiser.
         #
+        # Previously had a 0.4 m centreline tolerance with any cone in
+        # ±0.4 m vehicle-Y bucketed as 'ns' (unknown). The trajectory
+        # recording from the previous session showed lots of LEFT-side
+        # cones tagged 'ns', the path-planner forward-cone gate (≥ 2 LEFT
+        # cones ahead) starved on that, and /Path never published — the
+        # car sat at spawn for the entire session. Real corridor cones
+        # aren't on the centreline anyway; sign-only is correct here.
         # This is purely position-based — for the on-car target a
         # vision-based color classifier is needed. Tracked separately.
-        CENTRELINE_TOL_M = 0.4
         for cono in self.mapa.conos:
             if cono.color == 'ref':
                 continue  # keep reference tags for visualisation
@@ -146,12 +151,10 @@ class Publicar_Mapa(Node):
                 p_rel = do_transform_point(PointStamped(point=p), t_inv).point
             except Exception:
                 continue
-            if p_rel.y > CENTRELINE_TOL_M:
+            if p_rel.y > 0.0:
                 cono.color = 'Azul'
-            elif p_rel.y < -CENTRELINE_TOL_M:
-                cono.color = 'Amarillo'
             else:
-                cono.color = 'ns'
+                cono.color = 'Amarillo'
 
         markerArray = MarkerArray()
 

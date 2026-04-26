@@ -181,6 +181,36 @@ class Plan_Path(Node):
         )
         car_direction = numpy.array([numpy.cos(yaw), numpy.sin(yaw)])
 
+        # Forward-cone gate. fsd_path_planning produces a degenerate path
+        # when the visible cones are all at or behind the car's longitudinal
+        # position — its cone-walking heuristic falls back to the cross-
+        # track LEFT–RIGHT pairing axis. At session start the car spawns
+        # inside the start gate, the only cones in view are the four big-
+        # orange corners straddling the car, and the resulting path comes
+        # out 90° rotated (track goes north, planner emits east — DIAG
+        # captured xte=+4.6 m, yaw_err=−90° for several seconds before
+        # forward cones came into view). Require ≥ 2 LEFT + 2 RIGHT cones
+        # ahead of the car (vehicle-frame X > 0) before publishing; while
+        # the gate is closed the previous /Path stays in effect (or the
+        # control loop sees forward_path_points empty and brakes neutral).
+        left_arr = global_cones[ConeTypes.LEFT]
+        right_arr = global_cones[ConeTypes.RIGHT]
+
+        def _count_ahead(arr):
+            if arr.shape[0] == 0:
+                return 0
+            fwd = (
+                (arr[:, 0] - car_position[0]) * car_direction[0]
+                + (arr[:, 1] - car_position[1]) * car_direction[1]
+            )
+            return int((fwd > 0.0).sum())
+
+        MIN_AHEAD_PER_SIDE = 2
+        left_ahead = _count_ahead(left_arr)
+        right_ahead = _count_ahead(right_arr)
+        if left_ahead < MIN_AHEAD_PER_SIDE or right_ahead < MIN_AHEAD_PER_SIDE:
+            return
+
         try:
             path = self.path_planner.calculate_path_in_global_frame(
                 global_cones, car_position, car_direction
@@ -202,6 +232,16 @@ class Plan_Path(Node):
         s_dense = numpy.linspace(s[0], s[-1], num=30)
         px = numpy.interp(s_dense, s, x)
         py = numpy.interp(s_dense, s, y)
+
+        # Temporal path smoothing was tested at α=0.5 (same-index blend
+        # with the previous published path) but the trajectory recorder
+        # showed a consistent leftward drift on a straight section of
+        # track even though the latest /Path was correct: the smoothed
+        # first points lag ~0.5–1 m behind the car, biasing the PP
+        # preview-point bearing one direction over many ticks. Reverted
+        # to publishing the new path crisply each callback. Path-noise
+        # mitigation has to live downstream (controller filtering) or
+        # be done in arc-length space, not by blending world positions.
         dx_ds = numpy.gradient(px, s_dense)
         dy_ds = numpy.gradient(py, s_dense)
         pyaw = numpy.arctan2(dy_ds, dx_ds)

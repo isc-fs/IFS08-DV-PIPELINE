@@ -9,6 +9,7 @@ from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Empty
 from visualization_msgs.msg import MarkerArray
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.time import Time
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -69,17 +70,26 @@ class Control(Node):
         self.path_subscriber = self.create_subscription(
             Path, "Path", self.path_callback, self.QUEUE_SIZE
         )
+        # /gss and /testing_only/odom are published BEST_EFFORT by the
+        # bridge (high-rate sensor stream — drops are correct, backpressure
+        # is not). RELIABLE subscribers will silently fail to connect to
+        # BEST_EFFORT publishers in ROS 2, so match the QoS here.
+        sensor_qos = QoSProfile(
+            depth=self.QUEUE_SIZE,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         self.velocity_subscriber = self.create_subscription(
             TwistWithCovarianceStamped,
             "/fsds/gss",
             self.velocity_callback,
-            self.QUEUE_SIZE,
+            sensor_qos,
         )
         self.odom_subscriber = self.create_subscription(
             Odometry,
             "/fsds/testing_only/odom",
             self.odometry_callback,
-            self.QUEUE_SIZE,
+            sensor_qos,
         )
         # Big-orange cones detected by Cone_Detection on measured cluster
         # height (505 mm big-orange vs 325 mm small — see DS Table 1). Cones
@@ -138,6 +148,28 @@ class Control(Node):
         # Monotonic minimum — refinements can only pull the target closer.
         self.latched_stop_traveled: Optional[float] = None
         self.ebs_requested: bool = False
+
+        # Continuity state across control ticks. The path planner publishes a
+        # fresh /Path every tick (path_planning.py: ~30-pt resample of fsd's
+        # output). Each new path is geometrically close to the last on a
+        # straight, but at curve entry the cones in view shift and the new
+        # path's nearest-point-to-vehicle can land several metres further
+        # along than the old one. Stanley's argmin then jumps forward, the
+        # heading at the new index is very different, yaw_err steps, and
+        # steering saturates. We anchor the target index across solves by
+        # tracking the previous tick's target world location and clipping
+        # the new index to forward-only motion within physical limits.
+        self._prev_target_world: Optional[Tuple[float, float]] = None
+        # Steering rate-limit backstop. Real steering actuators slew at a
+        # finite rate; software limit also smooths transients when the
+        # anchor above can't fully suppress a discontinuity.
+        self._prev_steering_cmd: float = 0.0
+        # Planner-warm gate: hold the car stationary until the planner has
+        # produced the same-shape path on at least two consecutive ticks.
+        # The pre-go DIAG capture showed yaw_err = -89.7° / xte = +4.59 m
+        # before the first real solve — benign only because v_tgt was 0.
+        self._prev_path_signature = None
+        self._path_stable_count: int = 0
 
     def _setup_timer(self) -> None:
         """Schedule the periodic execution of the control loop callback."""
@@ -342,16 +374,95 @@ class Control(Node):
             ]
         )
 
+        # Planner-warm gate. The first one-or-two solves of every session
+        # produce a path that doesn't reflect the actual cones in view, so
+        # hold neutral until the path geometry is stable across at least
+        # two consecutive ticks. Cheap signature: number of poses + the
+        # rounded first-pose location.
+        path_signature = (
+            len(self.path.poses),
+            round(float(px[0]), 1),
+            round(float(py[0]), 1),
+        )
+        if path_signature == self._prev_path_signature:
+            self._path_stable_count += 1
+        else:
+            self._path_stable_count = 0
+        self._prev_path_signature = path_signature
+        if self._path_stable_count < 2 and self.velocity < 0.5:
+            command_msg.throttle = 0.0
+            command_msg.brake = 0.05
+            command_msg.steering = 0.0
+            self.command_publisher.publish(command_msg)
+            return
+
         # Feed the local path into the Stanley controller and obtain the steering demand
         self.stanley_controller.set_path(px, py, pyaw)
+
+        # Arc-length anchor across path solves. We re-project the previous
+        # target's world location onto the new path each tick and constrain
+        # the new target index to the forward window
+        # `[idx_of_prev_on_new_path, idx_of_prev_on_new_path + max_step]`
+        # where `max_step` is the number of indices the vehicle can have
+        # physically advanced this tick (`v · dt` plus a 1 m safety buffer).
+        # The natural argmin is then clipped into this window. On a straight
+        # this is a no-op (argmin == prev + 1); on the curve replans that
+        # tripped the previous run, the leap is suppressed and yaw_err / xte
+        # change continuously.
+        nat_target, _ndx, _ndy, _nabs = self.stanley_controller.find_target_path_id(
+            float(odom_to_vehicle.transform.translation.x),
+            float(odom_to_vehicle.transform.translation.y),
+            float(yaw),
+        )
+        nat_target = int(nat_target)
+        if self._prev_target_world is None or len(px) <= 1:
+            target_index = nat_target
+        else:
+            d_prev = np.hypot(
+                px - self._prev_target_world[0], py - self._prev_target_world[1]
+            )
+            idx_prev = int(np.argmin(d_prev))
+            ds = np.hypot(np.diff(px), np.diff(py))
+            avg_ds = float(np.mean(ds)) if ds.size and float(np.mean(ds)) > 1e-3 else 0.7
+            max_step_m = max(0.1, abs(self.velocity)) / self.PUBLISH_RATE_HZ + 1.0
+            max_step_idx = max(1, int(np.ceil(max_step_m / avg_ds)))
+            target_index = int(
+                np.clip(nat_target, idx_prev, min(idx_prev + max_step_idx, len(px) - 1))
+            )
+
+        # Velocity-scaled preview point for the Pure-Pursuit heading
+        # term. Walk forward along the path from target_index until
+        # cumulative arc length reaches L_d = max(3.5, 0.5 · |v|).
+        # The 3.5 m floor (≈ 2 · wheelbase) keeps PP in its stable
+        # regime — below ~2L the geometric formula
+        #   δ = atan2(2 · L · sin α, L_d)
+        # interprets a slightly-off preview point as a tight sub-
+        # wheelbase turning radius and saturates max_steer on tiny α.
+        # At v = 10 m/s the floor lifts to 5 m, giving roughly 0.5 s
+        # of preview which the chassis can actually realise.
+        L_d = max(3.5, 0.5 * abs(self.velocity))
+        preview_index = target_index
+        cumlen = 0.0
+        for i in range(target_index + 1, len(px)):
+            cumlen += float(np.hypot(px[i] - px[i - 1], py[i] - py[i - 1]))
+            preview_index = i
+            if cumlen >= L_d:
+                break
+
         (limited_steering_angle, _target_index, crosstrack_error) = (
-            self.stanley_controller.stanley_control(
+            self.stanley_controller.stanley_control_at_index(
                 float(odom_to_vehicle.transform.translation.x),
                 float(odom_to_vehicle.transform.translation.y),
                 float(yaw),
                 self.velocity,
+                target_index,
                 self.steering,
+                preview_index,
             )
+        )
+        self._prev_target_world = (
+            float(px[target_index]),
+            float(py[target_index]),
         )
         # Update the travelled-distance counter used by the orange stop gate.
         cx = float(odom_to_vehicle.transform.translation.x)
@@ -481,9 +592,53 @@ class Control(Node):
             #   convention is still standard-Stanley. Re-instating the
             #   negation here.
             self.steering = -limited_steering_angle
+
+        # Steering slew-rate limit. Real-car servo + tie-rod system slews at
+        # roughly 500–700 °/s; we clamp tighter (360 °/s ⇒ 0.157 rad/tick at
+        # 40 Hz) to absorb residual transients the arc-length anchor above
+        # cannot suppress (e.g. a single mis-detected cone shifting the
+        # planned path's curvature for one tick). A clean lap should never
+        # hit this limit — it's only a backstop.
+        max_steer_rate_rad_per_tick = np.deg2rad(360.0) / self.PUBLISH_RATE_HZ
+        self.steering = float(np.clip(
+            self.steering,
+            self._prev_steering_cmd - max_steer_rate_rad_per_tick,
+            self._prev_steering_cmd + max_steer_rate_rad_per_tick,
+        ))
+        self._prev_steering_cmd = self.steering
+
         command_msg.steering = self.steering / np.deg2rad(self.max_steering_ang)
 
         self.command_publisher.publish(command_msg)
+
+        # === DIAGNOSTIC LOGGING (every 8 ticks ≈ 5 Hz at 40 Hz publish) ===
+        # Captures the key signals to understand what the controller "sees"
+        # at the moment it commands a steering/throttle decision. Used to
+        # diagnose high-speed curve failures: is the path shrinking on
+        # turn-in? does the kinematic stop cap kick in early? does the
+        # cross-track jump suddenly when the path re-plans?
+        self._diag_tick = getattr(self, '_diag_tick', 0) + 1
+        if self._diag_tick % 8 == 0:
+            # Cumulative distance along forward_path_points — actual
+            # forward path the controller is following right now.
+            path_len_m = 0.0
+            for i in range(1, len(forward_path_points)):
+                dx_p = forward_path_points[i][0] - forward_path_points[i-1][0]
+                dy_p = forward_path_points[i][1] - forward_path_points[i-1][1]
+                path_len_m += float(np.hypot(dx_p, dy_p))
+            # Velocity controller exposes its filtered target speed.
+            v_target = getattr(self.velocity_controller, 'filtered_target_speed', float('nan'))
+            d_end_str = f"{distance_to_path_end:.1f}" if distance_to_path_end is not None else "n/a"
+            self.get_logger().info(
+                f"DIAG spd={self.velocity:5.2f} v_tgt={v_target:5.2f} "
+                f"v_cmd={velocity_command_value:+5.2f} "
+                f"thr={command_msg.throttle:.2f} brk={command_msg.brake:.2f} | "
+                f"path_n={len(forward_path_points):2d} path_len={path_len_m:5.1f}m "
+                f"d_end={d_end_str:>5}m | "
+                f"xte={crosstrack_error:+5.2f}m yaw_err={float(np.degrees(wrap_to_pi(pyaw[_target_index] - yaw))):+6.1f}deg "
+                f"stanley={float(np.degrees(limited_steering_angle)):+6.1f}deg "
+                f"steer_cmd={command_msg.steering:+.3f}"
+            )
 
     def get_transforms(
         self,
