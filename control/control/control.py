@@ -57,7 +57,7 @@ class Control(Node):
         # fresh session always starts with controls accepted. Without this, an
         # autonomous-stop at the end of session N (line ~424 below) would
         # leave the bridge dropping every setCarControls in session N+1 until
-        # the user manually restarted ros_stack. Published once below; the
+        # the user manually restarted dv_pipeline_stack. Published once below; the
         # bridge listens with the same TRANSIENT_LOCAL QoS so a
         # subscription-after-publish still picks it up.
         self.ebs_reset_publisher = self.create_publisher(
