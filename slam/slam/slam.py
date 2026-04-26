@@ -77,10 +77,65 @@ class Publicar_Mapa(Node):
         # Iniciar calse Mapa
         self.mapa = Mapa()
 
+        # Color cache. `mapa.actualizar_mapa` rebuilds `self.conos` from
+        # scratch every tick with `color='ns'`, and the spatial classifier
+        # below would otherwise re-decide blue/yellow purely from the
+        # current vehicle-frame Y of each cone — which flips for cones
+        # near the longitudinal axis as the car rotates through a corner.
+        # Direct cause of unstable /Path R values (audit 2026-04-26: R
+        # bouncing 220m → 8m → 3m → 0.9m within 3s during a curve attempt).
+        #
+        # Cache strategy: keyed by world position (snap radius 0.5 m, well
+        # within DBSCAN cluster drift ~10 cm and far below the FSG 3 m min
+        # cone spacing). First classification wins; later ticks reuse the
+        # cached color regardless of where the cone falls in vehicle frame.
+        # Cleared on /reset. Each entry is (world_x, world_y, color).
+        self._color_cache = []
+        self._color_cache_radius_sq = 0.5 ** 2
+
+        # Diagnostic counters for the cache, logged once per second.
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_last_log_ns = 0
+
+    def _lookup_or_classify(self, world_x: float, world_y: float, p_rel_y: float) -> str:
+        """Return the cached color for the cone at (world_x, world_y), or
+        classify it from `p_rel_y` (sign-of-Y rule, vehicle frame REP-103),
+        cache the result, and return it. Linear scan over the cache — for
+        FSD tracks (≤300 cones) this is cheaper than a KDTree rebuild."""
+        rsq = self._color_cache_radius_sq
+        for cx, cy, color in self._color_cache:
+            if (world_x - cx) ** 2 + (world_y - cy) ** 2 < rsq:
+                self._cache_hits += 1
+                return color
+        self._cache_misses += 1
+        color = 'Azul' if p_rel_y > 0.0 else 'Amarillo'
+        self._color_cache.append((world_x, world_y, color))
+        return color
+
+    def _maybe_log_cache_stats(self):
+        now_ns = self.get_clock().now().nanoseconds
+        if self._cache_last_log_ns == 0:
+            self._cache_last_log_ns = now_ns
+            return
+        if now_ns - self._cache_last_log_ns < 1_000_000_000:
+            return
+        total = self._cache_hits + self._cache_misses
+        if total > 0:
+            self.get_logger().info(
+                f"COLOR_CACHE size={len(self._color_cache)} "
+                f"hits={self._cache_hits} misses={self._cache_misses} "
+                f"hit_rate={100.0 * self._cache_hits / total:.0f}%"
+            )
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_last_log_ns = now_ns
+
     def reset_callback(self, request, response):
         self.mapa.conos = []
         self.mapa.deteciones = []
-        self.get_logger().info("Reseteando Mapa")
+        self._color_cache = []
+        self.get_logger().info("Reseteando Mapa (color cache cleared)")
         return response
 
     def listener_callback(self, msg):
@@ -113,48 +168,25 @@ class Publicar_Mapa(Node):
         self.mapa.actualizar_mapa()
         self.mapa.generar_trazas(t, t_inv)
 
-        # Spatial blue/yellow classification, applied AFTER generar_trazas.
-        #
-        # `actualizar_mapa` initialises every cone with color='ns' (unknown);
-        # `generar_trazas` then walks the closest blue + closest yellow chain
-        # (by repeated nearest-neighbour) and tags those cones along the way.
-        # That algorithm is fragile — a single missing detection breaks the
-        # chain, leaving the rest of the cones tagged 'ns'. The path planner
-        # (path_planning.py:130-135) classifies by RGB and routes 'ns' →
-        # `unknown_cones`, where fsd_path_planning has to internally guess
-        # left vs right; under motion that guess flips and the centreline
-        # destabilises.
-        #
-        # Override here with a simple sign-based rule (vehicle frame,
-        # REP-103: +Y = left of car):
-        #   cone.y_rel > 0   → left  → 'Azul'
-        #   cone.y_rel ≤ 0   → right → 'Amarillo'
-        #
-        # The cone's ODOM-frame position (cono.x, cono.y) is transformed
-        # back into vehicle frame using t_inv. Reference cones picked by
-        # generar_trazas keep their 'ref' tag for the visualiser.
-        #
-        # Previously had a 0.4 m centreline tolerance with any cone in
-        # ±0.4 m vehicle-Y bucketed as 'ns' (unknown). The trajectory
-        # recording from the previous session showed lots of LEFT-side
-        # cones tagged 'ns', the path-planner forward-cone gate (≥ 2 LEFT
-        # cones ahead) starved on that, and /Path never published — the
-        # car sat at spawn for the entire session. Real corridor cones
-        # aren't on the centreline anyway; sign-only is correct here.
-        # This is purely position-based — for the on-car target a
-        # vision-based color classifier is needed. Tracked separately.
+        # Color assignment, applied AFTER generar_trazas. First time we see
+        # a cone (cache miss) we classify it by sign of vehicle-frame Y
+        # (REP-103: +Y = left of car). On subsequent ticks the color cache
+        # returns the already-decided color regardless of the cone's
+        # current vehicle-frame Y — this is the fix for the corner-flip
+        # failure where R (path radius) was oscillating 220m→8m→0.9m as
+        # cones near the longitudinal axis flipped sides on every tick.
+        # 'ref' cones (the two reference picks from generar_trazas) keep
+        # their ref tag for visualisation and are not classified here.
         for cono in self.mapa.conos:
             if cono.color == 'ref':
-                continue  # keep reference tags for visualisation
+                continue
             try:
                 p = Point(x=cono.x, y=cono.y, z=0.0)
                 p_rel = do_transform_point(PointStamped(point=p), t_inv).point
             except Exception:
                 continue
-            if p_rel.y > 0.0:
-                cono.color = 'Azul'
-            else:
-                cono.color = 'Amarillo'
+            cono.color = self._lookup_or_classify(cono.x, cono.y, p_rel.y)
+        self._maybe_log_cache_stats()
 
         markerArray = MarkerArray()
 

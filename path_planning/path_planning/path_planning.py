@@ -112,7 +112,56 @@ class Plan_Path(Node):
             self.get_logger().warn(f"Plan_Path: JIT warmup failed (non-fatal): {ex}")
         # global_cones, car_position, car_direction = load_data()
 
+        # Instrumentation for the curve-failure audit. Each callback falls
+        # into exactly one of these buckets; per-second rates are logged
+        # in _maybe_log_stats. A healthy run should be cb≈pub (every
+        # callback publishes) — gate_miss > 0 directly proves the
+        # forward-cone gate is starving the controller during the corner.
+        self._stats = {
+            "callbacks": 0,
+            "low_cones":   0,        # < 2 total cones in /Conos this tick
+            "gate_miss_L": 0,        # left_ahead < threshold
+            "gate_miss_R": 0,        # right_ahead < threshold
+            "gate_miss_both": 0,     # both sides starved
+            "tf_miss":     0,        # TF lookup failed
+            "plan_excpt":  0,        # fsd_path_planning raised
+            "plan_short":  0,        # planner returned < 2 points
+            "publish":     0,        # fresh path emitted
+        }
+        self._stats_prev = dict(self._stats)
+        self._stats_last_log_ns = 0
+        self._window_min_L_ahead = 999
+        self._window_min_R_ahead = 999
+
+    def _maybe_log_stats(self):
+        now_ns = self.get_clock().now().nanoseconds
+        if self._stats_last_log_ns == 0:
+            self._stats_last_log_ns = now_ns
+            return
+        if now_ns - self._stats_last_log_ns < 1_000_000_000:
+            return
+        dt = (now_ns - self._stats_last_log_ns) / 1e9
+        d = {k: self._stats[k] - self._stats_prev[k] for k in self._stats}
+        miss_total = d["gate_miss_L"] + d["gate_miss_R"] + d["gate_miss_both"]
+        # min_L/min_R show the worst-case margin in the window. Sentinel
+        # 999 means "no callback in the window had cone counts to record"
+        # — render as 'n/a' to avoid confusion with a real high count.
+        min_L = "n/a" if self._window_min_L_ahead == 999 else str(self._window_min_L_ahead)
+        min_R = "n/a" if self._window_min_R_ahead == 999 else str(self._window_min_R_ahead)
+        self.get_logger().info(
+            f"PATH_RATE cb={d['callbacks']/dt:4.1f}/s pub={d['publish']/dt:4.1f}/s "
+            f"gate_miss={miss_total/dt:4.1f}/s (L={d['gate_miss_L']} R={d['gate_miss_R']} "
+            f"both={d['gate_miss_both']}) min_L={min_L} min_R={min_R} "
+            f"low={d['low_cones']} tf={d['tf_miss']} "
+            f"excpt={d['plan_excpt']} short={d['plan_short']}"
+        )
+        self._stats_prev = dict(self._stats)
+        self._stats_last_log_ns = now_ns
+        self._window_min_L_ahead = 999
+        self._window_min_R_ahead = 999
+
     def listener_callback(self, msg):
+        self._stats["callbacks"] += 1
         self.mapa = msg
         global_cones = [numpy.zeros((0, 2)) for _ in range(5)]
         left_cones = []   # blue (ConeTypes.LEFT)
@@ -143,6 +192,8 @@ class Plan_Path(Node):
 
         total_cones = len(left_cones) + len(right_cones) + len(unknown_cones)
         if total_cones < 2:
+            self._stats["low_cones"] += 1
+            self._maybe_log_stats()
             return
 
         # global_cones is a sequence that contains 5 numpy arrays with shape (N, 2),
@@ -159,12 +210,16 @@ class Plan_Path(Node):
             t = self.tf_buffer.lookup_transform("odom", "fsds/FSCar", rclpy.time.Time())
         except TransformException as ex:
             self.get_logger().warn(f"TF lookup failed: {ex}")
+            self._stats["tf_miss"] += 1
+            self._maybe_log_stats()
             return
 
         try:
             t_inv = self.tf_buffer.lookup_transform("fsds/FSCar", "odom", rclpy.time.Time())
         except TransformException as ex:
             self.get_logger().warn(f"TF inverse lookup failed: {ex}")
+            self._stats["tf_miss"] += 1
+            self._maybe_log_stats()
             return
 
         yaw = quat2euler(
@@ -205,10 +260,39 @@ class Plan_Path(Node):
             )
             return int((fwd > 0.0).sum())
 
-        MIN_AHEAD_PER_SIDE = 2
+        # Dropped 2 → 1 on 2026-04-26 after the color-cache patch run
+        # showed sustained gate-miss starvation (gate_miss=10/s, all R-side)
+        # late in the corner — the path stopped publishing for ~3s while
+        # the car drifted off. With color-classification stable from the
+        # cache, a single forward cone per side is enough to define a
+        # corridor edge; the planner can pair it with whatever else is
+        # visible. The min_L/min_R counts in the PATH_RATE log fingerprint
+        # whether this threshold drop covered the failing case (min_R=1)
+        # or whether even 1 was too high (min_R=0 — needs upstream fix).
+        MIN_AHEAD_PER_SIDE = 1
         left_ahead = _count_ahead(left_arr)
         right_ahead = _count_ahead(right_arr)
+        self._window_min_L_ahead = min(self._window_min_L_ahead, left_ahead)
+        self._window_min_R_ahead = min(self._window_min_R_ahead, right_ahead)
         if left_ahead < MIN_AHEAD_PER_SIDE or right_ahead < MIN_AHEAD_PER_SIDE:
+            l_short = left_ahead < MIN_AHEAD_PER_SIDE
+            r_short = right_ahead < MIN_AHEAD_PER_SIDE
+            if l_short and r_short:
+                self._stats["gate_miss_both"] += 1
+            elif l_short:
+                self._stats["gate_miss_L"] += 1
+            else:
+                self._stats["gate_miss_R"] += 1
+            # Per-tick gate-miss detail. UNKNOWN bucket includes 'ref'-tagged
+            # cones (RGB white from generar_trazas) and any cone the spatial
+            # classifier couldn't tag — diagnostic for whether allowing the
+            # planner to use UNKNOWN cones in the gate would rescue the run.
+            unknown_ahead = _count_ahead(global_cones[ConeTypes.UNKNOWN])
+            self.get_logger().info(
+                f"GATE_MISS L={left_ahead} R={right_ahead} U={unknown_ahead} "
+                f"total_ahead={left_ahead + right_ahead + unknown_ahead}"
+            )
+            self._maybe_log_stats()
             return
 
         try:
@@ -217,10 +301,14 @@ class Plan_Path(Node):
             )
         except Exception as ex:
             self.get_logger().warn(f"Path calculation failed: {ex}")
+            self._stats["plan_excpt"] += 1
+            self._maybe_log_stats()
             return
 
         if path is None or len(path) < 2:
             self.get_logger().warn("Path planner returned empty path — skipping publish")
+            self._stats["plan_short"] += 1
+            self._maybe_log_stats()
             return
 
         s, x, y = [], [], []
@@ -252,6 +340,8 @@ class Plan_Path(Node):
             track.poses.append(gen_mark(float(xi), float(py[i]), pyaw[i]))
 
         self.publisher_path.publish(track)
+        self._stats["publish"] += 1
+        self._maybe_log_stats()
 
 
 class Reser_server(Node):

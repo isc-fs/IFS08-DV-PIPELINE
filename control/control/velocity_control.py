@@ -23,18 +23,14 @@ class VelocityControl:
         Kd: float,
         Fg: float,
         max_speed: float = 10,
-        # max_normal_acceleration was 7 m/s² — at R = 10 m that allowed
-        # v_curve ≈ √(7·10) = 8.4 m/s, where the chassis kinematic limit
-        # ω_max = v·tan(δ_max)/L (≈ 2.0 rad/s = 114°/s at v = 6.8 m/s,
-        # δ_max = 25°, L = 1.60 m) only just exceeds the rate at which the
-        # path's heading was changing during curve entry. Stanley spent
-        # the whole corner at full lock with no margin, then overshot
-        # past the apex and snake-danced (DIAG: yaw_err 20° → 35° → 58° →
-        # 99° in 800 ms). Drop to 4 m/s² → v_curve ≈ √40 = 6.3 m/s at
-        # R = 10 m, restoring ~30 % margin to Stanley before it saturates.
-        # Tactical fix; the proper one is a velocity-scaled lookahead
-        # target in Stanley itself (separate change).
-        max_normal_acceleration: float = 4,
+        # Dropped 5 → 3.5 on 2026-04-26 after live runs with pure-Stanley
+        # (k_us=0) showed the car under-steering wide on later turns and
+        # any FF over-steered curve entry. The 5 came from steady-state
+        # circle test peak (6.4 m/s²) but transient lateral grip at curve
+        # ENTRY is much less — slip needs ~0.5-1.5s to develop. 3.5 gives
+        # ~50% transient headroom: v_curve = √(R·3.5) = 7.25 m/s on R=15
+        # vs 8.66 at 5 — slow enough that chassis dynamics catch up.
+        max_normal_acceleration: float = 3.5,
         throttle_max: float = 0.4,
         brake_max: float = 1.0,
         smoothing_factor: float = 0.3,
@@ -278,24 +274,10 @@ class VelocityControl:
         if not curvatures:
             return self.max_speed**2 / (2 * self.max_normal_acceleration)
 
-        # Use the 90th-percentile curvature, not the max. The path planner
-        # resamples fsd_path_planning's output to 30 dense points; occasional
-        # near-coincident neighbours (path_planning.py:202) push the spline
-        # second derivative through the roof at a single sample, producing a
-        # spurious κ ≈ 3 ⇒ R ≈ 0.3 m. Taking max() let one noise spike
-        # collapse v_tgt 6 m/s → 1.4 m/s in a single tick (see DIAG capture
-        # at curve entry); P90 still tracks real corners (where most of the
-        # 10 samples carry comparable κ) while rejecting solitary outliers.
-        kappa_p90 = float(np.percentile(curvatures, 90))
-        return 1.0 / kappa_p90
-
-    # Cruising-floor activation threshold. Below this speed the floor stays
-    # off, so the car can sit at rest if the perceived path is bad (e.g.
-    # the −90° / 4.6 m garbage the planner emits before Go on the very
-    # first cones). Above this speed the floor kicks in to prevent the
-    # cross-track penalty from crawling us to a stop mid-curve, which
-    # collapses Stanley's lateral authority.
-    V_FLOOR_ACTIVATE_M_S: float = 1.5
+        # Find the maximum curvature (tightest part of the curve)
+        # and return its corresponding radius (inverse of curvature).
+        max_curvature = max(curvatures)
+        return 1.0 / max_curvature
 
     def get_control_value(
         self,
@@ -303,6 +285,7 @@ class VelocityControl:
         next_points: list[list[float]],
         crosstrack_error: float,
         distance_to_path_end: float = None,
+        is_stop_area: bool = False,
     ) -> tuple[float, float]:
         """
         Compute the throttle/brake command using PID control with feedforward.
@@ -331,17 +314,23 @@ class VelocityControl:
         # car naturally decelerates as the perceived path runs out (finish of
         # an acceleration / autocross run, or just when SLAM loses cones).
         # v² = 2·a·d gives the max speed from which we can still stop in d.
-        approaching_stop = False
         if distance_to_path_end is not None and distance_to_path_end >= 0.0:
             v_stop_cap = float(np.sqrt(2.0 * self.target_decel * distance_to_path_end))
             feedforward_value = min(feedforward_value, v_stop_cap)
-            # Monotonic-decrease lock once we're inside the approach zone.
-            # Far from any stop the lock resets so the car can resume full
-            # speed on a new stretch.
-            if distance_to_path_end < 15.0:
+            # Monotonic-decrease lock — but ONLY when the distance refers to
+            # an actual orange-cone Stop Area. The fallback `distance_to_path_end`
+            # in control.py uses "euclidean to last pose of perceived path",
+            # which is always 14-20 m because the planner emits short
+            # paths with the cones in view. Latching the cap on that signal
+            # produced the 2026-04-26 failure cascade: any momentary low
+            # feedforward (cross-track penalty during a curve) latched
+            # v_tgt to ~0; once stopped, cross-track grew, gate-miss
+            # starved the planner, and the car couldn't recover. The cap
+            # is correctness-critical for autonomous-stop (don't unbrake
+            # near the finish), so keep it for that case only.
+            if is_stop_area and distance_to_path_end < 15.0:
                 self._stop_approach_cap = min(self._stop_approach_cap, feedforward_value)
                 feedforward_value = self._stop_approach_cap
-                approaching_stop = True
             else:
                 self._stop_approach_cap = float("inf")
         else:
@@ -356,27 +345,6 @@ class VelocityControl:
         # Compute raw target speed and ensure it's non-negative
         raw_target_speed = feedforward_value - crosstrack_term
         raw_target_speed = max(0.0, raw_target_speed)
-
-        # Backstop floor on cruising speed, applied AFTER the cross-track
-        # penalty so a transient large xte cannot drop v_tgt below the
-        # speed at which Stanley still has lateral authority. Stanley's
-        # cross-track term `atan2(k·e, k_soft + v)` with k_soft = 6 m/s
-        # saturates as v → 0, and the chassis yaw rate ω = v·tan(δ)/L
-        # vanishes with v — so below ~3 m/s the controller cannot recover
-        # heading or position.
-        #
-        # Two activation conditions, both required:
-        #   (a) Not approaching the Stop Area (so we can still finish).
-        #   (b) Already moving (velocity ≥ V_FLOOR_ACTIVATE). Without (b)
-        #       the floor would pull the stationary car into accelerating
-        #       even when the perceived path is the garbage planner-pre-Go
-        #       solve (xte ≈ 4.6 m, yaw_err ≈ −90°): the original v_tgt = 0
-        #       — which the cross-track penalty produces correctly there
-        #       — was the safety net keeping the car still until the
-        #       planner found real cones. The floor must not break that.
-        v_floor_min = 3.0
-        if not approaching_stop and velocity_measurement >= self.V_FLOOR_ACTIVATE_M_S:
-            raw_target_speed = max(raw_target_speed, v_floor_min)
 
         # Apply exponential moving average (EMA) to smooth target speed changes
         # This prevents abrupt speed commands that could destabilize the vehicle

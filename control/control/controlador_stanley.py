@@ -149,82 +149,43 @@ class StanleyController:
 
     def stanley_control_at_index(self, x, y, yaw, target_velocity, target_index,
                                  steering_angle=0, preview_index=None):
-        # Hybrid Pure-Pursuit + Stanley:
+        # Classic Stanley computation (yaw_error + cross-track) but the
+        # caller forces the target index instead of the internal nearest-
+        # point search. control.py uses this with the arc-length anchor so
+        # the natural argmin can't leap several metres in 200 ms when a
+        # fresh /Path arrives — the failure that motivated the anchor
+        # (DIAG: target index jumped 6.9 m in one tick at curve entry,
+        # yaw_err stepped 7° → 33°, steer_cmd saturated to ±1.0).
         #
-        #   • Cross-track (lateral) term — classic Stanley
-        #         δ_xte = atan2(k · e_xte, k_soft + v)
-        #     using the NEAREST path point at target_index. Honest "how
-        #     off-path am I now" feedback.
-        #
-        #   • Heading (longitudinal) term — Pure-Pursuit geometric law
-        #         δ_pp  = atan2(2 · L · sin α, L_d_actual)
-        #     where α is the bearing from the FRONT AXLE to the preview
-        #     point at preview_index, and L_d_actual is the chord length
-        #     to that point. δ_pp is the steer angle that would carry
-        #     the chassis through the preview point on a circular arc,
-        #     so it tracks chassis kinematics correctly. The previous
-        #     formulation (Preview-Stanley) injected `pyaw[preview] - yaw`
-        #     directly as a steer command and over-steered: at v = 6.9
-        #     m/s on a 17 m-radius corner it commanded 13° where the
-        #     geometry only requires arctan(L/R) ≈ 5.4°. That over-shot
-        #     into the curve interior on every entry.
-        #
-        # The arc-length anchor on target_index (in control.py) keeps
-        # this stable across path replans; without it the natural argmin
-        # would leap several metres at a curve where the planner's path
-        # changes shape between solves (DIAG: target index jumped 6.9 m
-        # in 200 ms before the anchor was added).
-        if preview_index is None:
-            preview_index = target_index
+        # `preview_index` is currently unused (kept for ABI stability —
+        # control.py still passes one). An earlier iteration replaced the
+        # heading term with a Pure-Pursuit geometric formula at preview;
+        # that fix was made under the assumption Stanley was over-steering
+        # the curves, but the real cause was 5.3 Hz LiDAR + Cone_Detection
+        # backlog producing yaw_err spikes from path noise. With the
+        # sensor pipeline now stable at 10 Hz (fix/48 PR #118) plain
+        # Stanley should track cleanly. If at speed it still fails at
+        # corners, re-introduce a preview heading term — but as proper
+        # Preview-Stanley (heading at preview, cross-track at nearest),
+        # not the geometric PP we tried first.
+        del preview_index  # documented above; ignored
 
         fx = x + self.wheelbase * cos(yaw)
         fy = y + self.wheelbase * sin(yaw)
-
-        # Cross-track at nearest target_index
         dx = fx - self.px[target_index]
         dy = fy - self.py[target_index]
         absolute_error = float(np.hypot(dx, dy))
+
+        yaw_error = self.calculate_yaw_term(target_index, yaw)
         crosstrack_steering_error, crosstrack_error = self.calculate_crosstrack_term(
             target_velocity, yaw, dx, dy, absolute_error
         )
-
-        # Pure-Pursuit heading term at preview_index. Two stability
-        # guards:
-        #   (a) L_d_actual must be ≥ ~2 · wheelbase or the geometric
-        #       formula δ = atan2(2L sinα, L_d) saturates on tiny α —
-        #       it interprets a slightly-off preview point as needing
-        #       a turn radius below the wheelbase, which is unphysical.
-        #       The caller's `max(3.0, 0.5·v)` gate enforces this in
-        #       arc-length terms; the explicit floor here protects
-        #       against curved paths where the chord shrinks below
-        #       the arc-length lookahead. First PP run saturated at
-        #       startup (xte=−0.42, stanley=−25°) because L_d_actual
-        #       was 0.48 m on a path that bent away from the front
-        #       axle within the first 2 m.
-        #   (b) Below ~0.5 m/s the chassis yaw rate ω = v·tan(δ)/L is
-        #       negligible regardless of δ, so any heading command is
-        #       indistinguishable from noise — but the slew-rate limit
-        #       in control.py then carries that noisy command forward
-        #       once the low-speed gate releases. Zero the heading
-        #       term while nearly stationary; cross-track still applies.
-        L_D_MIN_M = 2.0 * self.wheelbase  # wheelbase = 1.60 m → 3.2 m
-        px_to_preview = self.px[preview_index] - fx
-        py_to_preview = self.py[preview_index] - fy
-        L_d_actual = float(np.hypot(px_to_preview, py_to_preview))
-        if L_d_actual >= L_D_MIN_M and abs(target_velocity) >= 0.5:
-            alpha = wrap_to_pi(atan2(py_to_preview, px_to_preview) - yaw)
-            pp_heading_steer = atan2(
-                2.0 * self.wheelbase * sin(alpha), L_d_actual
-            )
-        else:
-            pp_heading_steer = 0.0
-
         yaw_rate_damping = self.calculate_yaw_rate_term(
             target_velocity, steering_angle
         )
 
         desired_steering_angle = (
-            pp_heading_steer + crosstrack_steering_error + yaw_rate_damping
+            yaw_error + crosstrack_steering_error + yaw_rate_damping
         )
         desired_steering_angle -= self.calculate_steering_delay_term(
             desired_steering_angle, steering_angle

@@ -201,8 +201,41 @@ class Control(Node):
         # saturated max_steer (25°) → full lock → car turned too aggressively
         # one direction. With k=1.0 the same case gives ~12°, much gentler.
         # Tune up only if the car under-corrects on cleaner tracks.
-        self.declare_parameter("control_gain", 1.0)
-        self.declare_parameter("softening_gain", 6.0)
+        #
+        # Bumped 1.0 → 1.5 on fix/49 after the clean-baseline drive: trajectory
+        # recorder showed Stanley navigating the first curve correctly but
+        # drifting outward to the yellow line at the apex (consistent with
+        # underpowered cross-track at v ≈ 7 m/s, where atan2(k·e, k_soft+v)
+        # damps to ~half its low-speed value). 1.5 lifts the high-speed
+        # cornering term ~50% without re-triggering the saturation problem
+        # that motivated the original 1.0 — at v=3, e=2 it still gives ~17°,
+        # not the 29° saturation that broke it before.
+        #
+        # Bumped 1.5 → 2.0 after the max_normal_accel=5 drive still showed
+        # the car kissing the outer (blue) corridor edge at the curve apex.
+        # Chassis still has grip headroom (circle test: peak 6.4 m/s², we
+        # use 5), so the right move is to ask Stanley for more steer at
+        # any given xte rather than trade lap time for margin. At v=3,
+        # e=2 the term is now atan2(4, 9) ≈ 24° — close to but not at
+        # the 25° saturation, leaving the controller useful authority
+        # in the worst case while doubling the high-speed cornering
+        # response (atan2(1, 10) at v=7, e=0.5 ≈ 5.7° vs the 4.3° before).
+        #
+        # Reverted 2.0 → 1.5 on 2026-04-26 after the k=2.0 / k_soft=3 /
+        # max_normal_accel=5 drive: car oscillated -0.90 → +0.29 → +0.58
+        # in 4s and stalled at (17, -18) on the first curve. Combination of
+        # higher gain + lower k_soft made low-speed startup hyperactive
+        # (at v=1, atan2(2·e, 4) saturates on tiny errors). 1.5 keeps the
+        # high-speed cornering lift from k_soft=3 without the LF instability.
+        self.declare_parameter("control_gain", 1.5)
+        # softening_gain dropped 6.0 → 3.0 on fix/49 after the control_gain=1.5
+        # drive still showed outward drift at the top of the first curve.
+        # Stanley's cross-track formula `atan2(k·e, k_soft + v)` damps with v;
+        # at v=7 m/s, k=1.5, e=0.5 m the term was only ~3.3°, dominated by
+        # k_soft=6. Halving k_soft doubles the high-speed cornering authority
+        # without touching low-speed behaviour (where v ≪ k_soft so the term
+        # is already saturated by the path heading anyway).
+        self.declare_parameter("softening_gain", 3.0)
         self.declare_parameter("yaw_rate_gain", 0.0)
         self.declare_parameter("steering_damp_gain", 0.0)
         # Wheelbase for the Stanley front-axle projection. Authoritative
@@ -430,25 +463,6 @@ class Control(Node):
                 np.clip(nat_target, idx_prev, min(idx_prev + max_step_idx, len(px) - 1))
             )
 
-        # Velocity-scaled preview point for the Pure-Pursuit heading
-        # term. Walk forward along the path from target_index until
-        # cumulative arc length reaches L_d = max(3.5, 0.5 · |v|).
-        # The 3.5 m floor (≈ 2 · wheelbase) keeps PP in its stable
-        # regime — below ~2L the geometric formula
-        #   δ = atan2(2 · L · sin α, L_d)
-        # interprets a slightly-off preview point as a tight sub-
-        # wheelbase turning radius and saturates max_steer on tiny α.
-        # At v = 10 m/s the floor lifts to 5 m, giving roughly 0.5 s
-        # of preview which the chassis can actually realise.
-        L_d = max(3.5, 0.5 * abs(self.velocity))
-        preview_index = target_index
-        cumlen = 0.0
-        for i in range(target_index + 1, len(px)):
-            cumlen += float(np.hypot(px[i] - px[i - 1], py[i] - py[i - 1]))
-            preview_index = i
-            if cumlen >= L_d:
-                break
-
         (limited_steering_angle, _target_index, crosstrack_error) = (
             self.stanley_controller.stanley_control_at_index(
                 float(odom_to_vehicle.transform.translation.x),
@@ -457,7 +471,6 @@ class Control(Node):
                 self.velocity,
                 target_index,
                 self.steering,
-                preview_index,
             )
         )
         self._prev_target_world = (
@@ -496,7 +509,13 @@ class Control(Node):
         #      Only active once the car has driven past the start gate.
         #   2. Fallback: last pose of the perceived path — handles SLAM
         #      dropouts and events with no orange ahead.
-        distance_to_path_end = self._compute_orange_stop_distance()
+        # `is_stop_area` flag tells the velocity controller whether the
+        # distance refers to a real orange Stop Area (so it can engage its
+        # monotonic-decrease cap) or just the end of a short perceived
+        # path (where the cap would lock v_tgt at 0 and never release).
+        orange_stop_distance = self._compute_orange_stop_distance()
+        is_stop_area = orange_stop_distance is not None
+        distance_to_path_end = orange_stop_distance
         if distance_to_path_end is None and self.path.poses:
             last_pose = self.path.poses[-1].pose.position
             dx = last_pose.x - float(odom_to_vehicle.transform.translation.x)
@@ -508,6 +527,7 @@ class Control(Node):
             self.velocity_controller.get_control_value(
                 self.velocity, forward_path_points, crosstrack_error,
                 distance_to_path_end=distance_to_path_end,
+                is_stop_area=is_stop_area,
             )
         )
 
@@ -564,7 +584,11 @@ class Control(Node):
 
         # Gate steering: don't apply Stanley steering until the car is moving.
         # At near-zero speed the cross-track term saturates to max lock, causing
-        # the car to spin before it has any forward momentum.
+        # the car to spin before it has any forward momentum. (Tried lifting
+        # this gate when xte > 0.5 to enable stuck-recovery; backfired at
+        # curve entry — when v_tgt drops with cross-track penalty and v
+        # crosses below 0.5 mid-corner, full-lock fires and the car spins
+        # through the cones. Stuck recovery needs a different approach.)
         if abs(self.velocity) < 0.5:
             self.steering = 0.0
         else:
