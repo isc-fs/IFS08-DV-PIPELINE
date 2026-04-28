@@ -93,7 +93,7 @@ def ransac(data, m=3, prob=0.9999, threshold=None, max_iter=15000, rot=False):
 
 
 @numba.jit(nopython=True)
-def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=15000):
+def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=200):
     """
     Funciona exactamente igual que la funcion anterior, pero utiliza numba
     Esto da una ligera mejora en el rendimiento, pero por facilidad de cambiar
@@ -120,16 +120,21 @@ def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=15000):
     # Solo se van a comentar las diferencias con la funcion original
     # Los datos ahora ya se pasan con la columna de 1s. Mantenemos A para hacer que la nomenclatura sea la misma
     A = data
-    k = max_iter
-    support = 1
+    k = float(max_iter)
+    support = 0
     iters = 0
     data_size = len(data)
-    def_coefs = None
 
-    while iters < k:
-        if iters>50:
-            break   ###Esto aregla el problema de que cuando se reinica el sim se queda atascado
+    # Sentinel z-up plane so def_coefs is never None even on a degenerate
+    # cloud where no random sample finds enough inliers to beat support=0.
+    # The previous version initialized def_coefs to None and bailed at
+    # iters>50 to avoid hanging — but if the loop exited that way, the
+    # subsequent `def_coefs[-1] < 0` check crashed. The Spanish comment
+    # at the original break referred to "stuck on sim restart"; that's
+    # exactly the no-consensus case this sentinel handles cleanly.
+    def_coefs = np.array([0.0, 0.0, 0.0, 1.0])
 
+    while iters < k and iters < max_iter:
         points_ind = np.random.choice(data_size, m, replace=False)
         points = A[points_ind]
         # Se calcula el hiperplano con producto vectorial en vez de svd (numba no lo ejecuta bien con svd)
@@ -154,7 +159,15 @@ def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=15000):
         if support_aux > support:
             support = support_aux
             def_coefs = coefs
-            k = np.log(1 - prob) / np.log(1 - (support / data_size) ** m)
+            inlier_ratio = support / data_size
+            # Refine the iteration budget toward the standard RANSAC
+            # bound. Guard the perfect-inlier case (log(0) = -inf) and
+            # never let k climb above max_iter — degenerate scans must
+            # exit cleanly instead of running for thousands of iters.
+            if 0.0 < inlier_ratio < 1.0:
+                k_new = np.log(1 - prob) / np.log(1 - inlier_ratio ** m)
+                if k_new < k:
+                    k = k_new
         iters += 1
     if def_coefs[-1] < 0:
         def_coefs = -1 * def_coefs

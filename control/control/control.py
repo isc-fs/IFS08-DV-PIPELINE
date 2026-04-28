@@ -93,7 +93,7 @@ class Control(Node):
         )
         # Big-orange cones detected by Cone_Detection on measured cluster
         # height (505 mm big-orange vs 325 mm small — see DS Table 1). Cones
-        # are published in the fsds/FSCar frame, i.e. already vehicle-
+        # are published in the base_link frame, i.e. already vehicle-
         # relative, so forward distance is just position.x.
         self.orange_subscriber = self.create_subscription(
             MarkerArray,
@@ -113,7 +113,7 @@ class Control(Node):
         self.velocity: float = 0.0
         self.lateral_velocity: float = 0.0
         self.steering: float = 0.0
-        # Big-orange cones in the current LiDAR frame (fsds/FSCar), i.e. the
+        # Big-orange cones in the current LiDAR frame (base_link), i.e. the
         # position is already relative to the vehicle: x is forward distance.
         # Replaced wholesale on every MarkerArray message from Cone_Detection
         # (including empty messages), so this never goes stale.
@@ -670,7 +670,7 @@ class Control(Node):
         """Fetch the transforms linking the odom frame with the vehicle frame."""
         try:
             odom_to_vehicle = self.tf_buffer.lookup_transform(
-                "odom", "fsds/FSCar", Time()
+                "odom", "base_link", Time()
             )
         except TransformException as ex:
             # Convert exception to string for logging
@@ -679,7 +679,7 @@ class Control(Node):
 
         try:
             vehicle_to_odom = self.tf_buffer.lookup_transform(
-                "fsds/FSCar", "odom", Time()
+                "base_link", "odom", Time()
             )
         except TransformException as ex:
             self.get_logger().warn(f"Inverse transform lookup failed: {str(ex)}")

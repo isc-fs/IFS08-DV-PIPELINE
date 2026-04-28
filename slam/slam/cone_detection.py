@@ -78,7 +78,28 @@ def final_cone_result_rt(data, model=DBSCAN):
                     if len(clean_cone) > 0
                     else 0.0
                 )
-                cone_positions.append((params[0], params[1], height))
+                # Per-cone position uncertainty (σ_xy, metres). Centroid
+                # variance scales as σ_ray / sqrt(N) and σ_ray itself
+                # grows with range (bigger angular footprint per beam).
+                # The 1.5× inflation factor was added on 2026-04-28
+                # after a full bag diagnostic on trackA_manual_001602
+                # measured per-observation residuals to the CSV cone
+                # map and found the un-inflated formula was ~1.5×
+                # tighter than the actual cone-detection error (median
+                # 0.15 m residual at 5–25 m vs ~0.10 m predicted).
+                # Reporting σ tighter than truth makes the SLAM graph
+                # over-trust each observation and amplifies pose
+                # corrections that are not justified by the data.
+                # Reference cluster size is ~10 points (a healthy 8 m
+                # cone with the Hesai ATX 128 ch); fewer points loosen
+                # σ, more tighten it.
+                a_xy = params[0]
+                b_xy = params[1]
+                range_m = float(np.hypot(a_xy, b_xy))
+                n_pts = len(clean_cone)
+                base_sigma = 0.05 + 0.005 * range_m
+                sigma_xy = 1.5 * base_sigma / math.sqrt(max(1, n_pts) / 10.0)
+                cone_positions.append((a_xy, b_xy, height, sigma_xy))
     return cone_positions
 
 

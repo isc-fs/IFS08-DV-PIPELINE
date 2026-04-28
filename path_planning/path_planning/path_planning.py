@@ -207,7 +207,7 @@ class Plan_Path(Node):
         # ConeTypes.START_FINISH_LINE/ConeTypes.ORANGE_BIG which maps to index 4
 
         try:
-            t = self.tf_buffer.lookup_transform("odom", "fsds/FSCar", rclpy.time.Time())
+            t = self.tf_buffer.lookup_transform("odom", "base_link", rclpy.time.Time())
         except TransformException as ex:
             self.get_logger().warn(f"TF lookup failed: {ex}")
             self._stats["tf_miss"] += 1
@@ -215,7 +215,7 @@ class Plan_Path(Node):
             return
 
         try:
-            t_inv = self.tf_buffer.lookup_transform("fsds/FSCar", "odom", rclpy.time.Time())
+            t_inv = self.tf_buffer.lookup_transform("base_link", "odom", rclpy.time.Time())
         except TransformException as ex:
             self.get_logger().warn(f"TF inverse lookup failed: {ex}")
             self._stats["tf_miss"] += 1

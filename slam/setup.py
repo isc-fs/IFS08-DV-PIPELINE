@@ -25,8 +25,7 @@ setup(
         'console_scripts': [
             'Cone_Detection = slam.cone_detection_node:cone_detection',
             'BenchMark_Slam = slam.slam:BenchMark_Slam',
-            'Publicar_Mapa = slam.slam:publicar_mapa',
-            'Publicar_Track = slam.slam:publicar_track'
+            'Publicar_Mapa = slam.slam:publicar_mapa'
         ],
     },
 )

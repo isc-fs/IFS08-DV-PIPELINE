@@ -37,16 +37,7 @@ def generate_launch_description():
         arguments=['--ros-args', '--log-level', log]
     )
 
-    PUBLICAR_TRACK = Node( #Genera MarkerArry de posicion real de los conos del circuito
-        package='slam',
-        namespace='',
-        executable='Publicar_Track',
-        name='Publicar_Track',
-        arguments=['--ros-args', '--log-level', log]
-    )
-
     ld.add_action(CONE_DETECTION)
     ld.add_action(PUBLICAR_MAPA)
-    ld.add_action(PUBLICAR_TRACK)
 
     return ld

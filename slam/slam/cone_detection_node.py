@@ -107,12 +107,14 @@ class Cone_Detection(Node):
         i = 0
         orange_i = 0
         for entry in conos:
-            # Backward compat: old return shape was (x, y); new is (x, y, height).
-            if len(entry) >= 3:
-                a, b, height = float(entry[0]), float(entry[1]), float(entry[2])
-            else:
-                a, b = float(entry[0]), float(entry[1])
-                height = 0.0
+            # Backward compat: legacy shapes were (x, y) and (x, y, height);
+            # current shape is (x, y, height, sigma_xy).
+            a = float(entry[0])
+            b = float(entry[1])
+            height = float(entry[2]) if len(entry) >= 3 else 0.0
+            # sigma_xy < 0 is the sentinel for "uncertainty unknown" — SLAM
+            # falls back to a range-only formula in that case.
+            sigma_xy = float(entry[3]) if len(entry) >= 4 else -1.0
             is_big_orange = height > self.BIG_ORANGE_HEIGHT_THRESHOLD_M
             self.get_logger().debug(
                 f"x: {a} Y: {b} h: {height:.2f} big_orange={is_big_orange}"
@@ -123,7 +125,7 @@ class Cone_Detection(Node):
             marker.pose.position.z = 0.0
 
             ###Hacer compatible con RVIZ####
-            marker.header.frame_id = "fsds/FSCar"  ##El mapa esta en el sistema de referencia Odom no el coche
+            marker.header.frame_id = "base_link"  ##El mapa esta en el sistema de referencia Odom no el coche
             marker.type = marker.CUBE
             if (
                 i == 0
@@ -133,10 +135,19 @@ class Cone_Detection(Node):
                 marker.action = marker.ADD  # Añadir marcardo
 
             marker.header.stamp = msg.header.stamp
-            marker.scale.x = 0.1
+            # marker.scale carries per-cone measurement metadata for
+            # downstream SLAM, layered on top of the visualization-size
+            # convention RViz/Foxglove expects:
+            #   scale.x → σ_xy in metres (observation position uncertainty);
+            #             negative sentinel means "unknown, use SLAM's
+            #             range-only fallback"
+            #   scale.y → reserved (was visualization width; kept default)
+            #   scale.z → measured cluster height (existing convention,
+            #             used to separate big-orange from small cones)
+            # SLAM consumes scale.x via cone_graph_slam_node._observations
+            # _from_markers; RViz happily renders cubes of σ-meter width.
+            marker.scale.x = sigma_xy if sigma_xy > 0.0 else 0.1
             marker.scale.y = 0.1
-            # Encode measured cluster height on scale.z so downstream consumers
-            # can distinguish big orange from small without re-measuring.
             marker.scale.z = max(0.1, height)
             marker.color.a = 1.0
             marker.color.r = 1.0
@@ -152,7 +163,7 @@ class Cone_Detection(Node):
             if is_big_orange:
                 # Same pose, distinct marker list, orange colour for RViz.
                 orange = Marker()
-                orange.header.frame_id = "fsds/FSCar"
+                orange.header.frame_id = "base_link"
                 orange.header.stamp = msg.header.stamp
                 orange.type = Marker.CUBE
                 orange.action = 3 if orange_i == 0 else Marker.ADD

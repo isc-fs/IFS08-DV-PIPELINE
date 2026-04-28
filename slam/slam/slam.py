@@ -11,7 +11,6 @@ Contiene tres nodos:
 1. Publicar_Mapa: Se suscribe al nodo anterior y añade esos conos a un mapa de features (mapa.py-mas detelles). Luego publica el mapa
     entero con un MarkerArray a RVIZ.
 
-1. Publicar_Track: Publica la posicion real de los conos del track
 
 3. Publicar_Laser(EXPERIMENTO): Pretende publicar como un escaneo de laser los reslutados de Cone_Detection. Para luego introducirlo en SlamToolBox
 """
@@ -144,7 +143,7 @@ class Publicar_Mapa(Node):
 
         try:  ###Generar Objeto de transformada entre Odom y el coche
             t = self.tf_buffer.lookup_transform(
-                "odom", "fsds/FSCar", rclpy.time.Time()
+                "odom", "base_link", rclpy.time.Time()
             )
         except TransformException as ex:
             self.get_logger().warn(f"TF lookup failed: {ex}")
@@ -152,7 +151,7 @@ class Publicar_Mapa(Node):
 
         try:  ###Generar Objeto de transformada entre coche y odom. Transformada inversa
             t_inv = self.tf_buffer.lookup_transform(
-                "fsds/FSCar", "odom", rclpy.time.Time()
+                "base_link", "odom", rclpy.time.Time()
             )
         except TransformException as ex:
             self.get_logger().warn(f"TF inverse lookup failed: {ex}")
@@ -298,53 +297,6 @@ class Publicar_Mapa(Node):
         self.publisher_Path_amarillo.publish(track)
 
 
-class Publicar_Track(Node):
-    def __init__(self):
-        super().__init__("Publicar_Laser")
-        # Publicar
-        self.publisher_MarkerArray = self.create_publisher(MarkerArray, "Track", 10)
-        # Subscripcion
-        self.subscription = self.create_subscription(
-            Track, "/fsds/testing_only/track", self.listener_callback, 10
-        )
-
-    def listener_callback(self, msg):
-        Cone_list = MarkerArray()
-        i = 0
-        for cone in msg.track:
-
-            marker = Marker()
-            marker.header.frame_id = (
-                "odom"  ##El mapa esta en el sistema de referencia Odom no el coche
-            )
-            marker.type = marker.CUBE
-            if (
-                i == 0
-            ):  ##En el pimer elemeto se le dice a RVIZ que elimine los registros. Mas info en Wiki RVIZ MarkerArray
-                marker.action = 3  # ELIMINAR TODO 3
-            else:
-                marker.action = marker.ADD  # Añadir marcardo
-
-            marker.scale.x = 0.1
-            marker.scale.y = 0.1
-            marker.scale.z = 0.1
-            marker.color.a = 1.0
-            marker.color.r = 0.0
-            marker.color.g = 1.0
-            marker.color.b = 0.0
-            marker.pose.orientation.w = 1.0
-            marker.pose.position.x = cone.location.x
-            marker.pose.position.y = cone.location.y
-            marker.pose.position.z = 0.0
-            marker.id = i
-            i += 1
-
-            Cone_list.markers.append(marker)
-
-        self.publisher_MarkerArray.publish(Cone_list)
-        print(len(Cone_list.markers))
-
-
 class BenchMark(Node):
     def __init__(self):
         super().__init__("BenchMark_Slam")
@@ -394,8 +346,3 @@ def BenchMark_Slam(args=None):
     rclpy.spin(BenchMark_slam)
 
 
-def publicar_track(args=None):
-    rclpy.init(args=args)
-
-    nodo_laser = Publicar_Track()
-    rclpy.spin(nodo_laser)
