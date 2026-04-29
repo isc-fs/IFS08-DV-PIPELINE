@@ -60,15 +60,71 @@ def final_cone_result_rt(data, model=DBSCAN):
             clean_cone = cone[cone[:, 2] > 0.04 + lidar_distance_to_floor]
             if len(clean_cone) == 0:
                 continue
-            params = cone_fit_2params(clean_cone, solver="SLSQP")
-            if not np.isfinite(params).all():
+
+            # Quick cluster-shape sanity gate BEFORE the L-BFGS-B fit.
+            # Real cones have height in 0.10–0.55 m and a non-trivial
+            # vertical span. This catches near-flat ground patches,
+            # thin reflective stripes etc. so we don't spend solver
+            # time on them and don't fall back to a meaningless centroid.
+            cluster_height = float(clean_cone[:, 2].max() - clean_cone[:, 2].min())
+            if cluster_height < 0.08 or cluster_height > 0.70:
                 continue
-            if (
-                params[2] < 9.0
-                and params[2] > 2.5
-                and params[3] < 0.6
-                and params[3] > 0.1
-            ):
+
+            params = cone_fit_2params(clean_cone, solver="SLSQP")
+
+            # PRIMARY: parametric fit converged in the IFS-08 cone-
+            # shape envelope (c ≈ 2.78 small, 2.86 big-orange).
+            # FALLBACK: cluster has cone-like geometry (height,
+            # n_points, range-aware point-count) but the fit landed
+            # outside the envelope — common with 3 cm RangeNoiseStd
+            # which fuzzes the L-BFGS-B gradient enough that phase 2
+            # recovers a shallow c (1.5–2.5) on real cones. The
+            # cluster centroid is a less-precise but unbiased estimate
+            # in that case; SLAM weights it ~6× lower via 2.5× σ.
+            fit_ok = (np.isfinite(params).all()
+                      and 2.5 <  params[2] < 9.0
+                      and 0.10 < params[3] < 0.60)
+
+            # Strong geometric pre-validation for centroid fallback.
+            # Conservative — better to lose a borderline cluster than
+            # feed a ground-patch false positive (which we measured
+            # earlier today: bare centroid fallback triggered earlier
+            # cascade because of biased ground-patch positions).
+            n_pts_pre = len(clean_cone)
+            range_m_pre = float(np.hypot(
+                float(clean_cone[:, 0].mean()),
+                float(clean_cone[:, 1].mean())))
+            # AMZ §3.2 / MUR rule: expected_points(d) ∝ 1/d² for a
+            # spinning LiDAR. At our 200k pts/s × 10 Hz × 128 ch the
+            # constant is ~250: small cone at 5 m → 10 pts, at 25 m →
+            # 0.4 pts. Require ≥ max(6, 0.5×expected) so close-range
+            # clusters get a stricter test than far-range ones.
+            expected_pts = 250.0 / max(range_m_pre ** 2, 1.0)
+            min_pts_required = max(6, int(0.5 * expected_pts))
+            centroid_ok = (
+                n_pts_pre >= min_pts_required
+                and 0.20 <= cluster_height <= 0.55
+                and range_m_pre <= 20.0    # only fall back at close
+                                           # range where centroid bias
+                                           # is small
+            )
+
+            if fit_ok:
+                a_xy = float(params[0])
+                b_xy = float(params[1])
+                fallback_used = False
+            elif centroid_ok:
+                a_xy = float(clean_cone[:, 0].mean())
+                b_xy = float(clean_cone[:, 1].mean())
+                fallback_used = True
+            else:
+                continue
+
+            # The original bounds are still the trust signal — fitted
+            # cones get the precise apex position; centroid-fallback
+            # cones get the cluster mean which has more variance. We
+            # report this to SLAM via σ_xy below.
+            if True:
                 # Cluster height (z-span, metres) — used downstream to separate
                 # big-orange cones (datasheet 505 mm) from small blue/yellow/
                 # small-orange cones (325 mm). Computed on the ground-removed
@@ -93,13 +149,18 @@ def final_cone_result_rt(data, model=DBSCAN):
                 # Reference cluster size is ~10 points (a healthy 8 m
                 # cone with the Hesai ATX 128 ch); fewer points loosen
                 # σ, more tighten it.
-                a_xy = params[0]
-                b_xy = params[1]
                 range_m = float(np.hypot(a_xy, b_xy))
                 n_pts = len(clean_cone)
                 base_sigma = 0.05 + 0.005 * range_m
                 sigma_xy = 1.5 * base_sigma / math.sqrt(max(1, n_pts) / 10.0)
-                cone_positions.append((a_xy, b_xy, height, sigma_xy))
+                # Centroid fallback gets 2.5× σ — gives SLAM ~16% the
+                # weight of a fitted observation per cone (1/2.5²),
+                # which lets fitted cones dominate the optimizer's
+                # corrections while still letting fallback cones
+                # contribute when nothing else is in view.
+                if fallback_used:
+                    sigma_xy *= 2.5
+                cone_positions.append((a_xy, b_xy, cluster_height, sigma_xy))
     return cone_positions
 
 

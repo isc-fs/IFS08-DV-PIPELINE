@@ -39,14 +39,19 @@ def objective_function_v2(params, x, y, z):
         float: el error cuadratico medio
     """
     a, b = params
+    # Original phase-1 fixed values. Tried c=2.78 (matched to real
+    # IFS-08 cone) on 2026-04-29 — counter-intuitively made things
+    # worse: the cost surface is flatter when c matches the data, so
+    # phase 1 doesn't move much from the (mean_x, mean_y) init, and
+    # phase 2 then recovers shallow c on noisy data. The c=5.5 init
+    # forces phase 1 to walk the apex toward the cluster's peak (a
+    # steep cone has a sharper minimum). The downstream validation
+    # then catches the slightly-too-shallow phase 2 c via the
+    # centroid-fallback path in cone_detection.py.
     c = 5.5
     d = 0.35
     z_pred = cone_model([a, b, c, d], x, y)
-    # return np.mean(np.abs(z - z_pred) * np.sin(np.arctan(1 / params[2])))
     return np.mean((z - z_pred) ** 2)
-    # return np.mean(
-    #     np.sqrt((c**2 * (x - a) ** 2 + c**2 * (y - b) ** 2 - (z - d) ** 2) ** 2)
-    # )
 
 
 @numba.njit

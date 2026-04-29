@@ -318,6 +318,28 @@ class FactorGraph:
         """
         return self._flush_update()
 
+    def discard_staged(self) -> None:
+        """Drop everything staged since the last commit and rewind
+        self._k. Used when a pre-commit sanity check determines this
+        scan should be skipped — for example when data association
+        flips from steady to mostly-new (the cascade signature on
+        cone-poor scenes after a sharp turn). Discarding leaves the
+        graph in the same state it was in before stage_imu_factor was
+        called, so the next scan retries from the previous committed
+        pose estimate.
+
+        NOTE: this only undoes the GRAPH side. The caller is
+        responsible for not having mutated LandmarkDb yet — i.e.
+        the DA-failure check must run BEFORE creating new landmark
+        entries, otherwise discard_staged() leaves orphan landmark
+        rows in the db that were never linked to a graph node.
+        """
+        self._new_factors.resize(0)
+        self._new_values.clear()
+        # Undo the stage_imu_factor increment so the next scan's
+        # stage_imu_factor produces the same prev_k → new_k pair.
+        self._k -= 1
+
     def landmark_position(self, landmark_id: int) -> Optional[np.ndarray]:
         """Return the latest world-frame Point3 estimate for a
         landmark, or None if iSAM2 hasn't merged it yet."""

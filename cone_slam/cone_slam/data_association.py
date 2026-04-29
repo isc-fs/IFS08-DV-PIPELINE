@@ -69,6 +69,21 @@ from cone_slam.landmark_db import Landmark, LandmarkDb
 DISTANCE_GATE_M = 2.0
 
 
+# Time-since-association gate expansion was tested on 2026-04-29 in
+# two variants (cap 1.5×, cap 4.0×). Both passed the iter-15
+# regression but made the cascade WORSE (80 s drift 5.8–11.9 m vs
+# A-alone's 2.1 m): once the gate opens past 3 m the optimizer
+# starts matching cones from adjacent track sections, accelerating
+# rather than recovering from the cascade. The mechanism only helps
+# if pose drift during a rejection burst is the *dominant* cause of
+# DA failure — but on cone-only LiDAR scenes the cascade is more
+# often dominated by wrong-match-when-gate-opens. Disabled.
+# Kept the current_step plumbing in associate() so re-enabling is a
+# threshold change.
+GATE_EXPANSION_PER_SCAN = 0.0    # disabled (no expansion)
+GATE_EXPANSION_CAP      = 1.0    # static gate
+
+
 # χ² threshold for the Mahalanobis gate. 2 DOF (xy in body frame).
 #   95 % → 5.99
 #   99 % → 9.21  (default, generous for early-iteration sparse data)
@@ -86,6 +101,29 @@ DEFAULT_LANDMARK_SIGMA_M = 0.5
 # (sigma_xy ≤ 0). 0.20 m matches the constant the SLAM graph used
 # before per-cone σ propagation was wired up.
 DEFAULT_OBS_SIGMA_M = 0.20
+
+
+# === Covariance inflation for Mahalanobis gating ============================
+# iSAM2's marginal covariance is the optimizer's INTERNAL certainty,
+# not the true error. With a good IMU + cones, iSAM2 reports σ ~ 1 cm
+# even when the actual pose has drifted 1+ m due to model errors,
+# unmodeled bias drift, etc. Two prior attempts to enable Mahalanobis
+# DA without inflation cascaded immediately because the gate
+# collapsed to ~0.3 m on tightly-constrained landmarks. The fix is to
+# (a) multiply Σ by a conservative factor before using it for gating,
+# and (b) impose a per-component variance floor so the gate never
+# collapses below physical cone-spacing bounds.
+#
+# Effective gate radius for typical regimes (with χ²=9.21):
+#   tight lm + tight pose:  σ_eff ≈ 0.55 m → gate ≈ 1.66 m
+#   loose lm + tight pose:  σ_eff ≈ 1.05 m → gate ≈ 3.18 m  (capped to
+#                                              DISTANCE_GATE_M=2.0 m)
+#   tight lm + loose pose:  σ_eff ≈ 0.85 m → gate ≈ 2.58 m
+POSE_COV_INFLATION    = 16.0  # multiplier on iSAM2's pose marginal
+LANDMARK_COV_INFLATION = 16.0  # multiplier on iSAM2's landmark marginal
+# Per-axis variance floor added to Σ_innov. (0.7 m)² = 0.49 m² so even
+# a perfectly-constrained landmark/pose pair retains a ~0.7 m σ_eff.
+COV_FLOOR_VAR_M2      = 0.49
 
 
 @dataclass
@@ -139,6 +177,7 @@ def associate(
     landmark_covariance_fn: Optional[
         Callable[[int], Optional[np.ndarray]]] = None,
     pose_xy_yaw_cov: Optional[np.ndarray] = None,
+    current_step: int = -1,
 ) -> List[Match]:
     """Match observations to landmarks. One Match per observation.
 
@@ -213,12 +252,25 @@ def associate(
             if landmark_covariance_fn is not None:
                 cov_world = landmark_covariance_fn(lm.id)
                 if cov_world is not None:
-                    sigma_world_xy = cov_world[:2, :2]
+                    # Inflate to compensate for iSAM2's optimistic
+                    # internal estimate (see CONS_COV_INFLATION above).
+                    sigma_world_xy = LANDMARK_COV_INFLATION * cov_world[:2, :2]
                     lm_cov_body[j] = R_w2b @ sigma_world_xy @ R_w2b.T
 
         for j in range(n_lm):
             lm_body = lm_bodies[j]
             sigma_lm = lm_cov_body[j]
+            # Per-landmark gate expansion based on staleness. When
+            # current_step is unknown (caller didn't pass it) we fall
+            # back to the static gate.
+            if current_step >= 0:
+                stale = max(0, current_step - candidates[j].last_seen_step)
+                gate_mult = min(
+                    GATE_EXPANSION_CAP,
+                    1.0 + GATE_EXPANSION_PER_SCAN * stale)
+                gate_eff = DISTANCE_GATE_M * gate_mult
+            else:
+                gate_eff = DISTANCE_GATE_M
 
             # Pose-uncertainty contribution to Σ_innov via the Jacobian
             # of body-frame projection w.r.t. (yaw, x_w, y_w). With
@@ -237,7 +289,10 @@ def associate(
                     [ lm_body[1], -c_yaw, -s_yaw],
                     [-lm_body[0],  s_yaw, -c_yaw],
                 ])
-                sigma_pose_contrib = J @ pose_xy_yaw_cov @ J.T
+                # Inflate the pose marginal too (same rationale as
+                # the landmark inflation above).
+                sigma_pose_contrib = (
+                    POSE_COV_INFLATION * (J @ pose_xy_yaw_cov @ J.T))
             else:
                 sigma_pose_contrib = np.zeros((2, 2))
 
@@ -246,15 +301,22 @@ def associate(
                 dx = o.body_x - lm_body[0]
                 dy = o.body_y - lm_body[1]
                 d_eu = float(np.hypot(dx, dy))
-                if d_eu > DISTANCE_GATE_M:
+                if d_eu > gate_eff:
                     # Euclidean physical-spacing backstop — skip
-                    # before doing the matrix math.
+                    # before doing the matrix math. Per-landmark
+                    # expansion via gate_eff lets stale landmarks
+                    # be re-acquired after a pose-drift window.
                     continue
                 obs_var = (o.sigma_xy ** 2) if o.sigma_xy > 0 \
                     else default_obs_var
+                # Σ_innov = (4× Σ_lm) + σ_obs² I + (4× JΣ_poseJᵀ) + floor
+                # The floor adds (0.5 m)² to each diagonal so the gate
+                # never collapses below physical-cone-spacing bounds
+                # even when iSAM2 reports near-zero uncertainty.
                 sigma_innov = (sigma_lm
                                + obs_var * np.eye(2)
-                               + sigma_pose_contrib)
+                               + sigma_pose_contrib
+                               + COV_FLOOR_VAR_M2 * np.eye(2))
                 innov = np.array([dx, dy])
                 try:
                     sol = np.linalg.solve(sigma_innov, innov)
@@ -262,7 +324,14 @@ def associate(
                     continue
                 d2 = float(innov @ sol)
                 if d2 <= MAHALANOBIS_CHI2:
-                    cost[ii, j] = d2
+                    # Mahalanobis as gate, Euclidean as Hungarian cost.
+                    # Mahalanobis-squared distance varies wildly with
+                    # tight-vs-loose covariances and was making
+                    # Hungarian prefer "information-cheap" but
+                    # physically-wrong matches in dense cone scenes.
+                    # Once the gate has confirmed a match is plausible,
+                    # the assignment cost should be physical proximity.
+                    cost[ii, j] = d_eu
 
         # Hungarian doesn't accept +∞; replace with a large finite value.
         big = 1e6

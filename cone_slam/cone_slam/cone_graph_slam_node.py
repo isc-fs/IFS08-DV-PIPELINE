@@ -290,25 +290,56 @@ class ConeGraphSlamNode(Node):
         pred_y = predicted_pose.y()
         pred_yaw = predicted_pose.rotation().yaw()
 
-        # Mahalanobis DA stays disabled. Two attempts (2026-04-28):
-        # (1) Σ_innov = Σ_landmark + σ_obs² I  →  cascaded immediately
-        #     because Σ_landmark goes tight after ~3 observations and
-        #     the gate collapses below the actual pose-prediction
-        #     drift between scans.
-        # (2) Σ_innov = Σ_landmark + σ_obs² I + J Σ_pose J^T (proper
-        #     pose-aware) → cascaded by step 420. Root cause: iSAM2's
-        #     reported marginal pose covariance is the optimizer's
-        #     internal certainty, not the true pose error — with a
-        #     good IMU + cones, iSAM2 returns ~1 cm while the actual
-        #     pose has drifted ~1 m due to model errors / unmodeled
-        #     bias drift. Mahalanobis built on that is over-confident
-        #     → tight gate → DA fails → cascade.
-        # The landmark_covariance / pose_covariance APIs in
-        # FactorGraph stay available for future work (e.g. an
-        # explicitly-inflated covariance scheme or robust DA), but
-        # we ship Euclidean DA for now since it actually tracks.
+        # Mahalanobis DA stays disabled. Three variants tested on
+        # 2026-04-29:
+        # (1) full pose-aware Mahalanobis (4×/16× covariance inflation
+        #     + 0.49 m² floor): cascaded at t≈75s. iSAM2 marginal is
+        #     internal certainty not actual error; even with inflation
+        #     the gate is wrong during empty-scan-driven pose drift.
+        # (2) Mahalanobis gate + Euclidean Hungarian cost: same.
+        # (3) Landmark-cov-only Mahalanobis (no pose Jacobian): same.
+        # In every variant, mid-drive tracking was comparable to
+        # Euclidean (60 s ≈ 0.8 m) but the cascade still triggered
+        # at the same lap position because the cascade root cause is
+        # pose drift > gate during empty-scan windows — no DA
+        # strategy can fix this because there's nothing to associate.
+        # Real fix needs lost-track detection / scan rejection during
+        # pose-prediction-confidence collapse, not gate widening.
+        # APIs in factor_graph (pose_covariance, landmark_covariance)
+        # and data_association (inflation constants) stay in place
+        # for future revisits.
+        # Pass current_step so associate() can expand per-landmark
+        # gates for landmarks that haven't been associated recently —
+        # the recovery mechanism for the rejection bursts triggered
+        # by improvement A.
         matches = associate(
-            observations, pred_x, pred_y, pred_yaw, self._db)
+            observations, pred_x, pred_y, pred_yaw, self._db,
+            current_step=self._graph.step)
+
+        # Pre-stage cascade-trigger detection. The cascade signature
+        # observed on trackA_manual_001602 around t≈80 s is: a single
+        # scan flips DA from "steady, mostly-associated" to "mostly
+        # new" (e.g., obs=8 new=6 assoc=2). The optimizer then jumps
+        # pose ~17 m to accommodate the falsely-new landmarks and the
+        # graph never recovers. Detection: if the new-rate suddenly
+        # spikes when (a) we have ≥5 observations to be statistically
+        # meaningful, (b) we're past the early-discovery phase
+        # (step > 30, so most cones in the local map are mature),
+        # (c) >60 % of obs are flagged new — the predicted pose is
+        # likely wrong and committing the staged factors will corrupt
+        # the graph. Drop the IMU factor too and re-try on the next
+        # scan from the same prev pose.
+        n_new_pre  = sum(1 for m in matches if m.landmark_id == -1)
+        total_pre  = len(matches)
+        if (total_pre >= 5
+                and self._graph.step > 30
+                and n_new_pre > int(0.60 * total_pre)):
+            self.get_logger().warn(
+                f"skip scan: DA-failure spike "
+                f"(obs={total_pre} new={n_new_pre} "
+                f"assoc={total_pre - n_new_pre}) — pose-jump rejected")
+            self._graph.discard_staged()
+            return
 
         # For each matched obs → factor between current pose and the
         # known landmark. For unmatched → allocate a new landmark and
