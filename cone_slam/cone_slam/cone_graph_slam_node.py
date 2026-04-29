@@ -519,11 +519,19 @@ class ConeGraphSlamNode(Node):
         msg.pose.pose.orientation.x = q.x()
         msg.pose.pose.orientation.y = q.y()
         msg.pose.pose.orientation.z = q.z()
-        # Velocity is in nav (odom) frame; consumers expecting body frame
-        # will need to rotate. For now, leave as-is.
-        msg.twist.twist.linear.x = float(result.velocity[0])
-        msg.twist.twist.linear.y = float(result.velocity[1])
-        msg.twist.twist.linear.z = float(result.velocity[2])
+        # nav_msgs/Odometry semantics: twist is expressed in child_frame_id
+        # (here base_link), NOT the header frame. GTSAM's NavState carries
+        # velocity in the navigation (odom) frame, so we project to body
+        # frame before publishing — otherwise consumers like Control read
+        # `twist.linear.x` as longitudinal speed and instead get an axis-
+        # aligned world component, which is wrong as soon as the car is
+        # not pointing along world +X.
+        v_world = result.velocity
+        c, s = np.cos(pose.rotation().yaw()), np.sin(pose.rotation().yaw())
+        # R_w2b = [[ c, s, 0], [-s, c, 0], [0, 0, 1]]; vertical untouched.
+        msg.twist.twist.linear.x = float(c * v_world[0] + s * v_world[1])
+        msg.twist.twist.linear.y = float(-s * v_world[0] + c * v_world[1])
+        msg.twist.twist.linear.z = float(v_world[2])
         self._state_pub.publish(msg)
 
     def _publish_cone_map(self, stamp) -> None:

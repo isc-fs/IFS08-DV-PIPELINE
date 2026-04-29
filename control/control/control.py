@@ -4,12 +4,11 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 import rclpy
 from fs_msgs.msg import ControlCommand
-from geometry_msgs.msg import TransformStamped, TwistWithCovarianceStamped
+from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Empty
 from visualization_msgs.msg import MarkerArray
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.time import Time
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -70,26 +69,15 @@ class Control(Node):
         self.path_subscriber = self.create_subscription(
             Path, "Path", self.path_callback, self.QUEUE_SIZE
         )
-        # /gss and /testing_only/odom are published BEST_EFFORT by the
-        # bridge (high-rate sensor stream — drops are correct, backpressure
-        # is not). RELIABLE subscribers will silently fail to connect to
-        # BEST_EFFORT publishers in ROS 2, so match the QoS here.
-        sensor_qos = QoSProfile(
-            depth=self.QUEUE_SIZE,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-        )
-        self.velocity_subscriber = self.create_subscription(
-            TwistWithCovarianceStamped,
-            "/fsds/gss",
-            self.velocity_callback,
-            sensor_qos,
-        )
-        self.odom_subscriber = self.create_subscription(
-            Odometry,
-            "/fsds/testing_only/odom",
-            self.odometry_callback,
-            sensor_qos,
+        # cone-graph SLAM owns the vehicle-state estimate. Its /cone_slam/state
+        # is an Odometry message: pose in odom frame, twist in base_link
+        # (longitudinal speed = twist.linear.x). It's the same source that
+        # publishes our odom→base_link TF, so we don't need GSS or any
+        # bridge-side odom topic — by design, the real car won't have GSS
+        # mounted; the same motor-RPM + IMU integration that powers SLAM
+        # gives us a consistent vehicle-frame velocity.
+        self.state_subscriber = self.create_subscription(
+            Odometry, "/cone_slam/state", self.state_callback, self.QUEUE_SIZE
         )
         # Big-orange cones detected by Cone_Detection on measured cluster
         # height (505 mm big-orange vs 325 mm small — see DS Table 1). Cones
@@ -164,6 +152,17 @@ class Control(Node):
         # finite rate; software limit also smooths transients when the
         # anchor above can't fully suppress a discontinuity.
         self._prev_steering_cmd: float = 0.0
+        # Arc-length anchor clip counter. The anchor `clip(nat_target,
+        # idx_prev, idx_prev + max_step_idx)` quietly suppresses target
+        # jumps on path replans; we surface its rate in DIAG so tuning
+        # surfaces (planner cadence, max_step buffer, avg_ds threshold)
+        # have a number to chase. Healthy run: clip rate ≪ 1 (occasional
+        # clip on curve replans). Saturation here is a planner-cadence /
+        # avg_ds mismatch and would indicate the anchor is doing too
+        # much heavy lifting to absorb upstream noise.
+        self._anchor_clip_count: int = 0
+        self._anchor_clip_max_jump: int = 0
+        self._anchor_total_count: int = 0
         # Planner-warm gate: hold the car stationary until the planner has
         # produced the same-shape path on at least two consecutive ticks.
         # The pre-go DIAG capture showed yaw_err = -89.7° / xte = +4.59 m
@@ -285,17 +284,20 @@ class Control(Node):
             self.Kp_vel, self.Ki_vel, self.Kd_vel, self.Fg
         )
 
-    def velocity_callback(self, msg: TwistWithCovarianceStamped) -> None:
-        """Record the latest longitudinal velocity measurement from the estimator."""
+    def state_callback(self, msg: Odometry) -> None:
+        """Record longitudinal & lateral velocity from /cone_slam/state.
+
+        The Odometry's twist is published in the child_frame (base_link),
+        so .linear.x is forward speed and .linear.y is lateral. We don't
+        need an explicit longitudinal/lateral split anymore; one
+        subscriber covers what GSS + /testing_only/odom used to.
+        """
         self.velocity = msg.twist.twist.linear.x
+        self.lateral_velocity = msg.twist.twist.linear.y
 
     def path_callback(self, msg: Path) -> None:
         """Persist the most recent reference path for downstream control logic."""
         self.path = msg
-
-    def odometry_callback(self, msg: Odometry) -> None:
-        """Record the lateral component of velocity supplied by odometry."""
-        self.lateral_velocity = msg.twist.twist.linear.y
 
     def orange_callback(self, msg: MarkerArray) -> None:
         """Cache the current frame's big-orange cones (car-relative coords)."""
@@ -462,6 +464,12 @@ class Control(Node):
             target_index = int(
                 np.clip(nat_target, idx_prev, min(idx_prev + max_step_idx, len(px) - 1))
             )
+            self._anchor_total_count += 1
+            if target_index != nat_target:
+                self._anchor_clip_count += 1
+                jump = abs(nat_target - target_index)
+                if jump > self._anchor_clip_max_jump:
+                    self._anchor_clip_max_jump = jump
 
         (limited_steering_angle, _target_index, crosstrack_error) = (
             self.stanley_controller.stanley_control_at_index(
@@ -653,6 +661,15 @@ class Control(Node):
             # Velocity controller exposes its filtered target speed.
             v_target = getattr(self.velocity_controller, 'filtered_target_speed', float('nan'))
             d_end_str = f"{distance_to_path_end:.1f}" if distance_to_path_end is not None else "n/a"
+            # Report and reset the anchor-clip window. clipped/total
+            # over the last ~200 ms; max_jump is the largest single
+            # clip (in path-index units) seen in the window.
+            clipped = self._anchor_clip_count
+            total = self._anchor_total_count
+            max_jump = self._anchor_clip_max_jump
+            self._anchor_clip_count = 0
+            self._anchor_total_count = 0
+            self._anchor_clip_max_jump = 0
             self.get_logger().info(
                 f"DIAG spd={self.velocity:5.2f} v_tgt={v_target:5.2f} "
                 f"v_cmd={velocity_command_value:+5.2f} "
@@ -661,7 +678,8 @@ class Control(Node):
                 f"d_end={d_end_str:>5}m | "
                 f"xte={crosstrack_error:+5.2f}m yaw_err={float(np.degrees(wrap_to_pi(pyaw[_target_index] - yaw))):+6.1f}deg "
                 f"stanley={float(np.degrees(limited_steering_angle)):+6.1f}deg "
-                f"steer_cmd={command_msg.steering:+.3f}"
+                f"steer_cmd={command_msg.steering:+.3f} "
+                f"anchor={clipped}/{total} max_jump={max_jump}"
             )
 
     def get_transforms(
