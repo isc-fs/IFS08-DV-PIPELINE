@@ -24,9 +24,25 @@ from __future__ import annotations
 
 from enum import IntEnum
 
-# Cone height encodes type per Cone_Detection (cone_detection_node.py:140).
-# Big-orange cones (start-finish) are ≥ 0.30 m; small cones ~0.20 m.
-BIG_ORANGE_HEIGHT_THRESHOLD_M = 0.30
+# Cone height encodes type per Cone_Detection (cone_detection_node.py:140):
+# the cluster-height of the LiDAR returns from each cone.
+#
+# Per FS Driverless cone spec (DS Table 1):
+#   - Small cones (yellow / blue / orange):  325 mm
+#   - Big-orange (start / finish):           505 mm
+#
+# The previous threshold of 0.30 m sat *below* the small-cone height of
+# 0.325 m, so any LiDAR measurement noise on a small cone tipped it
+# above 0.30 m and got it classified BIG_ORANGE. On the live UE5 run on
+# 2026-04-29 the very first cones the car drove past read back as
+# 0.32 / 0.34 m, control's `_compute_orange_stop_distance` saw them as
+# a finish gate at 30 m forward, latched a stop target, fired EBS, and
+# bridged-engaged the handbrake — all on harmless small cones.
+#
+# 0.40 m sits halfway between 0.325 and 0.505 m and gives ~7.5 cm of
+# noise budget on either side. If small cones ever measure that tall
+# we have a measurement problem upstream of here.
+BIG_ORANGE_HEIGHT_THRESHOLD_M = 0.40
 
 # Lateral band where small cones get orange (centerline) instead of
 # blue/yellow. Tuned to match typical FS lane width — anything within
