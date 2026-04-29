@@ -48,7 +48,7 @@ from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Float32
-from tf2_ros import TransformBroadcaster
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 from visualization_msgs.msg import Marker, MarkerArray
 
 from cone_slam.color_classifier import ConeColor, classify
@@ -163,10 +163,22 @@ class ConeGraphSlamNode(Node):
 
         # --- Publishers ---
         self._tf_broadcaster = TransformBroadcaster(self)
+        self._static_tf_broadcaster = StaticTransformBroadcaster(self)
         self._state_pub = self.create_publisher(
             Odometry, "/cone_slam/state", 10)
         self._cones_pub = self.create_publisher(
             MarkerArray, "/Conos", 10)
+
+        # Anchor `map -> odom` as identity on /tf_static. We don't
+        # have map-based localization (no GPS-aligned global frame),
+        # so the SLAM odom frame IS effectively the map frame for
+        # downstream consumers. Without this static, Lichtblick's 3D
+        # panel has no root and nothing renders — the cone map and
+        # the trajectory both anchor on `odom`, which dangles off
+        # /tf_static at recording time. The transform itself is
+        # identity; the publisher exists purely to give visualizers
+        # a parent frame to walk from.
+        self._publish_map_to_odom_static()
 
         self.get_logger().info(
             "cone_graph_slam initialized — waiting for IMU "
@@ -476,6 +488,22 @@ class ConeGraphSlamNode(Node):
         t.transform.rotation.y = q.y()
         t.transform.rotation.z = q.z()
         self._tf_broadcaster.sendTransform(t)
+
+    def _publish_map_to_odom_static(self) -> None:
+        """Emit `map -> odom` identity on /tf_static once at startup.
+
+        Lichtblick (and rviz2) need a static root that the dynamic
+        chain can hang off; without one the 3D panel renders nothing.
+        Recording-time consumers see this single message at t=0 and
+        keep it for the rest of the run, so it costs effectively
+        nothing per scan.
+        """
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = "map"
+        t.child_frame_id = self.odom_frame
+        t.transform.rotation.w = 1.0
+        self._static_tf_broadcaster.sendTransform(t)
 
     def _publish_state(self, stamp, result: ScanResult) -> None:
         msg = Odometry()
