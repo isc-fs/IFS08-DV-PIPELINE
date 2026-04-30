@@ -56,13 +56,45 @@ class Control(Node):
         # fresh session always starts with controls accepted. Without this, an
         # autonomous-stop at the end of session N (line ~424 below) would
         # leave the bridge dropping every setCarControls in session N+1 until
-        # the user manually restarted dv_pipeline_stack. Published once below; the
-        # bridge listens with the same TRANSIENT_LOCAL QoS so a
-        # subscription-after-publish still picks it up.
+        # the user manually restarted dv_pipeline_stack.
+        #
+        # In theory TRANSIENT_LOCAL+depth=1 makes a single publish-on-init
+        # bullet-proof: the publisher caches the message and any
+        # late-subscribing bridge gets it on discovery. In practice we
+        # observed the bridge missing this clear after every Mission-Control
+        # session restart — the new control-node publisher is created and
+        # the publish runs synchronously in __init__, *before* DDS discovery
+        # has matched the new publisher to the bridge's surviving
+        # subscription. The cached message races discovery and loses.
+        #
+        # Belt-and-suspenders fix: publish once now, then republish on a
+        # one-shot timer 0.5s later (after discovery has settled), and
+        # again at 1.5s. If the bridge restarts mid-session it will still
+        # pick the message up via TRANSIENT_LOCAL caching; if discovery
+        # was the issue, the deferred publishes catch it.
         self.ebs_reset_publisher = self.create_publisher(
             Empty, "/signal/ebs_reset", ebs_qos
         )
         self.ebs_reset_publisher.publish(Empty())
+        self._ebs_reset_retries_remaining = 4
+        self._ebs_reset_retry_timer = self.create_timer(
+            0.5, self._republish_ebs_reset
+        )
+
+    def _republish_ebs_reset(self) -> None:
+        """Re-publish /signal/ebs_reset until the retry budget is consumed.
+
+        See `_setup_publishers` for why a single publish-on-init isn't
+        enough across pipeline restarts. The retries cover the worst-case
+        DDS discovery window we've observed (~1–2 s) without spamming the
+        topic forever.
+        """
+        if self._ebs_reset_retries_remaining <= 0:
+            self._ebs_reset_retry_timer.cancel()
+            self.destroy_timer(self._ebs_reset_retry_timer)
+            return
+        self.ebs_reset_publisher.publish(Empty())
+        self._ebs_reset_retries_remaining -= 1
 
     def _setup_subscribers(self) -> None:
         """Subscribe to the topics providing path, velocity, and odometry feedback."""

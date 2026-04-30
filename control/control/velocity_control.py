@@ -31,7 +31,17 @@ class VelocityControl:
         # ~50% transient headroom: v_curve = √(R·3.5) = 7.25 m/s on R=15
         # vs 8.66 at 5 — slow enough that chassis dynamics catch up.
         max_normal_acceleration: float = 3.5,
-        throttle_max: float = 0.4,
+        # Throttle cap. 0.4 was tuned for the pre-EMRAX Chaos default
+        # torque curve and is too low against the EMRAX 228's flatter
+        # shaft profile (≈107 Nm/wheel at 0.4 — below the friction
+        # threshold). 1.0 went the other way: a real driver doesn't peg
+        # the pedal from a dead stop, and Chaos's rolling-without-slip
+        # constraint at v=0 prefers a smooth ramp to unstick rather
+        # than a step to full torque. 0.7 sits in the sweet spot —
+        # ≈187 Nm at the wheel (well above the lock), matches the
+        # typical FS launch-map ceiling, and leaves headroom for the
+        # PID to ease off once the car is rolling.
+        throttle_max: float = 0.7,
         brake_max: float = 1.0,
         smoothing_factor: float = 0.3,
         target_decel: float = 3.0,
