@@ -382,36 +382,54 @@ def _spline_through(midpoints_body: np.ndarray) -> np.ndarray:
 # ----- public API ------------------------------------------------------------
 
 
-def plan_centerline(cones: List[Cone], pose: Pose2D) -> List[PathPoint]:
-    """Compute a centerline ahead of the car.
+@dataclass
+class PlanDebug:
+    """Intermediate planner state, exposed for visualisation only.
 
-    Args:
-        cones: full world-frame cone list. Color tags are read for
-               BLUE/YELLOW pre-filter (path generation uses only
-               those — ORANGE / BIG_ORANGE / UNKNOWN are dropped).
-        pose: current car pose in world frame.
-
-    Returns:
-        A list of PathPoints in world frame, ordered along arc length
-        from the car forward. Empty list if no path could be computed
-        (e.g., not enough cones, triangulation failed, or the search
-        found <MIN_MIDPOINTS midpoints).
+    All arrays are in world frame (already projected from body frame
+    by `plan_centerline_with_debug`) so the consumer can publish them
+    on a TF that doesn't follow the car. Empty arrays are valid: at
+    early ticks (few cones, no triangulation) they communicate that
+    the planner failed at a specific stage.
     """
-    if not cones:
-        return []
+    triangulation_edges: np.ndarray = None  # (E, 2, 2) — endpoints per edge
+    candidate_midpoints: np.ndarray = None  # (E, 2) — one per edge
+    selected_midpoints: np.ndarray = None   # (M, 2) — best-first chosen
 
-    # Use BLUE + YELLOW only for the cone field. ORANGE/BIG_ORANGE are
-    # waypoint cones (centerline markers, start/finish gate) — they'd
-    # confuse the triangulation by appearing close to the centerline
-    # rather than on a corridor wall.
+
+def plan_centerline(cones: List[Cone], pose: Pose2D) -> List[PathPoint]:
+    """Compute a centerline ahead of the car. Public API; no debug data.
+    """
+    path, _ = plan_centerline_with_debug(cones, pose)
+    return path
+
+
+def plan_centerline_with_debug(
+    cones: List[Cone], pose: Pose2D,
+) -> Tuple[List[PathPoint], PlanDebug]:
+    """Same as plan_centerline, but also returns intermediate state
+    (triangulation edges, candidate midpoints, selected midpoints) for
+    visualisation. The ROS node uses this to publish a Lichtblick /
+    Foxglove debug overlay on /path_planning/delaunay/*.
+
+    All debug arrays are in world frame.
+    """
+    debug = PlanDebug(
+        triangulation_edges=np.empty((0, 2, 2)),
+        candidate_midpoints=np.empty((0, 2)),
+        selected_midpoints=np.empty((0, 2)),
+    )
+
+    if not cones:
+        return [], debug
+
     track_cones = [c for c in cones if c.color in (ConeColor.BLUE, ConeColor.YELLOW)]
     if len(track_cones) < 3:
-        return []
+        return [], debug
 
     cones_world = np.array([[c.x, c.y] for c in track_cones], dtype=float)
     cones_body = _world_to_body(cones_world, pose)
 
-    # Corridor filter: keep cones inside the forward "useful" window.
     mask = (
         (cones_body[:, 0] >= BODY_X_MIN)
         & (cones_body[:, 0] <= LOOKAHEAD_M)
@@ -419,25 +437,41 @@ def plan_centerline(cones: List[Cone], pose: Pose2D) -> List[PathPoint]:
     )
     cones_body = cones_body[mask]
     if cones_body.shape[0] < 3:
-        return []
+        return [], debug
 
     edges = _build_edges(cones_body)
     if not edges:
-        return []
+        return [], debug
+
+    # Capture debug snapshot — body→world projection happens once for
+    # all debug arrays so they share a single transform.
+    if edges:
+        edge_pts_body = np.array([
+            [cones_body[e.i], cones_body[e.j]] for e in edges
+        ])  # (E, 2, 2)
+        # Flatten endpoints for batch transform, then reshape.
+        flat = edge_pts_body.reshape(-1, 2)
+        flat_world = _body_to_world(flat, pose)
+        debug.triangulation_edges = flat_world.reshape(-1, 2, 2)
+
+        cand_body = np.array([e.midpoint for e in edges])  # (E, 2)
+        debug.candidate_midpoints = _body_to_world(cand_body, pose)
 
     midpoints_body = _search_path_body(edges)
+    if midpoints_body.shape[0] >= 1:
+        debug.selected_midpoints = _body_to_world(midpoints_body, pose)
+
     if midpoints_body.shape[0] < MIN_MIDPOINTS:
-        return []
+        return [], debug
 
     samples_body = _spline_through(midpoints_body)
-
-    # Project (x, y) back to world; rotate yaws by car yaw.
     samples_world_xy = _body_to_world(samples_body[:, :2], pose)
     yaws_world = samples_body[:, 2] + pose.yaw
 
-    return [
+    path = [
         PathPoint(x=float(samples_world_xy[i, 0]),
                   y=float(samples_world_xy[i, 1]),
                   yaw=float(yaws_world[i]))
         for i in range(samples_world_xy.shape[0])
     ]
+    return path, debug

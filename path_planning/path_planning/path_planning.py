@@ -49,7 +49,8 @@ from geometry_msgs.msg import PoseStamped
 from transforms3d.euler import quat2euler, euler2quat
 
 from path_planning.planner import (
-    Cone, ConeColor, Pose2D, plan_centerline,
+    Cone, ConeColor, Pose2D, PlanDebug,
+    plan_centerline_with_debug,
 )
 
 
@@ -85,6 +86,99 @@ def _classify_cone_color(r: float, g: float, b: float) -> ConeColor | None:
     return best
 
 
+def _build_delaunay_markers(debug: PlanDebug) -> MarkerArray:
+    """Pack a PlanDebug snapshot into one MarkerArray with three
+    visual layers: triangulation edges (gray lines), candidate
+    midpoints (green spheres), selected midpoints (orange spheres).
+
+    Frame: odom (same as /Path). Use Lichtblick's 3D panel to
+    overlay on the cone field — each layer can be toggled
+    independently from the panel UI.
+
+    A DELETEALL marker leads each publish so previous frames don't
+    accumulate visually when the cone field shrinks.
+    """
+    arr = MarkerArray()
+
+    clear = Marker()
+    clear.action = Marker.DELETEALL
+    clear.header.frame_id = "odom"
+    arr.markers.append(clear)
+
+    # Layer 1: triangulation edges.
+    if debug.triangulation_edges is not None and debug.triangulation_edges.size > 0:
+        m = Marker()
+        m.header.frame_id = "odom"
+        m.ns = "delaunay_edges"
+        m.id = 1
+        m.type = Marker.LINE_LIST
+        m.action = Marker.ADD
+        m.scale.x = 0.04  # line thickness (m)
+        m.color.r = 0.55
+        m.color.g = 0.55
+        m.color.b = 0.55
+        m.color.a = 0.6
+        for e in debug.triangulation_edges:
+            for endpoint in (e[0], e[1]):
+                from geometry_msgs.msg import Point  # local import: lightweight
+                p = Point()
+                p.x = float(endpoint[0])
+                p.y = float(endpoint[1])
+                p.z = 0.05
+                m.points.append(p)
+        arr.markers.append(m)
+
+    # Layer 2: candidate midpoints (every triangulated edge gives one).
+    if debug.candidate_midpoints is not None and debug.candidate_midpoints.size > 0:
+        m = Marker()
+        m.header.frame_id = "odom"
+        m.ns = "delaunay_candidates"
+        m.id = 2
+        m.type = Marker.SPHERE_LIST
+        m.action = Marker.ADD
+        m.scale.x = 0.18
+        m.scale.y = 0.18
+        m.scale.z = 0.18
+        m.color.r = 0.10
+        m.color.g = 0.85
+        m.color.b = 0.30
+        m.color.a = 0.7
+        from geometry_msgs.msg import Point
+        for c in debug.candidate_midpoints:
+            p = Point()
+            p.x = float(c[0])
+            p.y = float(c[1])
+            p.z = 0.10
+            m.points.append(p)
+        arr.markers.append(m)
+
+    # Layer 3: best-first-selected midpoints — what fed the spline.
+    if debug.selected_midpoints is not None and debug.selected_midpoints.size > 0:
+        m = Marker()
+        m.header.frame_id = "odom"
+        m.ns = "delaunay_selected"
+        m.id = 3
+        m.type = Marker.SPHERE_LIST
+        m.action = Marker.ADD
+        m.scale.x = 0.32
+        m.scale.y = 0.32
+        m.scale.z = 0.32
+        m.color.r = 1.0
+        m.color.g = 0.55
+        m.color.b = 0.10
+        m.color.a = 0.9
+        from geometry_msgs.msg import Point
+        for s in debug.selected_midpoints:
+            p = Point()
+            p.x = float(s[0])
+            p.y = float(s[1])
+            p.z = 0.20
+            m.points.append(p)
+        arr.markers.append(m)
+
+    return arr
+
+
 def _pose_stamped(x: float, y: float, yaw: float) -> PoseStamped:
     p = PoseStamped()
     p.header.frame_id = "odom"
@@ -104,6 +198,14 @@ class Plan_Path(Node):
         super().__init__("Plan_Path")
 
         self.publisher_path = self.create_publisher(Path, "Path", 10)
+        # Delaunay debug overlay for Lichtblick / Foxglove. Three layers
+        # in one MarkerArray:
+        #   - LINE_LIST of all triangulated edges (gray)
+        #   - SPHERE_LIST of all candidate midpoints (small, green)
+        #   - SPHERE_LIST of best-first-selected midpoints (large, orange)
+        # Frame: odom (same as /Path).
+        self.publisher_delaunay = self.create_publisher(
+            MarkerArray, "/path_planning/delaunay", 10)
         self.create_subscription(
             MarkerArray, "Conos", self._on_cones, 10)
 
@@ -185,7 +287,13 @@ class Plan_Path(Node):
             yaw=float(yaw),
         )
 
-        path_points = plan_centerline(cones, pose)
+        path_points, debug = plan_centerline_with_debug(cones, pose)
+
+        # Always publish the debug overlay (even on plan-empty: shows
+        # the triangulation that exists when the search starves, so
+        # the user can see why the planner gave up).
+        self.publisher_delaunay.publish(_build_delaunay_markers(debug))
+
         if not path_points:
             self._stats["plan_empty"] += 1
             self._maybe_log_stats()
