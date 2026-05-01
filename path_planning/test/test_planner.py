@@ -64,17 +64,20 @@ def test_straight_both_sides() -> None:
         "path not monotonic forward"
 
 
-def test_straight_left_only_fallback() -> None:
-    """When right cones are missing, the one-side fallback should put
-    the centerline ~TRACK_HALF_WIDTH_M to the right of the left cones."""
+def test_straight_left_only_returns_empty() -> None:
+    """When only one side of cones is visible (e.g. right side
+    occluded), Delaunay can't form non-degenerate triangles from
+    collinear inputs and the planner returns empty. The previous
+    forward-walker had a TRACK_HALF_WIDTH-offset fallback; Delaunay
+    is more conservative and refuses to extrapolate.
+
+    Real trackdrive has both sides visible most of the time; a
+    one-side fallback can be added later as a separate code path
+    if it turns out to matter (issue follow-up)."""
     cones = [c for c in _straight_track(20.0) if c.color == ConeColor.BLUE]
     pose = Pose2D(x=0.0, y=0.0, yaw=0.0)
     path = plan_centerline(cones, pose)
-
-    assert len(path) == N_OUTPUT
-    for p in path:
-        assert abs(p.y) < 0.30, \
-            f"left-only fallback lateral error {p.y:.3f} m"
+    assert path == [], "Delaunay refuses collinear-only input"
 
 
 def test_right_turn() -> None:
