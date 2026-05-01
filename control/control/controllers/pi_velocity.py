@@ -76,23 +76,17 @@ class PIVelocity(LongitudinalController):
 
     def compute(self, state: VehicleState, ref: ReferenceTrajectory) -> Tuple[float, float]:
         v_set = self._setpoint(state, ref)
-        # Track SIGNED body-frame forward velocity (not magnitude). If the
-        # car ends up going backward (vx < 0), the error v_set - vx is
-        # large positive, the PI commands throttle, and the motor produces
-        # forward torque that decelerates the reverse motion and brings
-        # the car back to forward travel. Using |v| would feed the wrong
-        # sign back: a reversing car at |v|=5 looks like an over-speed
-        # condition and the PI would issue regen — which is exactly what
-        # caused the reverse motion in the first place (positive
-        # feedback loop). See issue #159 for the underlying sim bug.
-        thr, regen = self._track(state.vx, v_set)
-        # Single-quadrant regen guard. Issue regen only when the wheel is
-        # genuinely moving forward — never when stopped or reversing.
-        # The IFS-08 EMRAX is single-quadrant; our sim's EMRAX model
-        # isn't (filed as #159), so this is the controller-side workaround.
-        if state.vx <= 0.3:
-            regen = 0.0
-        return thr, regen
+        # Track SIGNED body-frame forward velocity (not magnitude). Using
+        # |v| would feed the wrong sign back if the car ever ended up
+        # going backward (e.g. pushed by collision): |v| = 5 looks like
+        # over-speed and the PI would issue regen, accelerating the
+        # reverse — a positive-feedback loop. With signed vx, a reversing
+        # car looks like negative velocity, so PI commands throttle to
+        # decelerate the reverse and bring the car back to forward travel.
+        # The sim-side single-quadrant regen fix (PR #160) ensures regen
+        # commanded at vx ≤ 0 produces zero motor torque, so this can't
+        # spiral even on transient reverse motion from collisions.
+        return self._track(state.vx, v_set)
 
     # ------------------------------------------------------------- setpoint
 
