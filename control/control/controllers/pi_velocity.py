@@ -52,7 +52,8 @@ class PIVelocity(LongitudinalController):
                  kp: float = 0.5,
                  ki: float = 0.05,
                  deadband: float = 0.2,
-                 lookahead_curvature_s: float = 3.0):
+                 lookahead_curvature_s: float = 3.0,
+                 throttle_max: float = 0.6):
         self.v_max = v_max
         self.a_lat_max = a_lat_max
         self.a_dec_max = a_dec_max
@@ -60,6 +61,14 @@ class PIVelocity(LongitudinalController):
         self.ki = ki
         self.deadband = deadband
         self.lookahead_curvature_s = lookahead_curvature_s
+        # Throttle saturation. Lower than the regen cap because if SLAM's
+        # velocity estimate lags reality (we observed this triggering at
+        # ~6 m/s during baseline runs — pose froze, controller kept
+        # commanding full throttle, real car ran away to ~24 m/s and
+        # crashed), a tighter throttle ceiling caps how badly the
+        # state-estimator divergence can blow up. Regen stays at 1.0 so
+        # the controller can still demand max stopping power.
+        self.throttle_max = throttle_max
         self._integral = 0.0
 
     def reset(self) -> None:
@@ -67,7 +76,17 @@ class PIVelocity(LongitudinalController):
 
     def compute(self, state: VehicleState, ref: ReferenceTrajectory) -> Tuple[float, float]:
         v_set = self._setpoint(state, ref)
-        return self._track(state.speed, v_set)
+        # Track SIGNED body-frame forward velocity (not magnitude). Using
+        # |v| would feed the wrong sign back if the car ever ended up
+        # going backward (e.g. pushed by collision): |v| = 5 looks like
+        # over-speed and the PI would issue regen, accelerating the
+        # reverse — a positive-feedback loop. With signed vx, a reversing
+        # car looks like negative velocity, so PI commands throttle to
+        # decelerate the reverse and bring the car back to forward travel.
+        # The sim-side single-quadrant regen fix (PR #160) ensures regen
+        # commanded at vx ≤ 0 produces zero motor torque, so this can't
+        # spiral even on transient reverse motion from collisions.
+        return self._track(state.vx, v_set)
 
     # ------------------------------------------------------------- setpoint
 
@@ -132,7 +151,7 @@ class PIVelocity(LongitudinalController):
         # EMRAX motor folder (Throttle - Regen) collapses to a clean signed
         # demand without partial-cancellation surprises.
         if u >= self.deadband:
-            return float(u), 0.0
+            return float(min(u, self.throttle_max)), 0.0
         if u <= -self.deadband:
             return 0.0, float(-u)
         return 0.0, 0.0

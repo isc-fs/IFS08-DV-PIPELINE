@@ -109,7 +109,7 @@ class ControlNode(Node):
         self.declare_parameter("longitudinal_controller", "pi_velocity")
         # Tunables — passed to the strategy constructors. Keep flat: each
         # strategy reads what it needs, ignores the rest.
-        self.declare_parameter("v_max", 12.0)
+        self.declare_parameter("v_max", 3.0)  # tuning experiment — completable-lap baseline
         self.declare_parameter("a_lat_max", 6.0)
         self.declare_parameter("a_dec_max", 4.0)
         self.declare_parameter("lookahead_min", 1.5)
@@ -117,6 +117,7 @@ class ControlNode(Node):
         self.declare_parameter("kp_v", 0.5)
         self.declare_parameter("ki_v", 0.05)
         self.declare_parameter("deadband_v", 0.2)
+        self.declare_parameter("throttle_max", 0.6)
         # Stop-latch guard. The FS start gate is also big-orange, so we
         # need to drive at least one lap-ish before the first orange
         # detection counts as the finish. Trackdrive courses are >100 m
@@ -152,6 +153,7 @@ class ControlNode(Node):
                 kp=self._p("kp_v"),
                 ki=self._p("ki_v"),
                 deadband=self._p("deadband_v"),
+                throttle_max=self._p("throttle_max"),
             )
         else:
             raise ValueError(f"unknown longitudinal_controller={lon_name!r}")
@@ -265,7 +267,14 @@ class ControlNode(Node):
 
         cmd.throttle = float(max(0.0, min(1.0, throttle)))
         cmd.brake = float(max(0.0, min(1.0, regen)))
-        cmd.steering = float(max(-1.0, min(1.0, steering_norm)))
+        # Sign convention boundary. The strategy contract declares positive
+        # steering = LEFT (math convention, matches Pure Pursuit's curvature
+        # κ = 2·sin(α)/Ld where α is atan2(body_y, body_x) with body_y =
+        # left). UE5 / Chaos SetSteeringInput uses the automotive convention:
+        # positive = RIGHT (clockwise). Flip here so every controller can be
+        # written in math without each one needing to know about the wire
+        # convention.
+        cmd.steering = float(max(-1.0, min(1.0, -steering_norm)))
         self._cmd_pub.publish(cmd)
 
         # Heartbeat — every ~0.5 s. Tells us at a glance whether each
