@@ -55,7 +55,11 @@ class ControlNode(Node):
         self._latest_odom: Optional[Odometry] = None
         self._latest_path_xs: list[float] = []
         self._latest_path_ys: list[float] = []
-        self._latest_orange_n: int = 0
+        # Big-orange forward distances (base_link frame) — captured at the
+        # tick when the gate is first detected, then frozen as a stop anchor
+        # in odom frame (see _on_orange / _stop_distance).
+        self._stop_anchor_xy: Optional[tuple[float, float]] = None
+        self._stop_latched: bool = False
 
         # TF listener (cone_graph_slam publishes odom→base_link)
         self._tf_buffer = Buffer()
@@ -65,6 +69,16 @@ class ControlNode(Node):
         self._cmd_pub = self.create_publisher(ControlCommand, "/control_command", 10)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._ebs_pub = self.create_publisher(Empty, "/signal/ebs", latched)
+        # /signal/ebs_reset clears the bridge's `ebs_triggered_` gate, which
+        # otherwise drops every /control_command silently after a previous
+        # ActivateEbs (incl. mission_control's RES-activate at event_start
+        # before the autonomy boots). Latched + retry: a single publish can
+        # race the bridge's subscriber readiness, so we re-fire a few times
+        # while the bridge is connecting.
+        self._ebs_reset_pub = self.create_publisher(Empty, "/signal/ebs_reset", latched)
+        self._ebs_reset_pub.publish(Empty())
+        self._ebs_reset_retries = 4
+        self._ebs_reset_timer = self.create_timer(0.5, self._republish_ebs_reset)
 
         # Subscribers
         self.create_subscription(Path, "Path", self._on_path, 10)
@@ -139,7 +153,54 @@ class ControlNode(Node):
         self._latest_path_ys = [p.pose.position.y for p in msg.poses]
 
     def _on_orange(self, msg: MarkerArray) -> None:
-        self._latest_orange_n = len(msg.markers)
+        """Latch a stop anchor on the first tick we see ≥2 big-orange cones.
+        Once latched, never unlatch — transient detector flicker (audit P0
+        item #2) cannot release the stop. The anchor is the centroid of
+        the orange cones, projected from the car's current odom-frame pose.
+        After that, _stop_distance() is the residual arc-length distance
+        from the car to the anchor in the odom frame.
+
+        The cones come in base_link (vehicle frame), so we transform via
+        the latest odom→base_link state we have — close enough at the
+        moment of latch since the car is still far from the gate."""
+        if self._stop_latched or self._latest_odom is None:
+            return
+        if len(msg.markers) < 2:
+            return
+        # Centroid in base_link
+        n = len(msg.markers)
+        sx = sum(m.pose.position.x for m in msg.markers) / n
+        sy = sum(m.pose.position.y for m in msg.markers) / n
+        # base_link → odom using current odom pose
+        o = self._latest_odom
+        q = o.pose.pose.orientation
+        _, _, yaw = quat2euler([q.w, q.x, q.y, q.z])
+        cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+        ax = o.pose.pose.position.x + cos_y * sx - sin_y * sy
+        ay = o.pose.pose.position.y + sin_y * sx + cos_y * sy
+        self._stop_anchor_xy = (ax, ay)
+        self._stop_latched = True
+        self.get_logger().info(
+            f"stop latched at odom=({ax:.2f}, {ay:.2f}) "
+            f"from {n} big-orange cones"
+        )
+
+    def _republish_ebs_reset(self) -> None:
+        """Re-fire /signal/ebs_reset for a short window after init to win the
+        race against the bridge's subscriber matching. Self-cancels."""
+        if self._ebs_reset_retries <= 0:
+            self._ebs_reset_timer.cancel()
+            return
+        self._ebs_reset_pub.publish(Empty())
+        self._ebs_reset_retries -= 1
+
+    def _stop_distance(self, state: VehicleState) -> float:
+        """Euclidean distance from car to the latched stop anchor. Returns
+        +inf when no stop is latched (controller treats this as 'no cap')."""
+        if not self._stop_latched or self._stop_anchor_xy is None:
+            return float("inf")
+        ax, ay = self._stop_anchor_xy
+        return math.hypot(ax - state.x, ay - state.y)
 
     # ------------------------------------------------------------- tick
 
@@ -159,6 +220,13 @@ class ControlNode(Node):
             self._cmd_pub.publish(cmd)
             return
 
+        # Stop semantics — populated here so both controllers see the same
+        # snapshot. Distance is to the latched orange-gate anchor in odom
+        # frame; treated as +inf until ≥2 big-orange cones have been seen
+        # at least once.
+        ref.stop_distance = self._stop_distance(state)
+        ref.stop_latched = self._stop_latched
+
         # Strategies own all algorithm logic. Per-tick state is immutable;
         # any internal accumulator (PI integral) lives on the strategy.
         steering_norm = self.lateral.compute(state, ref)
@@ -168,6 +236,17 @@ class ControlNode(Node):
         cmd.brake = float(max(0.0, min(1.0, regen)))
         cmd.steering = float(max(-1.0, min(1.0, steering_norm)))
         self._cmd_pub.publish(cmd)
+
+        # Heartbeat — every ~0.5 s. Tells us at a glance whether each
+        # stage is producing what we expect.
+        self._tick_count = getattr(self, "_tick_count", 0) + 1
+        if self._tick_count % 20 == 0:
+            self.get_logger().info(
+                f"v={state.speed:.2f} -> thr={cmd.throttle:+.3f} "
+                f"regen={cmd.brake:+.3f} steer={cmd.steering:+.3f} | "
+                f"path_n={len(ref.x)} path_len={ref.length:.1f}m "
+                f"stop_d={ref.stop_distance:.1f} latched={ref.stop_latched}"
+            )
 
     def _build_state(self) -> Optional[VehicleState]:
         if self._latest_odom is None:
