@@ -60,6 +60,14 @@ class ControlNode(Node):
         # in odom frame (see _on_orange / _stop_distance).
         self._stop_anchor_xy: Optional[tuple[float, float]] = None
         self._stop_latched: bool = False
+        # Travel distance (odom-frame) used as the gate-latch guard. The FS
+        # start gate is also big-orange, so a naive "latch on first sighting"
+        # snaps onto the start cones and the controller immediately tries to
+        # brake to a stop. The lap-min-distance guard suppresses the latch
+        # until we've travelled past where the start cones could possibly be.
+        self._origin_xy: Optional[tuple[float, float]] = None
+        self._travelled: float = 0.0
+        self._last_pose_xy: Optional[tuple[float, float]] = None
 
         # TF listener (cone_graph_slam publishes odom→base_link)
         self._tf_buffer = Buffer()
@@ -109,6 +117,11 @@ class ControlNode(Node):
         self.declare_parameter("kp_v", 0.5)
         self.declare_parameter("ki_v", 0.05)
         self.declare_parameter("deadband_v", 0.2)
+        # Stop-latch guard. The FS start gate is also big-orange, so we
+        # need to drive at least one lap-ish before the first orange
+        # detection counts as the finish. Trackdrive courses are >100 m
+        # per lap; 30 m is safely past any start-gate proximity.
+        self.declare_parameter("stop_latch_min_travel", 30.0)
 
     def _p(self, name: str):
         return self.get_parameter(name).value
@@ -153,19 +166,26 @@ class ControlNode(Node):
         self._latest_path_ys = [p.pose.position.y for p in msg.poses]
 
     def _on_orange(self, msg: MarkerArray) -> None:
-        """Latch a stop anchor on the first tick we see ≥2 big-orange cones.
-        Once latched, never unlatch — transient detector flicker (audit P0
-        item #2) cannot release the stop. The anchor is the centroid of
-        the orange cones, projected from the car's current odom-frame pose.
-        After that, _stop_distance() is the residual arc-length distance
-        from the car to the anchor in the odom frame.
+        """Latch a stop anchor on the first tick we see ≥2 big-orange cones,
+        AFTER the car has travelled at least stop_latch_min_travel metres
+        from origin. The minimum-travel gate exists because the FS start
+        gate is also big-orange; without it, we latch on the start cones
+        at t=0 and the controller immediately tries to brake to a stop.
+
+        Once latched, never unlatch — transient detector flicker (audit
+        P0 item #2) cannot release the stop. The anchor is the centroid
+        of the orange cones, projected from the car's current odom-frame
+        pose. After that, _stop_distance() is the residual euclidean
+        distance from the car to the anchor in odom frame.
 
         The cones come in base_link (vehicle frame), so we transform via
-        the latest odom→base_link state we have — close enough at the
-        moment of latch since the car is still far from the gate."""
+        the latest odom pose — close enough at the moment of latch since
+        the car is still ~10 m from the gate."""
         if self._stop_latched or self._latest_odom is None:
             return
         if len(msg.markers) < 2:
+            return
+        if self._travelled < self.get_parameter("stop_latch_min_travel").value:
             return
         # Centroid in base_link
         n = len(msg.markers)
@@ -220,6 +240,17 @@ class ControlNode(Node):
             self._cmd_pub.publish(cmd)
             return
 
+        # Accumulate travel distance — used by the stop-latch guard to
+        # ignore the start gate's big-orange cones until we've driven a
+        # full lap-ish away from spawn.
+        if self._last_pose_xy is None:
+            self._last_pose_xy = (state.x, state.y)
+        else:
+            dx = state.x - self._last_pose_xy[0]
+            dy = state.y - self._last_pose_xy[1]
+            self._travelled += math.hypot(dx, dy)
+            self._last_pose_xy = (state.x, state.y)
+
         # Stop semantics — populated here so both controllers see the same
         # snapshot. Distance is to the latched orange-gate anchor in odom
         # frame; treated as +inf until ≥2 big-orange cones have been seen
@@ -242,8 +273,9 @@ class ControlNode(Node):
         self._tick_count = getattr(self, "_tick_count", 0) + 1
         if self._tick_count % 20 == 0:
             self.get_logger().info(
-                f"v={state.speed:.2f} -> thr={cmd.throttle:+.3f} "
-                f"regen={cmd.brake:+.3f} steer={cmd.steering:+.3f} | "
+                f"v={state.speed:.2f} travelled={self._travelled:.1f}m -> "
+                f"thr={cmd.throttle:+.3f} regen={cmd.brake:+.3f} "
+                f"steer={cmd.steering:+.3f} | "
                 f"path_n={len(ref.x)} path_len={ref.length:.1f}m "
                 f"stop_d={ref.stop_distance:.1f} latched={ref.stop_latched}"
             )
