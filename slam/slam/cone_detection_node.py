@@ -84,6 +84,14 @@ class Cone_Detection(Node):
         warmup_numba_functions()
 
         self.n_conos = 0
+        # Per-second diagnostic accumulator for the cluster-filter pipeline.
+        # Each LiDAR scan populates per-stage cluster counts via
+        # final_cone_result_rt(debug_counters=...); we sum across scans and
+        # log a single summary line per second. Helps localise where cones
+        # are getting filtered out (issue #177).
+        self._diag = {}
+        self._diag_n_scans = 0
+        self._diag_last_log_ns = 0
 
     def listener_callback(self, msg):
         # Parse PointCloud2 using point_step to handle any field layout (xyz, xyz+padding, xyzi, etc.)
@@ -93,12 +101,37 @@ class Cone_Detection(Node):
         point_cloud = raw[:, :3]  # take only x, y, z
 
         conos = []
+        per_scan_diag = {}
         try:  ###A veces da error de division por cero. El try: es para evitar que crashe
-            conos = final_cone_result_rt(point_cloud)
+            conos = final_cone_result_rt(point_cloud, debug_counters=per_scan_diag)
         except Exception as e:
             import traceback
             self.get_logger().error(traceback.format_exc())
             pass
+
+        # Accumulate per-stage filter counts and log a per-second summary.
+        for k, v in per_scan_diag.items():
+            self._diag[k] = self._diag.get(k, 0) + v
+        self._diag_n_scans += 1
+        now_ns = self.get_clock().now().nanoseconds
+        if self._diag_last_log_ns == 0:
+            self._diag_last_log_ns = now_ns
+        elif now_ns - self._diag_last_log_ns >= 1_000_000_000 and self._diag_n_scans > 0:
+            n = self._diag_n_scans
+            self.get_logger().info(
+                f"CONE_FILTER (avg/scan over {n}): "
+                f"pts={self._diag.get('n_input_points',0)/n:5.0f} "
+                f"clusters={self._diag.get('n_clusters',0)/n:4.1f} "
+                f"-> >3pts={self._diag.get('after_min_pts',0)/n:4.1f} "
+                f"-> height={self._diag.get('after_height_gate',0)/n:4.1f} "
+                f"-> fit/centroid={self._diag.get('after_fit_or_centroid',0)/n:4.1f} "
+                f"(fit={self._diag.get('fit_used',0)/n:.1f}, "
+                f"centroid={self._diag.get('centroid_used',0)/n:.1f}, "
+                f"far_dropped={self._diag.get('far_dropped',0)/n:.1f})"
+            )
+            self._diag = {}
+            self._diag_n_scans = 0
+            self._diag_last_log_ns = now_ns
         self.get_logger().debug(str(len(conos)))
         markerArray = MarkerArray()
 

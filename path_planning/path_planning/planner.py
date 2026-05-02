@@ -91,7 +91,12 @@ MAX_EDGE_LEN_M = 7.0      # drop triangles with any edge longer than this
 MIN_TRI_ANGLE_RAD = 0.35  # drop slivers (interior angle < ~20°)
 
 # Search parameters.
-SEARCH_RADIUS_M = 5.0           # candidate gather radius around each leaf
+# SEARCH_RADIUS_M was 5.0 m, which exactly excluded the very-first step
+# from the car anchor (0,0) to the closest pair-midpoint at body_x ≈ 5
+# (a 5 m gate spacing is FS-standard). Bumped to 7.0 so the first hop
+# can pick that midpoint up; later hops between adjacent midpoints are
+# typically 2–4 m so the wider radius isn't restrictive.
+SEARCH_RADIUS_M = 7.0           # candidate gather radius around each leaf
 MAX_HEADING_DELTA_RAD = 0.8     # ~46°: per-step heading change cap
 MIN_MIDPOINT_DIST_M = 0.81      # don't pick a candidate within this of leaf
 MIN_TRACK_WIDTH_M = 2.0         # the candidate's edge must be ≥ this long
