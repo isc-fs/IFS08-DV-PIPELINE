@@ -28,7 +28,7 @@ import timeit
 import math
 
 
-def final_cone_result_rt(data, model=DBSCAN):
+def final_cone_result_rt(data, model=DBSCAN, debug_counters=None):
     """
     Permite sacar los conos a partir de los datos del lidar. Version
     para Real Time. Aplica RANSAC, Clustering y el ajuste de cono. Esta hecha
@@ -38,11 +38,17 @@ def final_cone_result_rt(data, model=DBSCAN):
         data (np.ndarray): los datos del lidar
         model (sklearn.model, optional): modelo de clustering empleado. Sirve una implementacion
                                          propia si es una clase con metodo fit_transform. Defaults to DBSCAN.
+        debug_counters (dict, optional): if provided, gets populated with
+            per-filter-stage cluster counts for diagnostics. Keys:
+            n_input_points, n_clusters, after_min_pts, after_height_gate,
+            after_fit_or_centroid, accepted, far_dropped, fit_used, centroid_used.
 
     Returns:
         float, float: las posiciones x e y de la punta del cono (a y b de los parametros del cono)
     """
 
+    if debug_counters is not None:
+        debug_counters["n_input_points"] = len(data)
     if len(data) == 0:
         return []
     labels, clean_data, def_coefs = clustering_separation_rt(data, model)
@@ -51,9 +57,27 @@ def final_cone_result_rt(data, model=DBSCAN):
     separated_data = [
         np.array(clean_data[labels == label]) for label in np.unique(labels)
     ]
+    if debug_counters is not None:
+        debug_counters["n_clusters"] = len(separated_data)
+        debug_counters["after_min_pts"] = 0
+        debug_counters["after_height_gate"] = 0
+        debug_counters["after_fit_or_centroid"] = 0
+        debug_counters["accepted"] = 0
+        debug_counters["far_dropped"] = 0
+        debug_counters["fit_used"] = 0
+        debug_counters["centroid_used"] = 0
     cone_positions = []
     for cone in separated_data:
-        if len(cone) > 3:
+        # Accept clusters with ≥ 2 points (was > 3). The previous floor
+        # was rejecting half of all DBSCAN clusters per scan because far
+        # cones (15–25 m) only return 2–3 points on the Hesai 128 ch:
+        # at 20 m a small FS cone subtends ~0.7° H × 1.8° V and at our
+        # 0.77° H step / 0.14° V step that's ~2–3 LiDAR returns total.
+        # The downstream height + fit/centroid gates already do real
+        # validation; this min-points floor was double-filtering.
+        if len(cone) > 2:
+            if debug_counters is not None:
+                debug_counters["after_min_pts"] += 1
             v = np.array([0, 0, -1 * def_coefs[0]])
             w = np.array(def_coefs[1:])
             lidar_distance_to_floor = np.dot(v, w) / np.linalg.norm(w)
@@ -69,6 +93,8 @@ def final_cone_result_rt(data, model=DBSCAN):
             cluster_height = float(clean_cone[:, 2].max() - clean_cone[:, 2].min())
             if cluster_height < 0.08 or cluster_height > 0.70:
                 continue
+            if debug_counters is not None:
+                debug_counters["after_height_gate"] += 1
 
             params = cone_fit_2params(clean_cone, solver="SLSQP")
 
@@ -97,10 +123,16 @@ def final_cone_result_rt(data, model=DBSCAN):
             # AMZ §3.2 / MUR rule: expected_points(d) ∝ 1/d² for a
             # spinning LiDAR. At our 200k pts/s × 10 Hz × 128 ch the
             # constant is ~250: small cone at 5 m → 10 pts, at 25 m →
-            # 0.4 pts. Require ≥ max(6, 0.5×expected) so close-range
-            # clusters get a stricter test than far-range ones.
+            # 0.4 pts. Require ≥ max(2, 0.5×expected) so close-range
+            # clusters get a stricter test than far-range ones; the
+            # floor of 2 (was 6) lets sparse far-range clusters
+            # through the centroid fallback. The 6-point floor was
+            # blocking every cone past ~10 m from passing centroid_ok,
+            # leaving fit_ok as the only path — and the L-BFGS-B fit
+            # is unreliable on 2–3 noisy points, so most far cones
+            # got dropped entirely.
             expected_pts = 250.0 / max(range_m_pre ** 2, 1.0)
-            min_pts_required = max(6, int(0.5 * expected_pts))
+            min_pts_required = max(2, int(0.5 * expected_pts))
             centroid_ok = (
                 n_pts_pre >= min_pts_required
                 and 0.20 <= cluster_height <= 0.55
@@ -113,12 +145,22 @@ def final_cone_result_rt(data, model=DBSCAN):
                 a_xy = float(params[0])
                 b_xy = float(params[1])
                 fallback_used = False
+                if debug_counters is not None:
+                    debug_counters["fit_used"] += 1
             elif centroid_ok:
                 a_xy = float(clean_cone[:, 0].mean())
                 b_xy = float(clean_cone[:, 1].mean())
                 fallback_used = True
+                if debug_counters is not None:
+                    debug_counters["centroid_used"] += 1
             else:
+                if debug_counters is not None:
+                    if range_m_pre > 20.0:
+                        debug_counters["far_dropped"] += 1
                 continue
+            if debug_counters is not None:
+                debug_counters["after_fit_or_centroid"] += 1
+                debug_counters["accepted"] += 1
 
             # The original bounds are still the trust signal — fitted
             # cones get the precise apex position; centroid-fallback
