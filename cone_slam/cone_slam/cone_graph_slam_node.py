@@ -118,6 +118,25 @@ class ConeGraphSlamNode(Node):
         self._state = State.INIT_WAITING_IMU
         self._calib_started_t: Optional[float] = None
 
+        # Optional per-landmark creation diagnostic. When DV_SLAM_LANDMARK_CAPTURE
+        # is set to a writable path, every new landmark dumps one JSON line
+        # (id, body_x, body_y, range, color, pred_yaw_deg, step) at creation.
+        # Used to verify the colour-lock-on-first-observation hypothesis (#188):
+        # if many landmarks created at long range or during a yaw rotation
+        # have body_y near the threshold and get locked the wrong colour, the
+        # hypothesis is confirmed.
+        import os as _os
+        self._lm_capture_path = _os.environ.get("DV_SLAM_LANDMARK_CAPTURE", "")
+        self._lm_capture_fh = None
+        if self._lm_capture_path:
+            try:
+                self._lm_capture_fh = open(self._lm_capture_path, "w")
+                self.get_logger().info(
+                    f"DV_SLAM_LANDMARK_CAPTURE → {self._lm_capture_path}")
+            except OSError as ex:
+                self.get_logger().error(f"landmark capture open failed: {ex}")
+                self._lm_capture_fh = None
+
         # Latest /motor_rpm sample. Wall-clock timestamp because the
         # bridge stamps it with node_->now() (no header.stamp on
         # std_msgs/Float32). Used for staleness check inside _on_cones.
@@ -367,6 +386,29 @@ class ConeGraphSlamNode(Node):
                 self._graph.stage_cone_observation(
                     lm.id, o.body_x, o.body_y, o.sigma_xy)
                 n_new += 1
+                if self._lm_capture_fh is not None:
+                    try:
+                        import math as _math, json as _json
+                        rng = _math.hypot(o.body_x, o.body_y)
+                        bearing_deg = _math.degrees(
+                            _math.atan2(o.body_y, o.body_x))
+                        self._lm_capture_fh.write(_json.dumps({
+                            "id": lm.id,
+                            "step": self._graph.step,
+                            "body_x": o.body_x,
+                            "body_y": o.body_y,
+                            "range_m": rng,
+                            "bearing_deg": bearing_deg,
+                            "height": o.height,
+                            "color": int(o.color),
+                            "pose_yaw_deg": _math.degrees(pred_yaw),
+                            "world_xyz": [float(world_xyz[0]),
+                                          float(world_xyz[1]),
+                                          float(world_xyz[2])],
+                        }) + "\n")
+                        self._lm_capture_fh.flush()
+                    except Exception:
+                        pass
             else:
                 self._db.mark_observed(m.landmark_id, self._graph.step)
                 self._graph.stage_cone_observation(
