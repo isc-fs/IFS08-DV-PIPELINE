@@ -97,7 +97,16 @@ MIN_TRI_ANGLE_RAD = 0.35  # drop slivers (interior angle < ~20°)
 # can pick that midpoint up; later hops between adjacent midpoints are
 # typically 2–4 m so the wider radius isn't restrictive.
 SEARCH_RADIUS_M = 7.0           # candidate gather radius around each leaf
-MAX_HEADING_DELTA_RAD = 0.8     # ~46°: per-step heading change cap
+# Per-step heading-change cap. 0.8 rad (~46°) was too strict on
+# consecutive sharp curves where SLAM has caught one side of the
+# corridor but not the other yet — the walker's leaf ends up
+# slightly off-centerline and the next geometrically-valid midpoint
+# requires a turn just past the cap, so the search dead-ends with
+# only 2–3 selected midpoints. 1.1 rad (~63°) accommodates a
+# 4.5 m-radius corner with 2.5 m cone spacing without admitting
+# physically-implausible U-turn segments (which the bicycle model
+# can't track anyway).
+MAX_HEADING_DELTA_RAD = 1.1     # ~63°: per-step heading change cap
 MIN_MIDPOINT_DIST_M = 0.81      # don't pick a candidate within this of leaf
 MIN_TRACK_WIDTH_M = 2.0         # the candidate's edge must be ≥ this long
 
@@ -105,6 +114,18 @@ MIN_TRACK_WIDTH_M = 2.0         # the candidate's edge must be ≥ this long
 # tie-breaker; raw distance contributes little (urinay convention).
 W_DIST = 0.1
 W_TW_DIFF = 0.8
+# Additive score penalty applied to candidate midpoints from edges
+# whose two endpoints share a colour. Such edges aren't centerline
+# crossings by construction; the cleanest failure mode they produce
+# is a long same-colour chord across a tight corner whose midpoint
+# sits along the straight extension of the approach and beats the
+# real corner midpoints in the heading-biased score (issue #180).
+# Penalty is large enough that a real blue↔yellow option always
+# wins when one exists, but small enough that a same-colour edge
+# can still be selected as a fallback when no opposite-colour
+# alternative is available — important for sparse/colour-noisy
+# real-world observations from a moving car.
+W_SAME_COLOR_PENALTY = 1.5
 
 # Output path density. 30 samples over ~18 m of lookahead = ~0.6 m
 # spacing, fine enough for Pure-Pursuit lookahead lookups.
@@ -183,6 +204,7 @@ class _Edge:
     j: int                   # cone index
     midpoint: np.ndarray     # (2,) midpoint in body frame
     length: float            # edge length (track-width estimate)
+    same_color: bool = False # endpoints have the same cone colour
 
 
 def _build_edges(
@@ -193,15 +215,15 @@ def _build_edges(
     after triangle-quality filtering. Each edge appears once even if
     shared by two triangles.
 
-    If `colors_body` (N,) is provided, edges between two same-color
-    cones are dropped: their midpoints are not centerline crossings.
-    On a tight corner the Delaunay triangulation routinely produces
-    a long same-color edge that spans the corner (e.g. an outside
-    cone before the apex paired with an outside cone past the apex).
-    Its midpoint sits roughly along the straight extension of the
-    approach, which then beats the real corner midpoints in the
-    heading-biased score and steers the path the wrong way. Filtering
-    same-color edges here closes that failure mode at the source.
+    If `colors_body` (N,) is provided, each edge is tagged with
+    `same_color = colors_body[i] == colors_body[j]`. The search
+    layer applies a heuristic penalty to same-color edges: they're
+    not centerline crossings by construction (the centerline is
+    *between* blue and yellow), but an outright drop here starves
+    the planner under sparse / colour-noisy real-world observations
+    where the only edge bridging a gap may be same-colour. Tagging
+    + score-penalty preserves them as fallback candidates that lose
+    to any real blue↔yellow option.
     """
     n = cones_body.shape[0]
     if n < 3:
@@ -226,8 +248,6 @@ def _build_edges(
             if key in seen:
                 continue
             seen.add(key)
-            if colors_body is not None and colors_body[i] == colors_body[j]:
-                continue
             pi, pj = cones_body[i], cones_body[j]
             length = float(np.linalg.norm(pi - pj))
             # Long-edge filter: drop track-spanning chords. These show
@@ -237,10 +257,14 @@ def _build_edges(
             # neighbours.
             if length > MAX_EDGE_LEN_M:
                 continue
+            same_color = (
+                colors_body is not None and colors_body[i] == colors_body[j]
+            )
             edges.append(_Edge(
                 i=i, j=j,
                 midpoint=0.5 * (pi + pj),
                 length=length,
+                same_color=bool(same_color),
             ))
     return edges
 
@@ -313,9 +337,19 @@ def _search_path_body(
 
             # Heading from current leaf to candidate.
             head = float(np.arctan2(mp[1] - leaf[1], mp[0] - leaf[0]))
-            # First step uses the leaf-to-cand heading as the seed,
-            # so heading delta is 0; subsequent steps compare to prev.
-            dhead = abs(_wrap_pi(head - prev_heading)) if len(pts) > 1 else 0.0
+            # The first step from the car anchor compares heading to
+            # body-+x (the car's forward direction). Without this, any
+            # cross-color midpoint near the car wins on distance alone
+            # — including geometrically off-centerline ones produced
+            # by colour confusion (a yellow cone mislabelled blue
+            # creates a "cross-colour" edge whose midpoint is on one
+            # side of the corridor, not at the centerline). With the
+            # constraint, an off-line midpoint (e.g. body-y = −1.19)
+            # has dhead ≈ 41° and loses to an on-centerline midpoint
+            # (e.g. body-y = +0.43, dhead ≈ 8°) on the heading term.
+            # prev_heading is initialised to 0 (= body-+x) so the
+            # comparison falls out naturally for step 0 too.
+            dhead = abs(_wrap_pi(head - prev_heading))
             if dhead > MAX_HEADING_DELTA_RAD:
                 _bump("heading_delta")
                 continue
@@ -343,6 +377,7 @@ def _search_path_body(
                 + W_DIST * (d / SEARCH_RADIUS_M)
                 + W_TW_DIFF * (abs(e.length - prev_tw) / MAX_EDGE_LEN_M
                                if prev_tw > 0.0 else 0.0)
+                + (W_SAME_COLOR_PENALTY if e.same_color else 0.0)
             )
             if score < best_score:
                 best_score = score

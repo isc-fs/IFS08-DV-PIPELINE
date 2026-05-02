@@ -325,6 +325,82 @@ def test_tight_corner_with_noise_doesnt_invert() -> None:
     assert not failures, "Wrong-direction failures:\n  " + "\n  ".join(failures)
 
 
+def test_pie_capture_tick_recovers() -> None:
+    """Captured tick from a PIE failure on customMap / test_submodule.csv
+    where the planner returned an empty path mid-corner. The SLAM map
+    contained colour-confused cones (yellow cones mis-classified as
+    blue), which produced a "cross-colour" Delaunay edge whose midpoint
+    sat off the centerline. Pre-fix the walker's first step picked
+    that midpoint (no first-step heading constraint), then step 2
+    starved because every remaining candidate required >46° heading
+    change from the off-line leaf.
+
+    Post-fix (first step compares heading to body-+x): the walker
+    picks an on-centerline midpoint at body (3.24, +0.43) and chains
+    cleanly through 10 midpoints.
+
+    Captured from /tmp/planner_capture.jsonl tick 84 (first plan_empty
+    event in a 153-tick PIE session).
+    """
+    pose = Pose2D(
+        x=22.621483185023195, y=1.6179696965233892, yaw=0.2780509329948125,
+    )
+    raw_cones = [
+        (4.266337088497731, 2.163876074223922, 3),
+        (5.034998281830168, 1.4592973900289956, 1),
+        (7.958635433643793, 1.455428713968176, 1),
+        (19.861061875921923, 2.6571922108667843, 1),
+        (17.00261555234292, -0.9360468087558064, 0),
+        (11.038191320928618, -1.4682362628284427, 0),
+        (7.9533264523666976, -1.5376280513915057, 0),
+        (5.021272978798792, -1.528678092400253, 0),
+        (4.262669840803345, -2.196285915866531, 3),
+        (11.024485559383324, 1.5251988263757168, 1),
+        (14.04037430246252, -1.282585467227396, 0),
+        (4.209282815232597, -2.1973675454516024, 0),
+        (22.747382964179206, 3.45468649796876, 1),
+        (14.02070989024912, 1.7231621839731712, 1),
+        (25.54387384263885, 4.518698225710516, 1),
+        (16.947264333117502, 2.0875385299859763, 1),
+        (28.37316330994175, 2.534861438999952, 1),
+        (28.21571654915225, 5.834744415341714, 1),
+        (19.979102381765774, -0.41359359407648516, 2),
+        (25.661172720426414, 1.338750056476591, 1),
+        (30.7037385302634, 7.471941951529211, 1),
+        (22.812016960863044, 0.3494141095590504, 2),
+        (31.00048712409213, 4.012512170524785, 1),
+        (32.920382264382944, 9.420783832667162, 1),
+        (33.41123644717094, 5.7767298135593155, 1),
+        (19.89266440271804, -0.4056802052551138, 0),
+        (35.54847186341183, 7.829034120181934, 1),
+        (25.64725545027751, 1.3260206571495077, 2),
+        (37.41082522914589, 10.188027277718012, 1),
+        (22.81978996061089, 0.34160927125691093, 0),
+        (34.80127174662435, 11.718701052529973, 1),
+        (36.639504226327794, 14.088929932620303, 1),
+        (39.25365826714985, 12.548103705711446, 1),
+        (28.420605506782323, 2.5578175386461246, 2),
+        (25.694327248449536, 1.3226770474024137, 0),
+        (38.56186777977754, 16.35262532984754, 1),
+        (41.21901947884294, 14.814388997935406, 1),
+        (31.014011889576143, 4.02363605734227, 2),
+        (28.321714433759183, 2.4987832430000982, 0),
+    ]
+    cones = [Cone(x=x, y=y, color=ConeColor(c)) for x, y, c in raw_cones]
+    path, debug = plan_centerline_with_debug(cones, pose)
+    assert path, (
+        f"Captured PIE failure tick still empty. "
+        f"sel={0 if debug.selected_midpoints is None else len(debug.selected_midpoints)}/"
+        f"{0 if debug.candidate_midpoints is None else len(debug.candidate_midpoints)} "
+        f"rej={debug.rejections}"
+    )
+    n_sel = len(debug.selected_midpoints)
+    assert n_sel >= 4, (
+        f"Captured PIE failure tick: only {n_sel} midpoints selected. "
+        f"Expected ≥ 4 (post-fix produced 10). rej={debug.rejections}"
+    )
+
+
 def test_color_confusion_drops_invalid_pair() -> None:
     """A blue cone on the wrong side (negative body_y) shouldn't drag
     the midpoint over to that side. The walker's distance-sanity
