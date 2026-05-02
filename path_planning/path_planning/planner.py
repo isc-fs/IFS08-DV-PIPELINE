@@ -187,10 +187,21 @@ class _Edge:
 
 def _build_edges(
     cones_body: np.ndarray,
+    colors_body: Optional[np.ndarray] = None,
 ) -> List[_Edge]:
     """Triangulate `cones_body` (N, 2) and return the unique edge set
     after triangle-quality filtering. Each edge appears once even if
     shared by two triangles.
+
+    If `colors_body` (N,) is provided, edges between two same-color
+    cones are dropped: their midpoints are not centerline crossings.
+    On a tight corner the Delaunay triangulation routinely produces
+    a long same-color edge that spans the corner (e.g. an outside
+    cone before the apex paired with an outside cone past the apex).
+    Its midpoint sits roughly along the straight extension of the
+    approach, which then beats the real corner midpoints in the
+    heading-biased score and steers the path the wrong way. Filtering
+    same-color edges here closes that failure mode at the source.
     """
     n = cones_body.shape[0]
     if n < 3:
@@ -215,6 +226,8 @@ def _build_edges(
             if key in seen:
                 continue
             seen.add(key)
+            if colors_body is not None and colors_body[i] == colors_body[j]:
+                continue
             pi, pj = cones_body[i], cones_body[j]
             length = float(np.linalg.norm(pi - pj))
             # Long-edge filter: drop track-spanning chords. These show
@@ -253,18 +266,29 @@ def _wrap_pi(a: float) -> float:
     return (a + np.pi) % (2.0 * np.pi) - np.pi
 
 
-def _search_path_body(edges: List[_Edge]) -> np.ndarray:
+def _search_path_body(
+    edges: List[_Edge],
+    rejections: Optional[dict] = None,
+) -> np.ndarray:
     """Greedy best-first walk over edge midpoints in body frame.
 
     Seeds at the car (origin). At each step picks the candidate
     midpoint that minimises the urinay heuristic, subject to the
     seven-gate validity filter. Returns (M, 2) midpoint array
     starting at the car anchor.
+
+    If `rejections` is provided, increments per-gate counters
+    every time a candidate edge is filtered out. Useful for
+    diagnosing why a path is shorter than expected.
     """
     pts: List[np.ndarray] = [np.zeros(2)]    # car anchor at body origin
     used: Set[int] = set()                   # edge indices already on path
     prev_heading = 0.0                       # last segment heading (rad)
     prev_tw = 0.0                            # last edge's track width
+
+    def _bump(reason: str) -> None:
+        if rejections is not None:
+            rejections[reason] = rejections.get(reason, 0) + 1
 
     while len(pts) < MAX_PATH_PTS:
         leaf = pts[-1]
@@ -281,8 +305,10 @@ def _search_path_body(edges: List[_Edge]) -> np.ndarray:
             mp = e.midpoint
             d = float(np.linalg.norm(mp - leaf))
             if d < MIN_MIDPOINT_DIST_M or d > SEARCH_RADIUS_M:
+                _bump("distance")
                 continue
             if e.length < MIN_TRACK_WIDTH_M:
+                _bump("track_width")
                 continue
 
             # Heading from current leaf to candidate.
@@ -291,6 +317,7 @@ def _search_path_body(edges: List[_Edge]) -> np.ndarray:
             # so heading delta is 0; subsequent steps compare to prev.
             dhead = abs(_wrap_pi(head - prev_heading)) if len(pts) > 1 else 0.0
             if dhead > MAX_HEADING_DELTA_RAD:
+                _bump("heading_delta")
                 continue
 
             # Forward-only: candidate must be in front of the leaf in
@@ -299,6 +326,7 @@ def _search_path_body(edges: List[_Edge]) -> np.ndarray:
             # first segment we require body-x forward of the leaf so
             # the path doesn't snap to a midpoint behind the car.
             if len(pts) == 1 and mp[0] <= leaf[0] + 1e-3:
+                _bump("behind_leaf")
                 continue
 
             # Self-intersection: don't allow the new segment to cross
@@ -307,6 +335,7 @@ def _search_path_body(edges: List[_Edge]) -> np.ndarray:
             # the heading cap catches most U-turn shapes anyway, but
             # this guard prevents the rare hairpin self-cross.
             if len(pts) >= 3 and _segment_crosses_any(pts, leaf, mp):
+                _bump("self_intersect")
                 continue
 
             score = (
@@ -396,10 +425,18 @@ class PlanDebug:
     on a TF that doesn't follow the car. Empty arrays are valid: at
     early ticks (few cones, no triangulation) they communicate that
     the planner failed at a specific stage.
+
+    `rejections` is a per-search-step diagnostic accumulator, populated
+    by `_search_path_body`. Counts how many candidate edges were
+    discarded by each gate across the whole walk. Useful when a path
+    comes back too short and we need to know which filter was the
+    bottleneck without re-running with a debugger. Keys: distance,
+    track_width, heading_delta, behind_leaf, self_intersect.
     """
     triangulation_edges: np.ndarray = None  # (E, 2, 2) — endpoints per edge
     candidate_midpoints: np.ndarray = None  # (E, 2) — one per edge
     selected_midpoints: np.ndarray = None   # (M, 2) — best-first chosen
+    rejections: dict = None                  # gate_name -> count
 
 
 def plan_centerline(cones: List[Cone], pose: Pose2D) -> List[PathPoint]:
@@ -423,6 +460,7 @@ def plan_centerline_with_debug(
         triangulation_edges=np.empty((0, 2, 2)),
         candidate_midpoints=np.empty((0, 2)),
         selected_midpoints=np.empty((0, 2)),
+        rejections={},
     )
 
     if not cones:
@@ -434,6 +472,7 @@ def plan_centerline_with_debug(
 
     cones_world = np.array([[c.x, c.y] for c in track_cones], dtype=float)
     cones_body = _world_to_body(cones_world, pose)
+    colors_body = np.array([int(c.color) for c in track_cones])
 
     mask = (
         (cones_body[:, 0] >= BODY_X_MIN)
@@ -441,10 +480,11 @@ def plan_centerline_with_debug(
         & (np.abs(cones_body[:, 1]) <= HALF_CORRIDOR_M)
     )
     cones_body = cones_body[mask]
+    colors_body = colors_body[mask]
     if cones_body.shape[0] < 3:
         return [], debug
 
-    edges = _build_edges(cones_body)
+    edges = _build_edges(cones_body, colors_body)
     if not edges:
         return [], debug
 
@@ -462,7 +502,7 @@ def plan_centerline_with_debug(
         cand_body = np.array([e.midpoint for e in edges])  # (E, 2)
         debug.candidate_midpoints = _body_to_world(cand_body, pose)
 
-    midpoints_body = _search_path_body(edges)
+    midpoints_body = _search_path_body(edges, rejections=debug.rejections)
     if midpoints_body.shape[0] >= 1:
         debug.selected_midpoints = _body_to_world(midpoints_body, pose)
 
