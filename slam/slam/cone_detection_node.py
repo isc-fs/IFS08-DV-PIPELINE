@@ -109,6 +109,29 @@ class Cone_Detection(Node):
             self.get_logger().error(traceback.format_exc())
             pass
 
+        # Pre-compute per-side tallies for the diagnostic. Cone_Detection
+        # doesn't itself colour-classify (SLAM does that downstream), but
+        # body-y sign is the same signal SLAM's classify() uses, so this
+        # is a faithful proxy for "what colour SLAM will see for each
+        # accepted cone." Used to determine whether a cone-imbalance in
+        # the SLAM map (#189) starts here in detection or downstream.
+        n_left = n_right = n_centerline = n_bigorange = 0
+        for entry in conos:
+            b = float(entry[1])  # body-y; +Y = left in REP-103
+            h = float(entry[2]) if len(entry) >= 3 else 0.0
+            if h > self.BIG_ORANGE_HEIGHT_THRESHOLD_M:
+                n_bigorange += 1
+            elif b > 0.5:
+                n_left += 1
+            elif b < -0.5:
+                n_right += 1
+            else:
+                n_centerline += 1
+        per_scan_diag["accepted_left"] = n_left
+        per_scan_diag["accepted_right"] = n_right
+        per_scan_diag["accepted_centerline"] = n_centerline
+        per_scan_diag["accepted_bigorange"] = n_bigorange
+
         # Accumulate per-stage filter counts and log a per-second summary.
         for k, v in per_scan_diag.items():
             self._diag[k] = self._diag.get(k, 0) + v
@@ -127,7 +150,11 @@ class Cone_Detection(Node):
                 f"-> fit/centroid={self._diag.get('after_fit_or_centroid',0)/n:4.1f} "
                 f"(fit={self._diag.get('fit_used',0)/n:.1f}, "
                 f"centroid={self._diag.get('centroid_used',0)/n:.1f}, "
-                f"far_dropped={self._diag.get('far_dropped',0)/n:.1f})"
+                f"far_dropped={self._diag.get('far_dropped',0)/n:.1f}) "
+                f"by-side: L={self._diag.get('accepted_left',0)/n:4.1f} "
+                f"R={self._diag.get('accepted_right',0)/n:4.1f} "
+                f"C={self._diag.get('accepted_centerline',0)/n:.1f} "
+                f"BO={self._diag.get('accepted_bigorange',0)/n:.1f}"
             )
             self._diag = {}
             self._diag_n_scans = 0
