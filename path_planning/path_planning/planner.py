@@ -1,9 +1,9 @@
-"""Centerline planner — forward-walking midpoint with cubic-spline smoothing.
+"""Centerline planner — Delaunay triangulation + BFS midpoint search.
 
 Pure-Python, no ROS deps. Designed to be testable in isolation against
 synthetic cone fixtures.
 
-# Algorithm
+# Algorithm (urinay-style; see https://github.com/origovi/urinay)
 
 Given a set of (color-tagged) cone positions in the world frame and a
 car pose (x, y, yaw), compute a smooth centerline ahead of the car as
@@ -12,105 +12,111 @@ a sequence of (x, y, yaw) waypoints in the world frame.
   1. Project every cone into body frame (forward-X, left-Y).
   2. Drop cones outside a forward "corridor of interest"
      (BODY_X_MIN ≤ body_x ≤ LOOKAHEAD_M, |body_y| ≤ HALF_CORRIDOR_M).
-     Cones behind the car or far to the side don't help.
-  3. Sort the remaining LEFT and RIGHT cones by body_x ascending.
-  4. Pair: walk forward in steps of STEP_M starting from BODY_X_MIN.
-     At each target_x, find the closest LEFT and RIGHT cones in the
-     window [target_x - STEP_M, target_x + STEP_M].
-       - both found → midpoint at ( target_x, (Ly + Ry) / 2 )
-       - only one found → offset from that cone by ±TRACK_HALF_WIDTH_M
-       - neither found → stop walking; we ran out of cones.
-  5. Always anchor the path at the car (body origin) as the first
-     point. Without this anchor a Pure-Pursuit / Stanley controller
-     looking for "the path point closest to me" can pick a midpoint
-     several meters ahead and act on a stale lateral error.
-  6. Cubic spline through the (anchor + midpoints) sequence in body
-     frame. Sample N_OUTPUT points along the spline. Compute yaw at
-     each sample from the spline derivative.
+  3. Delaunay-triangulate the surviving cone set (color-blind, like
+     urinay master).
+  4. Extract the unique edge set; for each edge precompute its
+     midpoint, its length (track-width estimate at that location),
+     and the two adjacent triangles. Drop edges longer than
+     MAX_EDGE_LEN_M (almost certainly a track-spanning chord, not a
+     track-width edge) or in triangles whose minimum interior angle
+     is below MIN_TRI_ANGLE_RAD (sliver triangles confuse the search).
+  5. Best-first search ("BFS with single-best-leaf"):
+     - Seed at the car (body origin).
+     - At each step, gather edge-midpoints within SEARCH_RADIUS_M of
+       the current leaf. Filter through the seven-gate validity check
+       (heading change limit, distance limit, no self-edges, no
+       intersections with prior segments, track-width minimum, no
+       backward "U-turn" candidates).
+     - Score each survivor with a heuristic combining
+         heading-change   (dominant)
+         distance         (small)
+         track-width consistency (tie-breaker)
+       Pick the lowest-heuristic candidate, append, repeat.
+     - Stop when no candidate passes the gates, or after MAX_PATH_PTS
+       steps, or when the path has reached LOOKAHEAD_M of arc length.
+  6. The car (body origin) is always the first path point.
   7. Project samples back to world frame and emit.
 
-# Why "forward-walking" and not Delaunay or full pairing
+# Why Delaunay (vs forward-walking midpoint)
 
-  - Robust to one missing side. FS courses routinely have stretches
-    where the inside-of-corner cones are out of LiDAR FoV. The
-    one-side fallback (step 4) keeps emitting a path where Delaunay
-    would refuse to triangulate cleanly.
-  - O(n) in cone count, no triangulation, no global graph. Fits
-    inside a 10 Hz callback without any optimization.
-  - Color-aware. We trust the cone-color tags coming from cone_slam
-    (color is locked at first observation in LandmarkDb). If the
-    upstream classifier ever fails, color confusion shows up here as
-    a midpoint that lands ON a cone instead of between the corridors,
-    which is easy to spot in viz.
+  - Handles asymmetric cone counts natively: when one side is sparse,
+    the triangulation just produces longer edges on that side, which
+    the edge-length filter strips, so the path naturally relies on
+    triangles formed by the dense side's neighbours.
+  - No "pair the closest cone in body_x" heuristic that flips
+    tick-to-tick: the triangulation is geometrically defined and
+    deterministic given the same cone set.
+  - Cone-color-blind by construction. We trust the geometric
+    structure of the cone field to encode the corridor.
 
-# What this deliberately does NOT do
+# What this MVP deliberately does NOT do (yet)
 
-  - No Delaunay triangulation. urinay-style triangle filtering is
-    neat but adds a configuration surface (max edge length, min
-    angle) that's hard to tune and easy to break on sparse cones.
-  - No tree search / multi-hypothesis. The car never has to choose
-    between two plausible paths in FS — the cone gates are
-    well-defined.
-  - No loop closure. Path planning is local; loop closure (if any)
-    lives in cone_slam.
-  - No skidpad / acceleration mission specialization. Trackdrive only
-    for now.
+  - Persistent midline (committed edges across ticks). Each tick
+    re-plans from scratch. Robust enough for trackdrive at our
+    speeds; the cost is some redundant work.
+  - Loop closure. The controller has its own stop-latch on the
+    big-orange finish gate.
+  - Multi-hypothesis search with deferred commit. We pick the best
+    candidate greedily at each step.
+  - Failsafe parameter-multiplier retry. If the search starves, we
+    return whatever path we have (clamped to MIN_MIDPOINTS).
+
+These can be added in later commits on this branch as needed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import numpy as np
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import PchipInterpolator
+from scipy.spatial import Delaunay, QhullError
 
 
 # ----- tuning ----------------------------------------------------------------
 
 # Body-frame X range we keep cones in. BODY_X_MIN is slightly negative
-# so we don't drop cones "next to the car" the very first frame after
-# the car crosses them — that lateral pair still defines the corridor
-# the car is currently inside.
-BODY_X_MIN = -0.5         # m, behind-the-car threshold (drop further-back cones)
+# so cones immediately next to the car (just behind the front axle in
+# body frame) still contribute to triangulation.
+BODY_X_MIN = -2.0         # m
 LOOKAHEAD_M = 18.0        # m, drop cones beyond this forward distance
 
-# Lateral cutoff. FS course is ≥ 3 m wide; cones ±5 m off the car's
-# longitudinal axis are confidently "this lane". Wider would let the
-# planner pull cones from a parallel section of track on tight loops.
-HALF_CORRIDOR_M = 5.0
+# Lateral cutoff: ignore cones in parallel sections of track on tight loops.
+HALF_CORRIDOR_M = 8.0     # m
 
-# Forward-walking step. Smaller = more midpoints (smoother spline,
-# slower); larger = fewer midpoints, can miss tight curves. 1.5 m
-# matches typical FS cone spacing along the racing line.
-STEP_M = 1.5
+# Triangle / edge filters. urinay defaults (autocross.yml) translated.
+MAX_EDGE_LEN_M = 7.0      # drop triangles with any edge longer than this
+MIN_TRI_ANGLE_RAD = 0.35  # drop slivers (interior angle < ~20°)
 
-# Standard FS track half-width (centerline → cone). Used for the
-# one-side fallback when only LEFT or only RIGHT cones are visible
-# at a given target_x.
-TRACK_HALF_WIDTH_M = 1.5
+# Search parameters.
+SEARCH_RADIUS_M = 5.0           # candidate gather radius around each leaf
+MAX_HEADING_DELTA_RAD = 0.8     # ~46°: per-step heading change cap
+MIN_MIDPOINT_DIST_M = 0.81      # don't pick a candidate within this of leaf
+MIN_TRACK_WIDTH_M = 2.0         # the candidate's edge must be ≥ this long
+
+# Heuristic weights. Heading dominates; track-width consistency is the
+# tie-breaker; raw distance contributes little (urinay convention).
+W_DIST = 0.1
+W_TW_DIFF = 0.8
 
 # Output path density. 30 samples over ~18 m of lookahead = ~0.6 m
-# spacing, fine enough for Stanley/Pure-Pursuit lookahead lookups.
+# spacing, fine enough for Pure-Pursuit lookahead lookups.
 N_OUTPUT = 30
 
-# Minimum number of midpoints (including the car-anchor) before we'll
-# emit a path. Two anchor + 1 midpoint is degenerate; require ≥ 3
-# total so the cubic spline has something to interpolate.
+# Minimum midpoints (incl. car anchor) before we'll emit a path.
 MIN_MIDPOINTS = 3
+
+# Maximum path-point count from the search; bounds runtime.
+MAX_PATH_PTS = 25
 
 
 # ----- public types ----------------------------------------------------------
 
 
 class ConeColor(IntEnum):
-    """Local mirror of cone_slam.color_classifier.ConeColor.
-
-    Duplicated to keep this module independent of the cone_slam
-    package — the planner is a downstream consumer and shouldn't
-    import from upstream packages. The numeric values match.
-    """
+    """Local mirror of cone_slam.color_classifier.ConeColor."""
 
     YELLOW = 0       # right side of track
     BLUE = 1         # left side of track
@@ -139,12 +145,10 @@ class PathPoint:
     yaw: float        # radians, tangent direction
 
 
-# ----- helpers ---------------------------------------------------------------
+# ----- frame helpers ---------------------------------------------------------
 
 
-def _world_to_body(
-    pts_xy: np.ndarray, pose: Pose2D,
-) -> np.ndarray:
+def _world_to_body(pts_xy: np.ndarray, pose: Pose2D) -> np.ndarray:
     """Project (N, 2) world-frame points into body frame."""
     if pts_xy.shape[0] == 0:
         return pts_xy
@@ -154,9 +158,7 @@ def _world_to_body(
     return (pts_xy - np.array([pose.x, pose.y])) @ R_w2b.T
 
 
-def _body_to_world(
-    pts_xy: np.ndarray, pose: Pose2D,
-) -> np.ndarray:
+def _body_to_world(pts_xy: np.ndarray, pose: Pose2D) -> np.ndarray:
     """Project (N, 2) body-frame points into world frame."""
     if pts_xy.shape[0] == 0:
         return pts_xy
@@ -166,115 +168,212 @@ def _body_to_world(
     return pts_xy @ R_b2w.T + np.array([pose.x, pose.y])
 
 
-def _walk_midpoints_body(
-    left_body: np.ndarray, right_body: np.ndarray,
-) -> np.ndarray:
-    """Forward-walking midpoint generator in body frame.
+# ----- triangulation + edge extraction --------------------------------------
 
-    Both inputs are (N, 2) sorted by body_x ascending. Returns the
-    midpoint sequence starting from the car (0, 0) and walking forward
-    by consuming cones in body_x order. Each cone is used at most
-    once: once a cone is matched at a midpoint, it's "behind" the
-    walker for subsequent steps.
+
+@dataclass
+class _Edge:
+    """A Delaunay-triangle edge between two cones (i, j) in body frame."""
+    i: int                   # cone index
+    j: int                   # cone index
+    midpoint: np.ndarray     # (2,) midpoint in body frame
+    length: float            # edge length (track-width estimate)
+
+
+def _build_edges(
+    cones_body: np.ndarray,
+) -> List[_Edge]:
+    """Triangulate `cones_body` (N, 2) and return the unique edge set
+    after triangle-quality filtering. Each edge appears once even if
+    shared by two triangles.
     """
-    pts: List[Tuple[float, float]] = [(0.0, 0.0)]   # car anchor
-    li = ri = 0   # next-unused index into left_body / right_body
-    nl, nr = left_body.shape[0], right_body.shape[0]
-    last_x = max(BODY_X_MIN, 0.0)
+    n = cones_body.shape[0]
+    if n < 3:
+        return []
+    try:
+        tri = Delaunay(cones_body)
+    except (QhullError, ValueError):
+        return []
 
-    while li < nl or ri < nr:
-        # Pick the side whose next-unused cone is closest in body_x.
-        # That side gets to "advance" the walker; we then look at the
-        # other side for a partner within ±STEP_M of that body_x.
-        if li < nl and ri < nr:
-            lead_left = left_body[li, 0] <= right_body[ri, 0]
-        else:
-            lead_left = li < nl
+    seen: Set[Tuple[int, int]] = set()
+    edges: List[_Edge] = []
+    for simplex in tri.simplices:
+        # Reject sliver triangles by minimum interior angle. A sliver
+        # (one angle very small) means two of its three edges are
+        # nearly the same line, which produces midpoints that snap
+        # back and forth between near-identical positions.
+        if _min_triangle_angle(cones_body[simplex]) < MIN_TRI_ANGLE_RAD:
+            continue
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            i, j = int(simplex[a]), int(simplex[b])
+            key = (i, j) if i < j else (j, i)
+            if key in seen:
+                continue
+            seen.add(key)
+            pi, pj = cones_body[i], cones_body[j]
+            length = float(np.linalg.norm(pi - pj))
+            # Long-edge filter: drop track-spanning chords. These show
+            # up at the start/end of the cone field and at sharp
+            # hairpins where the inside of the corner has no cones,
+            # so the triangulation reaches across the track to find
+            # neighbours.
+            if length > MAX_EDGE_LEN_M:
+                continue
+            edges.append(_Edge(
+                i=i, j=j,
+                midpoint=0.5 * (pi + pj),
+                length=length,
+            ))
+    return edges
 
-        if lead_left:
-            lx = float(left_body[li, 0])
-            ly = float(left_body[li, 1])
-            li += 1
-            if lx > LOOKAHEAD_M:
-                break
-            if lx <= last_x:
-                # Already past this body_x — skip rather than going
-                # backwards in the spline.
+
+def _min_triangle_angle(pts: np.ndarray) -> float:
+    """Smallest interior angle (radians) of the triangle formed by
+    the three rows of `pts`."""
+    a, b, c = pts[0], pts[1], pts[2]
+    angles = []
+    for v0, v1, v2 in ((a, b, c), (b, c, a), (c, a, b)):
+        u = v1 - v0
+        w = v2 - v0
+        cos = float(np.dot(u, w) / (np.linalg.norm(u) * np.linalg.norm(w) + 1e-12))
+        cos = max(-1.0, min(1.0, cos))
+        angles.append(np.arccos(cos))
+    return float(min(angles))
+
+
+# ----- search ----------------------------------------------------------------
+
+
+def _wrap_pi(a: float) -> float:
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def _search_path_body(edges: List[_Edge]) -> np.ndarray:
+    """Greedy best-first walk over edge midpoints in body frame.
+
+    Seeds at the car (origin). At each step picks the candidate
+    midpoint that minimises the urinay heuristic, subject to the
+    seven-gate validity filter. Returns (M, 2) midpoint array
+    starting at the car anchor.
+    """
+    pts: List[np.ndarray] = [np.zeros(2)]    # car anchor at body origin
+    used: Set[int] = set()                   # edge indices already on path
+    prev_heading = 0.0                       # last segment heading (rad)
+    prev_tw = 0.0                            # last edge's track width
+
+    while len(pts) < MAX_PATH_PTS:
+        leaf = pts[-1]
+        # Lookahead-budget cutoff: stop when path arc length already
+        # spans LOOKAHEAD_M of forward distance.
+        if leaf[0] >= LOOKAHEAD_M:
+            break
+
+        best_idx = -1
+        best_score = float("inf")
+        for k, e in enumerate(edges):
+            if k in used:
                 continue
-            partner = _consume_partner(right_body, ri, lx, STEP_M)
-            if partner is not None:
-                ry = float(right_body[partner, 1])
-                ri = partner + 1
-                if (ly - ry) > 1.0:
-                    pts.append((lx, 0.5 * (ly + ry)))
-                    last_x = lx
-            else:
-                pts.append((lx, ly - TRACK_HALF_WIDTH_M))
-                last_x = lx
-        else:
-            rx = float(right_body[ri, 0])
-            ry = float(right_body[ri, 1])
-            ri += 1
-            if rx > LOOKAHEAD_M:
-                break
-            if rx <= last_x:
+            mp = e.midpoint
+            d = float(np.linalg.norm(mp - leaf))
+            if d < MIN_MIDPOINT_DIST_M or d > SEARCH_RADIUS_M:
                 continue
-            partner = _consume_partner(left_body, li, rx, STEP_M)
-            if partner is not None:
-                ly = float(left_body[partner, 1])
-                li = partner + 1
-                if (ly - ry) > 1.0:
-                    pts.append((rx, 0.5 * (ly + ry)))
-                    last_x = rx
-            else:
-                pts.append((rx, ry + TRACK_HALF_WIDTH_M))
-                last_x = rx
+            if e.length < MIN_TRACK_WIDTH_M:
+                continue
+
+            # Heading from current leaf to candidate.
+            head = float(np.arctan2(mp[1] - leaf[1], mp[0] - leaf[0]))
+            # First step uses the leaf-to-cand heading as the seed,
+            # so heading delta is 0; subsequent steps compare to prev.
+            dhead = abs(_wrap_pi(head - prev_heading)) if len(pts) > 1 else 0.0
+            if dhead > MAX_HEADING_DELTA_RAD:
+                continue
+
+            # Forward-only: candidate must be in front of the leaf in
+            # the segment's heading frame. After the first segment
+            # this is enforced by the heading-delta cap; for the very
+            # first segment we require body-x forward of the leaf so
+            # the path doesn't snap to a midpoint behind the car.
+            if len(pts) == 1 and mp[0] <= leaf[0] + 1e-3:
+                continue
+
+            # Self-intersection: don't allow the new segment to cross
+            # any previous segment of the path. Only matters once the
+            # path has at least two committed segments — in practice
+            # the heading cap catches most U-turn shapes anyway, but
+            # this guard prevents the rare hairpin self-cross.
+            if len(pts) >= 3 and _segment_crosses_any(pts, leaf, mp):
+                continue
+
+            score = (
+                (1.0 - W_DIST) * np.sqrt(dhead / (np.pi * 0.5))
+                + W_DIST * (d / SEARCH_RADIUS_M)
+                + W_TW_DIFF * (abs(e.length - prev_tw) / MAX_EDGE_LEN_M
+                               if prev_tw > 0.0 else 0.0)
+            )
+            if score < best_score:
+                best_score = score
+                best_idx = k
+
+        if best_idx < 0:
+            break
+
+        e = edges[best_idx]
+        used.add(best_idx)
+        pts.append(e.midpoint.copy())
+        prev_heading = float(np.arctan2(
+            e.midpoint[1] - leaf[1], e.midpoint[0] - leaf[0]))
+        prev_tw = e.length
 
     return np.array(pts)
 
 
-def _consume_partner(
-    cones_body: np.ndarray, start_idx: int,
-    target_x: float, half_window: float,
-) -> Optional[int]:
-    """Among cones[start_idx:], return the index closest to target_x
-    in body_x within ± half_window. None if no cone is in range."""
-    if start_idx >= cones_body.shape[0]:
-        return None
-    sub = cones_body[start_idx:, 0]
-    dx = np.abs(sub - target_x)
-    in_window = dx <= half_window
-    if not in_window.any():
-        return None
-    rel = int(np.argmin(np.where(in_window, dx, np.inf)))
-    return start_idx + rel
+def _segment_crosses_any(
+    pts: List[np.ndarray], a: np.ndarray, b: np.ndarray,
+) -> bool:
+    """True iff the segment a→b crosses any prior path segment
+    pts[i]→pts[i+1]. Skips the segment ending at `a` (shared endpoint)."""
+    for i in range(len(pts) - 2):
+        c, d = pts[i], pts[i + 1]
+        if _segments_intersect(a, b, c, d):
+            return True
+    return False
+
+
+def _segments_intersect(
+    a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray,
+) -> bool:
+    """Standard 2D segment intersection (proper crossing, no
+    collinear-overlap edge cases — adequate for our generic
+    triangulated midpoints)."""
+    def ccw(p, q, r):
+        return (r[1] - p[1]) * (q[0] - p[0]) > (q[1] - p[1]) * (r[0] - p[0])
+    return (ccw(a, c, d) != ccw(b, c, d)) and (ccw(a, b, c) != ccw(a, b, d))
+
+
+# ----- spline smoothing -----------------------------------------------------
 
 
 def _spline_through(midpoints_body: np.ndarray) -> np.ndarray:
-    """Fit a cubic spline through (N, 2) midpoints, sample N_OUTPUT
-    points along arc length, return (N_OUTPUT, 3) of (x, y, yaw)
-    in body frame.
+    """Fit a PCHIP cubic Hermite spline through (N, 2) midpoints,
+    sample N_OUTPUT points along arc length. Returns (N_OUTPUT, 3)
+    of (x, y, yaw) in body frame.
 
-    Pre: midpoints_body.shape[0] >= MIN_MIDPOINTS.
+    PCHIP (vs natural CubicSpline) is monotonic-preserving per
+    coordinate and never overshoots, so an unevenly-spaced midpoint
+    sequence produces a sane path.
     """
-    # Parameterize by cumulative arc length so closely-spaced midpoints
-    # don't dominate the spline curvature. Strictly increasing s is
-    # required by CubicSpline; with the forward-walking pattern this
-    # is naturally true (each step advances target_x by STEP_M).
     diffs = np.diff(midpoints_body, axis=0)
     seg_len = np.linalg.norm(diffs, axis=1)
     s = np.concatenate([[0.0], np.cumsum(seg_len)])
 
-    cs_x = CubicSpline(s, midpoints_body[:, 0], bc_type="natural")
-    cs_y = CubicSpline(s, midpoints_body[:, 1], bc_type="natural")
+    cs_x = PchipInterpolator(s, midpoints_body[:, 0])
+    cs_y = PchipInterpolator(s, midpoints_body[:, 1])
 
     s_dense = np.linspace(s[0], s[-1], num=N_OUTPUT)
     px = cs_x(s_dense)
     py = cs_y(s_dense)
-    # Tangent direction from analytical derivative — smoother than
-    # finite differences on the sampled output.
-    dx = cs_x(s_dense, 1)
-    dy = cs_y(s_dense, 1)
+    dx = cs_x.derivative()(s_dense)
+    dy = cs_y.derivative()(s_dense)
     pyaw = np.arctan2(dy, dx)
 
     return np.column_stack([px, py, pyaw])
@@ -283,73 +382,96 @@ def _spline_through(midpoints_body: np.ndarray) -> np.ndarray:
 # ----- public API ------------------------------------------------------------
 
 
-def plan_centerline(cones: List[Cone], pose: Pose2D) -> List[PathPoint]:
-    """Compute a centerline ahead of the car.
+@dataclass
+class PlanDebug:
+    """Intermediate planner state, exposed for visualisation only.
 
-    Args:
-        cones: full world-frame cone list. Color is honoured;
-               UNKNOWN / centerline / start-finish cones are ignored.
-        pose: current car pose in world frame.
-
-    Returns:
-        A list of PathPoints in world frame, ordered along arc length
-        from the car forward. Empty list if no path could be computed
-        (e.g., not enough cones, or no forward cones).
+    All arrays are in world frame (already projected from body frame
+    by `plan_centerline_with_debug`) so the consumer can publish them
+    on a TF that doesn't follow the car. Empty arrays are valid: at
+    early ticks (few cones, no triangulation) they communicate that
+    the planner failed at a specific stage.
     """
+    triangulation_edges: np.ndarray = None  # (E, 2, 2) — endpoints per edge
+    candidate_midpoints: np.ndarray = None  # (E, 2) — one per edge
+    selected_midpoints: np.ndarray = None   # (M, 2) — best-first chosen
+
+
+def plan_centerline(cones: List[Cone], pose: Pose2D) -> List[PathPoint]:
+    """Compute a centerline ahead of the car. Public API; no debug data.
+    """
+    path, _ = plan_centerline_with_debug(cones, pose)
+    return path
+
+
+def plan_centerline_with_debug(
+    cones: List[Cone], pose: Pose2D,
+) -> Tuple[List[PathPoint], PlanDebug]:
+    """Same as plan_centerline, but also returns intermediate state
+    (triangulation edges, candidate midpoints, selected midpoints) for
+    visualisation. The ROS node uses this to publish a Lichtblick /
+    Foxglove debug overlay on /path_planning/delaunay/*.
+
+    All debug arrays are in world frame.
+    """
+    debug = PlanDebug(
+        triangulation_edges=np.empty((0, 2, 2)),
+        candidate_midpoints=np.empty((0, 2)),
+        selected_midpoints=np.empty((0, 2)),
+    )
+
     if not cones:
-        return []
+        return [], debug
 
-    # Bucket by color. We only use BLUE (LEFT) and YELLOW (RIGHT) for
-    # path generation; ORANGE (centerline) is reserved for downstream
-    # mission control and BIG_ORANGE for cone_slam loop-closure work.
-    left_world = np.array(
-        [[c.x, c.y] for c in cones if c.color == ConeColor.BLUE],
-        dtype=float,
-    ).reshape(-1, 2)
-    right_world = np.array(
-        [[c.x, c.y] for c in cones if c.color == ConeColor.YELLOW],
-        dtype=float,
-    ).reshape(-1, 2)
+    track_cones = [c for c in cones if c.color in (ConeColor.BLUE, ConeColor.YELLOW)]
+    if len(track_cones) < 3:
+        return [], debug
 
-    # World → body and corridor filter.
-    left_body = _world_to_body(left_world, pose)
-    right_body = _world_to_body(right_world, pose)
+    cones_world = np.array([[c.x, c.y] for c in track_cones], dtype=float)
+    cones_body = _world_to_body(cones_world, pose)
 
-    def _filter(b: np.ndarray) -> np.ndarray:
-        if b.shape[0] == 0:
-            return b
-        mask = (
-            (b[:, 0] >= BODY_X_MIN)
-            & (b[:, 0] <= LOOKAHEAD_M)
-            & (np.abs(b[:, 1]) <= HALF_CORRIDOR_M)
-        )
-        return b[mask]
+    mask = (
+        (cones_body[:, 0] >= BODY_X_MIN)
+        & (cones_body[:, 0] <= LOOKAHEAD_M)
+        & (np.abs(cones_body[:, 1]) <= HALF_CORRIDOR_M)
+    )
+    cones_body = cones_body[mask]
+    if cones_body.shape[0] < 3:
+        return [], debug
 
-    left_body = _filter(left_body)
-    right_body = _filter(right_body)
+    edges = _build_edges(cones_body)
+    if not edges:
+        return [], debug
 
-    if left_body.shape[0] == 0 and right_body.shape[0] == 0:
-        return []
+    # Capture debug snapshot — body→world projection happens once for
+    # all debug arrays so they share a single transform.
+    if edges:
+        edge_pts_body = np.array([
+            [cones_body[e.i], cones_body[e.j]] for e in edges
+        ])  # (E, 2, 2)
+        # Flatten endpoints for batch transform, then reshape.
+        flat = edge_pts_body.reshape(-1, 2)
+        flat_world = _body_to_world(flat, pose)
+        debug.triangulation_edges = flat_world.reshape(-1, 2, 2)
 
-    # Sort by forward distance for the walker.
-    if left_body.shape[0]:
-        left_body = left_body[np.argsort(left_body[:, 0])]
-    if right_body.shape[0]:
-        right_body = right_body[np.argsort(right_body[:, 0])]
+        cand_body = np.array([e.midpoint for e in edges])  # (E, 2)
+        debug.candidate_midpoints = _body_to_world(cand_body, pose)
 
-    midpoints_body = _walk_midpoints_body(left_body, right_body)
+    midpoints_body = _search_path_body(edges)
+    if midpoints_body.shape[0] >= 1:
+        debug.selected_midpoints = _body_to_world(midpoints_body, pose)
+
     if midpoints_body.shape[0] < MIN_MIDPOINTS:
-        return []
+        return [], debug
 
     samples_body = _spline_through(midpoints_body)
-
-    # Project (x, y) back to world; rotate yaws by car yaw.
     samples_world_xy = _body_to_world(samples_body[:, :2], pose)
     yaws_world = samples_body[:, 2] + pose.yaw
 
-    return [
+    path = [
         PathPoint(x=float(samples_world_xy[i, 0]),
                   y=float(samples_world_xy[i, 1]),
                   yaw=float(yaws_world[i]))
         for i in range(samples_world_xy.shape[0])
     ]
+    return path, debug

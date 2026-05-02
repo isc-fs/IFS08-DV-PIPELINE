@@ -64,17 +64,15 @@ def test_straight_both_sides() -> None:
         "path not monotonic forward"
 
 
-def test_straight_left_only_fallback() -> None:
-    """When right cones are missing, the one-side fallback should put
-    the centerline ~TRACK_HALF_WIDTH_M to the right of the left cones."""
+def test_straight_left_only_returns_empty() -> None:
+    """When only one side of cones is visible, Delaunay can't form
+    non-degenerate triangles. The planner returns empty rather than
+    fabricating a path — the autonomy must not drive when it can't
+    see both sides of the corridor."""
     cones = [c for c in _straight_track(20.0) if c.color == ConeColor.BLUE]
     pose = Pose2D(x=0.0, y=0.0, yaw=0.0)
     path = plan_centerline(cones, pose)
-
-    assert len(path) == N_OUTPUT
-    for p in path:
-        assert abs(p.y) < 0.30, \
-            f"left-only fallback lateral error {p.y:.3f} m"
+    assert path == [], "Delaunay refuses collinear-only input"
 
 
 def test_right_turn() -> None:
@@ -99,21 +97,23 @@ def test_right_turn() -> None:
 
 
 def test_sparse_returns_empty() -> None:
-    """A single pair of cones isn't enough to span MIN_MIDPOINTS
-    (=anchor + at least 2 spline knots) → empty output."""
+    """A single pair of cones can't be Delaunay-triangulated (need
+    ≥3 non-collinear points). The planner returns empty rather than
+    fabricating a path — the autonomy must not drive when it doesn't
+    have enough information to plan."""
     cones = [
         Cone(x=2.0, y=+1.5, color=ConeColor.BLUE),
         Cone(x=2.0, y=-1.5, color=ConeColor.YELLOW),
     ]
     pose = Pose2D(x=0.0, y=0.0, yaw=0.0)
     path = plan_centerline(cones, pose)
-    assert path == [], "expected empty path on degenerate input"
+    assert path == [], "Delaunay needs ≥3 non-collinear cones"
 
 
 def test_no_forward_cones_returns_empty() -> None:
-    """All cones behind the car → no forward cones → empty path."""
+    """All cones behind the car → no forward cones → empty path.
+    The autonomy must not drive when it has no forward visibility."""
     cones = _straight_track(10.0)
-    # Pose well past the cones, facing further forward.
     pose = Pose2D(x=20.0, y=0.0, yaw=0.0)
     assert plan_centerline(cones, pose) == []
 
