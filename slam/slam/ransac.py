@@ -120,6 +120,15 @@ def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=200):
     # Solo se van a comentar las diferencias con la funcion original
     # Los datos ahora ya se pasan con la columna de 1s. Mantenemos A para hacer que la nomenclatura sea la misma
     A = data
+    # Hoist the per-iteration loop-invariant slices into contiguous arrays.
+    # `A[:, :-1]` is a strided (Fortran-flavoured) view of a C-contiguous A;
+    # passing it to `.dot(...)` inside Numba falls back to a slow path with
+    # a NumbaPerformanceWarning. At 174 k pts/scan (real Hesai ATX_S01
+    # rate) the slow path costs ~30-60 ms/scan, enough to push Cone_Detection
+    # CPU-bound so SLAM starts dropping scans (Δ_to_t_end < 0). Materialising
+    # the slice once removes the per-iteration overhead.
+    A_xy = np.ascontiguousarray(A[:, :-1])
+    A_z = np.ascontiguousarray(A[:, -1])
     k = float(max_iter)
     support = 0
     iters = 0
@@ -152,7 +161,7 @@ def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=200):
         coefs = np.array([bias] + list(normal_vector))
 
         support_aux = 0
-        for i in A[:, :-1].dot((coefs[:-1] / (-1 * coefs[-1]))) - A[:, -1]:
+        for i in A_xy.dot((coefs[:-1] / (-1 * coefs[-1]))) - A_z:
             if abs(i) < threshold:
                 support_aux += 1
         support_aux -= m
@@ -173,7 +182,7 @@ def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=200):
         def_coefs = -1 * def_coefs
     return (
         np.where(
-            np.abs(A[:, :-1].dot(def_coefs[:-1] / (-1 * def_coefs[-1])) - A[:, -1])
+            np.abs(A_xy.dot(def_coefs[:-1] / (-1 * def_coefs[-1])) - A_z)
             < threshold
         ),
         def_coefs,
