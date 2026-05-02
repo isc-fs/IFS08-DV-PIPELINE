@@ -32,6 +32,8 @@ History:
 
 from __future__ import annotations
 
+import json
+import os
 from typing import List
 
 import numpy as np
@@ -226,6 +228,24 @@ class Plan_Path(Node):
         self._stats_prev = dict(self._stats)
         self._stats_last_log_ns = 0
 
+        # Optional per-tick capture: when DV_PLANNER_CAPTURE is set to
+        # a writable file path, every callback dumps (cones, pose,
+        # n_path) as a JSON line. Lets us replay real failing scenes
+        # through the planner offline and write regression tests with
+        # actual SLAM-derived data — synthetic geometries miss the
+        # frame-to-frame-instability + sparse-cone failure modes that
+        # show up in PIE.
+        self._capture_path = os.environ.get("DV_PLANNER_CAPTURE", "")
+        self._capture_fh = None
+        if self._capture_path:
+            try:
+                self._capture_fh = open(self._capture_path, "w")
+                self.get_logger().info(
+                    f"DV_PLANNER_CAPTURE → {self._capture_path}")
+            except OSError as ex:
+                self.get_logger().error(f"capture open failed: {ex}")
+                self._capture_fh = None
+
     def _maybe_log_stats(self) -> None:
         now_ns = self.get_clock().now().nanoseconds
         if self._stats_last_log_ns == 0:
@@ -288,6 +308,24 @@ class Plan_Path(Node):
         )
 
         path_points, debug = plan_centerline_with_debug(cones, pose)
+
+        # Tick capture: dump (cones, pose, n_path) for offline replay.
+        if self._capture_fh is not None:
+            try:
+                self._capture_fh.write(json.dumps({
+                    "t_ns": self.get_clock().now().nanoseconds,
+                    "pose": [pose.x, pose.y, pose.yaw],
+                    "cones": [[c.x, c.y, int(c.color)] for c in cones],
+                    "n_path": len(path_points),
+                    "n_selected": int(0 if debug.selected_midpoints is None
+                                      else len(debug.selected_midpoints)),
+                    "n_candidates": int(0 if debug.candidate_midpoints is None
+                                        else len(debug.candidate_midpoints)),
+                    "rejections": dict(debug.rejections or {}),
+                }) + "\n")
+                self._capture_fh.flush()
+            except Exception:
+                pass
 
         # Always publish the debug overlay (even on plan-empty: shows
         # the triangulation that exists when the search starves, so
