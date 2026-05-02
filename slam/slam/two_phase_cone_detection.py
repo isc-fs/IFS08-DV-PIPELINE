@@ -61,7 +61,11 @@ def get_gammas(x, y, a, b):
 
 @numba.njit
 def lst_sqrs_fit(X, y):
-    return np.linalg.inv(X.T @ X) @ X.T @ y
+    # X.T is a non-contiguous transpose view of a C-contiguous X; using
+    # it directly in `@` triggers Numba's slow path and emits a
+    # NumbaPerformanceWarning. Materialise once with ascontiguousarray.
+    Xt = np.ascontiguousarray(X.T)
+    return np.linalg.inv(Xt @ X) @ Xt @ y
 
 
 def cone_fit_2params(data, solver="L-BFGS-B"):

@@ -137,6 +137,17 @@ class ConeGraphSlamNode(Node):
                 self.get_logger().error(f"landmark capture open failed: {ex}")
                 self._lm_capture_fh = None
 
+        # Per-second SLAM observation diagnostic. Breaks every scan's
+        # cones into (incoming, associated, new) per colour, plus
+        # cascade-skipped scans. Used to find where yellow cones
+        # disappear in tight corners (#189): if obs has 7 yellow but
+        # assoc+new totals only 1 yellow, the loss is in SLAM (DA gate
+        # / pose-jump rejection); if obs already has 1 yellow, the
+        # loss is upstream in Cone_Detection.
+        self._obs_diag = {}
+        self._obs_n_scans = 0
+        self._obs_last_log_ns = 0
+
         # Latest /motor_rpm sample. Wall-clock timestamp because the
         # bridge stamps it with node_->now() (no header.stamp on
         # std_msgs/Float32). Used for staleness check inside _on_cones.
@@ -308,6 +319,14 @@ class ConeGraphSlamNode(Node):
         # Parse cone observations + classify color per cone.
         observations = self._observations_from_markers(msg)
 
+        # Per-scan obs-by-colour tally for the SLAM_OBS diagnostic.
+        per_scan = {f"obs_{c.name.lower()}": 0
+                    for c in (ConeColor.YELLOW, ConeColor.BLUE,
+                              ConeColor.ORANGE, ConeColor.BIG_ORANGE)}
+        for o in observations:
+            per_scan[f"obs_{o.color.name.lower()}"] += 1
+        per_scan["obs_total"] = len(observations)
+
         # Run data association against the predicted body-frame position
         # of every existing landmark, using the iSAM2-predicted pose
         # from the IMU step (still inside the optimizer's "predicted"
@@ -370,6 +389,8 @@ class ConeGraphSlamNode(Node):
                 f"(obs={total_pre} new={n_new_pre} "
                 f"assoc={total_pre - n_new_pre}) — pose-jump rejected")
             self._graph.discard_staged()
+            per_scan["skipped"] = 1
+            self._accumulate_obs_diag(per_scan)
             return
 
         # For each matched obs → factor between current pose and the
@@ -386,6 +407,8 @@ class ConeGraphSlamNode(Node):
                 self._graph.stage_cone_observation(
                     lm.id, o.body_x, o.body_y, o.sigma_xy)
                 n_new += 1
+                per_scan[f"new_{o.color.name.lower()}"] = (
+                    per_scan.get(f"new_{o.color.name.lower()}", 0) + 1)
                 if self._lm_capture_fh is not None:
                     try:
                         import math as _math, json as _json
@@ -414,6 +437,10 @@ class ConeGraphSlamNode(Node):
                 self._graph.stage_cone_observation(
                     m.landmark_id, o.body_x, o.body_y, o.sigma_xy)
                 n_assoc += 1
+                per_scan[f"assoc_{o.color.name.lower()}"] = (
+                    per_scan.get(f"assoc_{o.color.name.lower()}", 0) + 1)
+
+        self._accumulate_obs_diag(per_scan)
 
         # Commit IMU + cone factors in one iSAM2 update.
         result = self._graph.commit()
@@ -454,6 +481,43 @@ class ConeGraphSlamNode(Node):
                 f"|v|={float(np.linalg.norm(v)):.3f}")
 
     # ----- helpers ----------------------------------------------------------
+
+    def _accumulate_obs_diag(self, per_scan: dict) -> None:
+        """Accumulate per-scan obs/assoc/new counters and emit a
+        per-second SLAM_OBS log line. Compares observations entering
+        SLAM (after colour classification) with what survives data
+        association — i.e., shows whether SLAM is dropping a colour."""
+        for k, v in per_scan.items():
+            self._obs_diag[k] = self._obs_diag.get(k, 0) + v
+        self._obs_n_scans += 1
+        now_ns = self.get_clock().now().nanoseconds
+        if self._obs_last_log_ns == 0:
+            self._obs_last_log_ns = now_ns
+            return
+        if now_ns - self._obs_last_log_ns < 1_000_000_000:
+            return
+        n = self._obs_n_scans
+        if n <= 0:
+            return
+        d = self._obs_diag
+        def _avg(key: str) -> float:
+            return d.get(key, 0) / n
+        self.get_logger().info(
+            f"SLAM_OBS (avg/scan over {n}): "
+            f"obs={_avg('obs_total'):4.1f} "
+            f"(B={_avg('obs_blue'):3.1f} Y={_avg('obs_yellow'):3.1f} "
+            f"O={_avg('obs_orange'):3.1f} BO={_avg('obs_big_orange'):3.1f}) "
+            f"assoc={_avg('assoc_blue')+_avg('assoc_yellow')+_avg('assoc_orange')+_avg('assoc_big_orange'):4.1f} "
+            f"(B={_avg('assoc_blue'):3.1f} Y={_avg('assoc_yellow'):3.1f} "
+            f"O={_avg('assoc_orange'):3.1f} BO={_avg('assoc_big_orange'):3.1f}) "
+            f"new={_avg('new_blue')+_avg('new_yellow')+_avg('new_orange')+_avg('new_big_orange'):3.1f} "
+            f"(B={_avg('new_blue'):3.1f} Y={_avg('new_yellow'):3.1f} "
+            f"O={_avg('new_orange'):3.1f} BO={_avg('new_big_orange'):3.1f}) "
+            f"skip={_avg('skipped'):.1f}"
+        )
+        self._obs_diag = {}
+        self._obs_n_scans = 0
+        self._obs_last_log_ns = now_ns
 
     @staticmethod
     def _stamp_msg(msg: MarkerArray):
