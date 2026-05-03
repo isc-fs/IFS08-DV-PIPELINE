@@ -1,4 +1,4 @@
-"""Path planning ROS 2 node — thin adapter around path_planning.planner.
+"""Path planning ROS 2 node — thin adapter around the FaSTTUBe planner.
 
 Subscribes:
   /Conos          (visualization_msgs/MarkerArray) — world-frame cone map
@@ -16,18 +16,25 @@ Looks up TF:
                     this transform; if it's missing we skip the tick
                     rather than fall back on a stale or wrong frame.
 
-Algorithm: delegated to `planner.plan_centerline` (forward-walking
-midpoint with cubic-spline smoothing). This module is only the ROS 2
-plumbing — color decoding, TF lookup, message-shape conversion, and
-per-second instrumentation.
+Algorithm: delegated to `fasttube_adapter.FasttubeAdapter`, which wraps
+`fsd_path_planning.PathPlanner` (FaSTTUBe / papalotis, MIT). This module
+is only the ROS 2 plumbing — color decoding, TF lookup, message-shape
+conversion, and per-second instrumentation.
 
 History:
-  - feat/30 replaced the previous fsd_path_planning-based implementation
-    with a from-scratch planner that better fits this pipeline. The
-    upstream library couldn't be installed cleanly from git on the
-    image's setuptools/pip versions, and the algorithm we needed was
-    simple enough to write directly. This is now a self-contained
-    adapter: no third-party planner dep, no vendored sources.
+  - PR #243 replaced the in-house Delaunay+best-first walker with the
+    FaSTTUBe library. The walker was poisoned by orange-classified false
+    positives in the cone soup (independently tracked on fix/241) and
+    struggled at one-sided observation regions (#189). FaSTTUBe sorts
+    each side independently and matches across sides, eliminating both
+    failure classes in one swap. The Delaunay debug overlay
+    (`/path_planning/delaunay`) was dropped along with the algorithm —
+    the new planner doesn't expose triangulation internals and a stale
+    fake overlay would mislead more than help.
+  - feat/30 had previously replaced an even older fsd_path_planning-based
+    implementation with the from-scratch walker; this PR returns to the
+    FaSTTUBe library now that pip install issues are resolved (pinned
+    commit, --no-deps in the Dockerfile).
 """
 
 from __future__ import annotations
@@ -36,7 +43,6 @@ import json
 import os
 from typing import List
 
-import numpy as np
 import rclpy
 from rclpy.node import Node
 
@@ -50,16 +56,14 @@ from geometry_msgs.msg import PoseStamped
 
 from transforms3d.euler import quat2euler, euler2quat
 
-from path_planning.planner import (
-    Cone, ConeColor, Pose2D, PlanDebug,
-    plan_centerline_with_debug,
-)
+from path_planning.core_types import Cone, ConeColor, Pose2D
+from path_planning.fasttube_adapter import FasttubeAdapter
 
 
 # Canonical cone-color RGB tuples published by cone_graph_slam (see
 # pipeline/cone_slam/cone_slam/cone_graph_slam_node.py:519+). The
-# planner only uses BLUE and YELLOW; ORANGE and BIG_ORANGE pass through
-# the classifier but are filtered out by plan_centerline.
+# planner consumes BLUE, YELLOW, ORANGE, BIG_ORANGE — FaSTTUBe sorts
+# yellow/blue per side and treats orange as start/finish markers.
 CONE_COLOR_RGB = [
     ((1.0, 1.0, 0.0), ConeColor.YELLOW),
     ((0.0, 0.4, 1.0), ConeColor.BLUE),
@@ -75,8 +79,8 @@ def _classify_cone_color(r: float, g: float, b: float) -> ConeColor | None:
     """Return the closest canonical ConeColor, or None if unrecognized.
 
     `None` flags an out-of-palette marker (typically a malformed publisher
-    or an UNKNOWN cone from a future SLAM revision); plan_centerline
-    will skip it because only BLUE / YELLOW are used.
+    or an UNKNOWN cone from a future SLAM revision); the adapter will
+    skip it because it has no FaSTTUBe ConeTypes mapping.
     """
     best = None
     best_dist = COLOR_MATCH_TOL * 3.0
@@ -86,99 +90,6 @@ def _classify_cone_color(r: float, g: float, b: float) -> ConeColor | None:
             best_dist = d
             best = color
     return best
-
-
-def _build_delaunay_markers(debug: PlanDebug) -> MarkerArray:
-    """Pack a PlanDebug snapshot into one MarkerArray with three
-    visual layers: triangulation edges (gray lines), candidate
-    midpoints (green spheres), selected midpoints (orange spheres).
-
-    Frame: odom (same as /Path). Use Lichtblick's 3D panel to
-    overlay on the cone field — each layer can be toggled
-    independently from the panel UI.
-
-    A DELETEALL marker leads each publish so previous frames don't
-    accumulate visually when the cone field shrinks.
-    """
-    arr = MarkerArray()
-
-    clear = Marker()
-    clear.action = Marker.DELETEALL
-    clear.header.frame_id = "odom"
-    arr.markers.append(clear)
-
-    # Layer 1: triangulation edges.
-    if debug.triangulation_edges is not None and debug.triangulation_edges.size > 0:
-        m = Marker()
-        m.header.frame_id = "odom"
-        m.ns = "delaunay_edges"
-        m.id = 1
-        m.type = Marker.LINE_LIST
-        m.action = Marker.ADD
-        m.scale.x = 0.04  # line thickness (m)
-        m.color.r = 0.55
-        m.color.g = 0.55
-        m.color.b = 0.55
-        m.color.a = 0.6
-        for e in debug.triangulation_edges:
-            for endpoint in (e[0], e[1]):
-                from geometry_msgs.msg import Point  # local import: lightweight
-                p = Point()
-                p.x = float(endpoint[0])
-                p.y = float(endpoint[1])
-                p.z = 0.05
-                m.points.append(p)
-        arr.markers.append(m)
-
-    # Layer 2: candidate midpoints (every triangulated edge gives one).
-    if debug.candidate_midpoints is not None and debug.candidate_midpoints.size > 0:
-        m = Marker()
-        m.header.frame_id = "odom"
-        m.ns = "delaunay_candidates"
-        m.id = 2
-        m.type = Marker.SPHERE_LIST
-        m.action = Marker.ADD
-        m.scale.x = 0.18
-        m.scale.y = 0.18
-        m.scale.z = 0.18
-        m.color.r = 0.10
-        m.color.g = 0.85
-        m.color.b = 0.30
-        m.color.a = 0.7
-        from geometry_msgs.msg import Point
-        for c in debug.candidate_midpoints:
-            p = Point()
-            p.x = float(c[0])
-            p.y = float(c[1])
-            p.z = 0.10
-            m.points.append(p)
-        arr.markers.append(m)
-
-    # Layer 3: best-first-selected midpoints — what fed the spline.
-    if debug.selected_midpoints is not None and debug.selected_midpoints.size > 0:
-        m = Marker()
-        m.header.frame_id = "odom"
-        m.ns = "delaunay_selected"
-        m.id = 3
-        m.type = Marker.SPHERE_LIST
-        m.action = Marker.ADD
-        m.scale.x = 0.32
-        m.scale.y = 0.32
-        m.scale.z = 0.32
-        m.color.r = 1.0
-        m.color.g = 0.55
-        m.color.b = 0.10
-        m.color.a = 0.9
-        from geometry_msgs.msg import Point
-        for s in debug.selected_midpoints:
-            p = Point()
-            p.x = float(s[0])
-            p.y = float(s[1])
-            p.z = 0.20
-            m.points.append(p)
-        arr.markers.append(m)
-
-    return arr
 
 
 def _pose_stamped(x: float, y: float, yaw: float) -> PoseStamped:
@@ -200,19 +111,16 @@ class Plan_Path(Node):
         super().__init__("Plan_Path")
 
         self.publisher_path = self.create_publisher(Path, "Path", 10)
-        # Delaunay debug overlay for Lichtblick / Foxglove. Three layers
-        # in one MarkerArray:
-        #   - LINE_LIST of all triangulated edges (gray)
-        #   - SPHERE_LIST of all candidate midpoints (small, green)
-        #   - SPHERE_LIST of best-first-selected midpoints (large, orange)
-        # Frame: odom (same as /Path).
-        self.publisher_delaunay = self.create_publisher(
-            MarkerArray, "/path_planning/delaunay", 10)
         self.create_subscription(
             MarkerArray, "Conos", self._on_cones, 10)
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # FaSTTUBe planner instance. Reused across cone callbacks; the
+        # library is stateless for trackdrive (the only mission this
+        # node currently supports — issue #243 covers skidpad/accel).
+        self._adapter = FasttubeAdapter()
 
         # Per-second instrumentation. Each callback falls into exactly
         # one bucket; rates are logged every ~1 s in _maybe_log_stats.
@@ -220,9 +128,9 @@ class Plan_Path(Node):
         # signal.
         self._stats = {
             "callbacks": 0,
-            "no_cones": 0,        # 0 BLUE + 0 YELLOW after color decode
+            "no_cones": 0,        # 0 cones after color decode
             "tf_miss": 0,         # TF lookup failed
-            "plan_empty": 0,      # plan_centerline returned []
+            "plan_empty": 0,      # adapter returned []
             "publish": 0,
         }
         self._stats_prev = dict(self._stats)
@@ -307,7 +215,7 @@ class Plan_Path(Node):
             yaw=float(yaw),
         )
 
-        path_points, debug = plan_centerline_with_debug(cones, pose)
+        path_points = self._adapter.plan(cones, pose)
 
         # Tick capture: dump (cones, pose, n_path) for offline replay.
         if self._capture_fh is not None:
@@ -317,20 +225,10 @@ class Plan_Path(Node):
                     "pose": [pose.x, pose.y, pose.yaw],
                     "cones": [[c.x, c.y, int(c.color)] for c in cones],
                     "n_path": len(path_points),
-                    "n_selected": int(0 if debug.selected_midpoints is None
-                                      else len(debug.selected_midpoints)),
-                    "n_candidates": int(0 if debug.candidate_midpoints is None
-                                        else len(debug.candidate_midpoints)),
-                    "rejections": dict(debug.rejections or {}),
                 }) + "\n")
                 self._capture_fh.flush()
             except Exception:
                 pass
-
-        # Always publish the debug overlay (even on plan-empty: shows
-        # the triangulation that exists when the search starves, so
-        # the user can see why the planner gave up).
-        self.publisher_delaunay.publish(_build_delaunay_markers(debug))
 
         if not path_points:
             self._stats["plan_empty"] += 1
