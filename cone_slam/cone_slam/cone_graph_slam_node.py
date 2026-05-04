@@ -398,6 +398,28 @@ class ConeGraphSlamNode(Node):
         # Parse cone observations + classify color per cone.
         observations = self._observations_from_markers(msg)
 
+        # Drop ORANGE / BIG_ORANGE observations entirely. Rationale:
+        #   - Orange cones are only used downstream for start/finish-line
+        #     detection by control_node, which subscribes directly to
+        #     cone_detection's `/Conos_Orange` stream — it does NOT depend
+        #     on the SLAM map for big-orange identity.
+        #   - The path planner doesn't need them either: oranges had been
+        #     mapped to FaSTTUBe's UNKNOWN slot, contributing nothing
+        #     useful to either side chain.
+        #   - The SLAM-side colour classifier flickers on cones near the
+        #     yellow/orange centre band. With orange landmarks in the map,
+        #     a single cone alternately tagged YELLOW and ORANGE across
+        #     scans creates two co-located landmarks (different colour
+        #     buckets in DA can't merge them), poisoning the planner with
+        #     half-density per side. Observed live in test_submodule.
+        # Filtering at the source eliminates the duplication, keeps the
+        # colour-gated DA as-is (no risk of cross-colour wrong matches in
+        # cluster regions), and we lose nothing we currently rely on. If
+        # we later need orange in SLAM (lap counting, skidpad), revisit.
+        observations = [o for o in observations
+                        if o.color not in (ConeColor.ORANGE,
+                                           ConeColor.BIG_ORANGE)]
+
         # Per-scan obs-by-colour tally for the SLAM_OBS diagnostic.
         per_scan = {f"obs_{c.name.lower()}": 0
                     for c in (ConeColor.YELLOW, ConeColor.BLUE,
