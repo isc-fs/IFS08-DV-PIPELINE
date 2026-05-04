@@ -151,12 +151,27 @@ def _build_debug_markers(debug: PlanDebug) -> MarkerArray:
     return arr
 
 
-def _pose_stamped(x: float, y: float, yaw: float) -> PoseStamped:
+def _pose_stamped(x: float, y: float, yaw: float,
+                  curvature: float = 0.0) -> PoseStamped:
+    """Build a PoseStamped, smuggling curvature in pose.position.z.
+
+    nav_msgs/Path has no per-pose curvature field. We could add a
+    custom message, but that's an invasive multi-package change for a
+    single float. Instead: the pipeline runs in a flat-2D world
+    (`base_link.z = 0`), so `pose.position.z` is otherwise unused.
+    Encode the path's signed curvature there as a side-channel between
+    `path_planning` and `control` — the controller's `_on_path` reads
+    it back into `ReferenceTrajectory.curvature`. (#260 follow-up)
+
+    Cosmetic side-effect: visualizers will render the path slightly
+    above z=0 on tight bends. Acceptable — the displaced height is at
+    most ~|κ| metres (typically < 0.5 m), barely visible.
+    """
     p = PoseStamped()
     p.header.frame_id = "odom"
     p.pose.position.x = x
     p.pose.position.y = y
-    p.pose.position.z = 0.0
+    p.pose.position.z = float(curvature)
     qw, qx, qy, qz = euler2quat(0.0, 0.0, yaw)
     p.pose.orientation.w = float(qw)
     p.pose.orientation.x = float(qx)
@@ -314,7 +329,7 @@ class Plan_Path(Node):
         out = Path()
         out.header.frame_id = "odom"
         for p in path_points:
-            out.poses.append(_pose_stamped(p.x, p.y, p.yaw))
+            out.poses.append(_pose_stamped(p.x, p.y, p.yaw, p.curvature))
 
         self.publisher_path.publish(out)
         self._stats["publish"] += 1

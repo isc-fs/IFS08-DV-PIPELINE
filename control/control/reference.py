@@ -39,8 +39,19 @@ class ReferenceTrajectory:
         return self.s[-1] if self.s else 0.0
 
     @classmethod
-    def from_xy(cls, xs: List[float], ys: List[float]) -> "ReferenceTrajectory":
-        """Build from raw waypoints — derives yaw, curvature, arc length."""
+    def from_xy(cls, xs: List[float], ys: List[float],
+                kappa: List[float] | None = None) -> "ReferenceTrajectory":
+        """Build from raw waypoints — derives yaw, curvature, arc length.
+
+        If `kappa` is provided (e.g. FaSTTUBe's analytical B-spline κ
+        smuggled through `pose.position.z` from path_planning), it's
+        used verbatim instead of the controller-side finite difference.
+        The finite-difference fallback is noisy on tight bends because
+        it's computed from 3 consecutive 0.5 m-spaced points; analytical
+        κ from the planner's spline is much smoother and lets
+        `_max_curvature_ahead` see a corner well before the car reaches
+        it. (#260 follow-up)
+        """
         if len(xs) != len(ys) or len(xs) < 2:
             return cls(x=list(xs), y=list(ys))
 
@@ -55,17 +66,24 @@ class ReferenceTrajectory:
             s[i + 1] = s[i] + math.hypot(dx, dy)
         yaws[-1] = yaws[-2]
 
-        # Curvature via discrete heading derivative wrt arc length
-        kappa = [0.0] * n
-        for i in range(1, n - 1):
-            ds = s[i + 1] - s[i - 1]
-            if ds > 1e-6:
-                dyaw = _wrap_pi(yaws[i + 1] - yaws[i - 1])
-                kappa[i] = dyaw / ds
-        kappa[0] = kappa[1] if n > 1 else 0.0
-        kappa[-1] = kappa[-2] if n > 1 else 0.0
+        # Curvature: prefer the explicit κ list if provided AND it has
+        # at least one non-trivial value (a length-matched all-zero list
+        # is the legacy "no curvature info" sentinel from before the
+        # planner started passing κ through). Otherwise fall back to the
+        # finite-difference computation from heading change vs arc.
+        if kappa is not None and len(kappa) == n and any(abs(k) > 1e-6 for k in kappa):
+            kappa_out = list(kappa)
+        else:
+            kappa_out = [0.0] * n
+            for i in range(1, n - 1):
+                ds = s[i + 1] - s[i - 1]
+                if ds > 1e-6:
+                    dyaw = _wrap_pi(yaws[i + 1] - yaws[i - 1])
+                    kappa_out[i] = dyaw / ds
+            kappa_out[0] = kappa_out[1] if n > 1 else 0.0
+            kappa_out[-1] = kappa_out[-2] if n > 1 else 0.0
 
-        return cls(x=list(xs), y=list(ys), yaw=yaws, curvature=kappa, s=s)
+        return cls(x=list(xs), y=list(ys), yaw=yaws, curvature=kappa_out, s=s)
 
 
 def _wrap_pi(a: float) -> float:
