@@ -18,14 +18,12 @@ setup(
     zip_safe=True,
     maintainer='jaime',
     maintainer_email='jaimeperezgil21@gmail.com',
-    description='TODO: Package description',
+    description='LiDAR cone detection: ground removal (RANSAC), DBSCAN clustering, and per-cluster cone fitting that publishes raw cone observations on /Conos_raw for downstream factor-graph SLAM in cone_slam.',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'Cone_Detection = slam.cone_detection_node:cone_detection',
-            'BenchMark_Slam = slam.slam:BenchMark_Slam',
-            'Publicar_Mapa = slam.slam:publicar_mapa'
         ],
     },
 )

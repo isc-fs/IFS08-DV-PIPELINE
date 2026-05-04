@@ -17,8 +17,8 @@ setup(
     zip_safe=True,
     maintainer='jaime',
     maintainer_email='jaimeperezgil21@gmail.com',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='Vehicle controller: pure-pursuit lateral steering + PI longitudinal velocity tracking, with EBS / regen / autonomous-stop logic. Consumes /Path and the SLAM odometry, publishes /control_command.',
+    license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
