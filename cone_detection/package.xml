@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>slam</name>
+  <name>cone_detection</name>
   <version>0.0.0</version>
   <description>LiDAR cone detection: ground removal (RANSAC), DBSCAN clustering, and per-cluster cone fitting that publishes raw cone observations on /Conos_raw for downstream factor-graph SLAM in cone_slam.</description>
   <maintainer email="jaimeperezgil21@gmail.com">jaime</maintainer>

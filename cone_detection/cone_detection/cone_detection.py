@@ -28,10 +28,10 @@ import math
 import numpy as np
 from sklearn.cluster import DBSCAN
 
-from slam.ransac import ransac2
-from slam.ground_removal import cone_model
-from slam.rotaciones import vectors2matrix
-from slam.two_phase_cone_detection import *  # noqa: F401, F403  (cone_fit_2params + helpers used by final_cone_result_rt)
+from cone_detection.ransac import ransac2
+from cone_detection.ground_removal import cone_model
+from cone_detection.rotaciones import vectors2matrix
+from cone_detection.two_phase_cone_detection import *  # noqa: F401, F403  (cone_fit_2params + helpers used by final_cone_result_rt)
 
 
 def final_cone_result_rt(data, model=DBSCAN, debug_counters=None):
@@ -271,7 +271,7 @@ def warmup_numba_functions():
 
     # Warm up objective_function_v2
     dummy_params = np.array([0.0, 0.0])
-    from slam.two_phase_cone_detection import (
+    from cone_detection.two_phase_cone_detection import (
         objective_function_v2,
         cone_model,
         get_gammas,
