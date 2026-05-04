@@ -36,29 +36,38 @@ from path_planning.core_types import Cone, ConeColor, PathPoint, Pose2D
 logger = logging.getLogger(__name__)
 
 
-# Map our ConeColor → FaSTTUBe ConeTypes (#254).
+# Map our ConeColor → FaSTTUBe ConeTypes (#254, #189 follow-up).
 #   ours:    YELLOW=0, BLUE=1, ORANGE=2, BIG_ORANGE=3
 #   theirs:  UNKNOWN=0, RIGHT/YELLOW=1, LEFT/BLUE=2, ORANGE_SMALL=3, ORANGE_BIG=4
 #
-# Side semantics agree between the two enums (blue=left, yellow=right),
-# but ORANGE/BIG_ORANGE are mapped to UNKNOWN deliberately. FaSTTUBe's
-# core_cone_matching.py only iterates LEFT/RIGHT in its matching pass —
-# anything tagged ORANGE_* is dropped. Our SLAM colour classifier has a
-# centre-band fallthrough that mis-tags inner-corner cones as ORANGE
-# (audited on `fix/241`), so faithfully forwarding the SLAM tag to the
-# library would cost us real side cones on every tight turn. UNKNOWN
-# routes the cone through the library's colour-blind geometric sort
-# instead, which is documented to handle mixed colour/no-colour input
-# (their FS Czech 2023 P2 result was on this code path).
+# All colours route to UNKNOWN — fully colour-blind sort. The
+# cone-classification audit (#189) showed there is NO real colour
+# signal anywhere in the pipeline: UE5 sets `bReturnPhysicalMaterial=
+# false` at the raycast site, the LiDAR wire format is XYZ-only, and
+# `color_classifier.classify()` invents the colour from `body_y` sign
+# + height at first observation. That spatial heuristic mis-tags
+# 30-50 % of cones once the car is past straight sections — yellow
+# cones near the body axis (long range, corner-exit transitions, fast
+# yaw) get locked as BLUE or ORANGE forever, the planner sees a
+# 70:30 imbalance, and FaSTTUBe virtual-extrapolates the
+# under-represented side onto the wrong line.
 #
-# Trade-off: when the SLAM classifier eventually grows a real intensity-
-# based colour signal (#255), revisit this and forward valid ORANGE/
-# BIG_ORANGE through to get the library's colour-aware fast sort back.
+# Routing every cone through UNKNOWN forces the library's geometric
+# sort (`core_trace_sorter.select_first_k_starting_cones` and the
+# trace search) to assign sides from corridor topology rather than
+# from the upstream tag. Verified on a 108-tick capture: 108/108 ticks
+# produce valid forward-going paths with zero exceptions. The earlier
+# ZeroDivisionError we hit on this approach was the streamlit-demo
+# plotting helper triggered by perfectly-symmetric synthetic test
+# data, not the production sort path.
+#
+# Revisit when LiDAR-side colour acquisition lands (#255) — at that
+# point the upstream tag becomes a real signal worth gating on.
 _COLOR_TO_CONETYPE = {
-    ConeColor.YELLOW: ConeTypes.RIGHT,        # = 1
-    ConeColor.BLUE: ConeTypes.LEFT,           # = 2
-    ConeColor.ORANGE: ConeTypes.UNKNOWN,      # = 0 (was ORANGE_SMALL)
-    ConeColor.BIG_ORANGE: ConeTypes.UNKNOWN,  # = 0 (was ORANGE_BIG)
+    ConeColor.YELLOW:     ConeTypes.UNKNOWN,
+    ConeColor.BLUE:       ConeTypes.UNKNOWN,
+    ConeColor.ORANGE:     ConeTypes.UNKNOWN,
+    ConeColor.BIG_ORANGE: ConeTypes.UNKNOWN,
 }
 
 # Cone cull window applied in the adapter (#254). FaSTTUBe is designed
