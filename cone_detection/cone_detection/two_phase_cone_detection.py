@@ -1,3 +1,11 @@
+"""Two-phase parametric cone fit used by the LiDAR cone-detection pipeline.
+
+Phase 1: scipy.optimize.minimize searches the apex (a, b) at fixed
+(c=5.5, d=0.35). Phase 2: linear least-squares solves for (c, d) given
+the apex from phase 1. Splitting the four-parameter fit into two stages
+makes the optimiser well-behaved even on the small (3–10 point) clusters
+that mid-range cones produce.
+"""
 from scipy.optimize import minimize
 import numba
 import numpy as np
@@ -5,49 +13,23 @@ import numpy as np
 
 @numba.njit
 def cone_model(params, x, y):
-    """
-    Formula del cono empleada en la implementacion del ajuste del
-    cono. Sirve para que scipy.minimize sepa cual es la formula del cono
-
-    Args:
-        params (list): la lista de los parametros
-        x (np.ndarray): lass posiciones x de los datos
-        y (np.ndarray): las posiciones y de los datos
-
-    Returns:
-        np.ndarray: la posicion z de los puntos
-    """
+    """Generalised cone surface: z(x, y) = d - c·sqrt((x-a)² + (y-b)²)."""
     a, b, c, d = params
-    # Formula generalizada de un cono
     return d - c * np.sqrt((x - a) ** 2 + (y - b) ** 2)
 
 
 @numba.njit
 def objective_function_v2(params, x, y, z):
-    """
-    Funcion a minimizar por minimize. Para el ajuste de
-    un cono buscamos que su error cuadratico medio sea lo
-    mas pequeño posible
-
-    Args:
-        params (list): lista de los parametros del cono
-        x (np.ndarray): los valores de las x de los puntos
-        y (np.ndarray): los valores de las y de los puntos
-        z (np.ndarray): Los valores de las z de los puntos
-
-    Returns:
-        float: el error cuadratico medio
-    """
+    """Phase-1 cost. Searches over (a, b) at fixed c, d."""
     a, b = params
-    # Original phase-1 fixed values. Tried c=2.78 (matched to real
-    # IFS-08 cone) on 2026-04-29 — counter-intuitively made things
-    # worse: the cost surface is flatter when c matches the data, so
-    # phase 1 doesn't move much from the (mean_x, mean_y) init, and
-    # phase 2 then recovers shallow c on noisy data. The c=5.5 init
-    # forces phase 1 to walk the apex toward the cluster's peak (a
-    # steep cone has a sharper minimum). The downstream validation
-    # then catches the slightly-too-shallow phase 2 c via the
-    # centroid-fallback path in cone_detection.py.
+    # Fixed c chosen empirically. Tried c=2.78 (IFS-08 real-cone slope)
+    # on 2026-04-29 — counter-intuitively worse: the cost surface is
+    # flatter when c matches the data, so phase 1 didn't move from the
+    # (mean_x, mean_y) init, and phase 2 then recovered shallow c on
+    # noisy data. c=5.5 forces phase 1 to walk the apex toward the
+    # cluster's peak (steep cone → sharper minimum). The downstream
+    # validation in cone_detection.py catches the slightly-too-shallow
+    # phase-2 c via the centroid-fallback path.
     c = 5.5
     d = 0.35
     z_pred = cone_model([a, b, c, d], x, y)
@@ -69,34 +51,22 @@ def lst_sqrs_fit(X, y):
 
 
 def cone_fit_2params(data, solver="L-BFGS-B"):
+    """Two-phase cone fit. Returns (a, b, c, d) — apex (a, b, d), slope c."""
     x = data[:, 0]
     y = data[:, 1]
     z = data[:, 2]
-
-    # Estos son los parametros con los que empieza
-    # (estan puestos asi porque no estan muy lejos de los valores reales)
+    # Initialise apex at the cluster centroid.
     a = np.mean(x)
     b = np.mean(y)
-
     try:
         result = minimize(
-            objective_function_v2,
-            [a, b],
-            args=(x, y, z),
-            method=solver,
-            # tol=1e-14,
-            # options={"maxiter": 10000},
+            objective_function_v2, [a, b], args=(x, y, z), method=solver,
         )
         a, b = result.x
         gamma = get_gammas(x, y, a, b)
         M = np.vstack((np.ones(len(data)), gamma)).T
         d, c = lst_sqrs_fit(M, z.T)
         return a, b, -c, d
-
-        # print("a", a, "b", b, "c", c, "d", d, "error", result.fun)
-        # print(result.fun)
     except Exception as e:
         print(e)
-        a, b, c, d = (0, 0, 0, 0)
-
-    return a, b, c, d
+        return 0, 0, 0, 0
