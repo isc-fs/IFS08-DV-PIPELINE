@@ -235,15 +235,38 @@ class FactorGraph:
         landmark_id: int,
         initial_world_xyz: np.ndarray,
     ) -> None:
-        """Insert a brand-new landmark variable.
+        """Insert a brand-new landmark variable plus a z-only anchor
+        prior.
 
         Called once per cone, the first time it's observed. Subsequent
         observations of the same cone use stage_cone_observation() with
         its existing id and add another factor between the current pose
         and that landmark.
+
+        Why the z-anchor: stage_cone_observation builds the bearing
+        from `Unit3([body_x, body_y, 0.0])` and the range from
+        `hypot(body_x, body_y)` — both horizontal-only. With the
+        landmark and pose both at z ≈ 0 (anchor + flat-ground
+        BetweenFactor) the Jacobian columns of every cone factor
+        against landmark.z linearise to zero. That's a rank-1
+        deficiency on every landmark. Today the larger graph (V(k),
+        B(k), and a long pose chain) supplies enough off-axis
+        Hessian structure for iSAM2 to route around it via Bayes-tree
+        elimination order, but any change that shrinks the variable
+        footprint can expose it as IndeterminantLinearSystem (we hit
+        this on every landmark of a position-only graph experiment,
+        2026-05-04). Anchoring z near the initial estimate (5 cm 1σ)
+        while leaving xy effectively free (10 m 1σ — much wider than
+        any cone-factor range residual, so the bearing-range factor
+        stays the dominant xy constraint) costs one factor per
+        landmark and removes the deficiency.
         """
-        self._new_values.insert(L(landmark_id),
-                                gtsam.Point3(*initial_world_xyz))
+        initial_point = gtsam.Point3(*initial_world_xyz)
+        self._new_values.insert(L(landmark_id), initial_point)
+        z_anchor_sigmas = np.array([10.0, 10.0, 0.05])
+        z_anchor_noise = gtsam.noiseModel.Diagonal.Sigmas(z_anchor_sigmas)
+        self._new_factors.add(gtsam.PriorFactorPoint3(
+            L(landmark_id), initial_point, z_anchor_noise))
 
     def stage_cone_observation(
         self,
