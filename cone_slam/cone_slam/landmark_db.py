@@ -10,20 +10,19 @@ can attach BearingRangeFactor3D constraints to it from any pose node
 that observes it again in future scans. That's the "loop closure for
 free" that GraphSLAM gives you over filter-based SLAM.
 
-Landmark color is locked at FIRST observation. The audited spatial
-classifier already has a hidden assumption that color shouldn't flip
-once cached, and we lean into that — re-classifying on every scan
-defeats the point of having stable IDs.
+Position-only — no per-landmark colour. The body_y classifier that
+used to set this was a heuristic with no real colour signal behind it,
+and removing it from the pipeline removes the colour-flicker class of
+DA failures we used to band-aid. Visualization renders all landmarks
+the same colour.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict
 
 import numpy as np
-
-from cone_slam.color_classifier import ConeColor
 
 
 @dataclass
@@ -31,7 +30,6 @@ class Landmark:
     """One persistent cone in the world map."""
 
     id: int                                # gtsam landmark key index
-    color: ConeColor                       # locked at first observation
     position: np.ndarray = field(           # (3,) world-frame x, y, z. Updated
         default_factory=lambda: np.zeros(3))  # by iSAM2 every scan.
     n_observations: int = 0                # how many factors point at it
@@ -43,12 +41,7 @@ class Landmark:
 
 
 class LandmarkDb:
-    """Owner of all cone landmarks with persistent IDs.
-
-    Lookups are by ID for everything except the data-association code,
-    which scans by color. Both are cheap because cone counts stay
-    small (FS tracks have ~100-300 cones total).
-    """
+    """Owner of all cone landmarks with persistent IDs."""
 
     def __init__(self) -> None:
         self._landmarks: Dict[int, Landmark] = {}
@@ -56,13 +49,10 @@ class LandmarkDb:
 
     # ----- create ------------------------------------------------------------
 
-    def create(
-        self, color: ConeColor, initial_position: np.ndarray, step: int
-    ) -> Landmark:
+    def create(self, initial_position: np.ndarray, step: int) -> Landmark:
         """Allocate a new landmark with a fresh ID."""
         lm = Landmark(
             id=self._next_id,
-            color=color,
             position=np.asarray(initial_position, dtype=float).copy(),
             n_observations=1,
             last_seen_step=step,
@@ -75,11 +65,6 @@ class LandmarkDb:
 
     def get(self, lid: int) -> Landmark:
         return self._landmarks[lid]
-
-    def all_by_color(self, color: ConeColor) -> List[Landmark]:
-        """Return every landmark of the given color. Used by data
-        association for the color-gate filter."""
-        return [lm for lm in self._landmarks.values() if lm.color == color]
 
     def __len__(self) -> int:
         return len(self._landmarks)

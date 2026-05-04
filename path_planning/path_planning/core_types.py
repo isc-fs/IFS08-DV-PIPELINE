@@ -8,25 +8,22 @@ without pulling in the planner library itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
 
 import numpy as np
 
 
-class ConeColor(IntEnum):
-    """Local mirror of cone_slam.color_classifier.ConeColor."""
-
-    YELLOW = 0       # right side of track
-    BLUE = 1         # left side of track
-    ORANGE = 2       # small orange (centerline / waypoint)
-    BIG_ORANGE = 3   # large orange (start/finish)
-
-
 @dataclass(frozen=True)
 class Cone:
-    x: float          # world frame
-    y: float          # world frame
-    color: ConeColor
+    """Position-only cone observation in world frame.
+
+    The pipeline used to carry a per-cone `color` field, populated by
+    the cone_slam body_y heuristic. That classifier was removed when
+    we found it had no real colour signal underlying it; the planner
+    sorts cones by corridor geometry and ignores colour entirely.
+    """
+
+    x: float
+    y: float
 
 
 @dataclass(frozen=True)

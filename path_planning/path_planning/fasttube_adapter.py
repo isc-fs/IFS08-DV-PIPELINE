@@ -29,46 +29,16 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
-from fsd_path_planning import ConeTypes, MissionTypes, PathPlanner
+from fsd_path_planning import MissionTypes, PathPlanner
 
-from path_planning.core_types import Cone, ConeColor, PathPoint, Pose2D
+from path_planning.core_types import Cone, PathPoint, Pose2D
 
 logger = logging.getLogger(__name__)
 
-
-# Map our ConeColor → FaSTTUBe ConeTypes (#254, #189 follow-up).
-#   ours:    YELLOW=0, BLUE=1, ORANGE=2, BIG_ORANGE=3
-#   theirs:  UNKNOWN=0, RIGHT/YELLOW=1, LEFT/BLUE=2, ORANGE_SMALL=3, ORANGE_BIG=4
-#
-# All colours route to UNKNOWN — fully colour-blind sort. The
-# cone-classification audit (#189) showed there is NO real colour
-# signal anywhere in the pipeline: UE5 sets `bReturnPhysicalMaterial=
-# false` at the raycast site, the LiDAR wire format is XYZ-only, and
-# `color_classifier.classify()` invents the colour from `body_y` sign
-# + height at first observation. That spatial heuristic mis-tags
-# 30-50 % of cones once the car is past straight sections — yellow
-# cones near the body axis (long range, corner-exit transitions, fast
-# yaw) get locked as BLUE or ORANGE forever, the planner sees a
-# 70:30 imbalance, and FaSTTUBe virtual-extrapolates the
-# under-represented side onto the wrong line.
-#
-# Routing every cone through UNKNOWN forces the library's geometric
-# sort (`core_trace_sorter.select_first_k_starting_cones` and the
-# trace search) to assign sides from corridor topology rather than
-# from the upstream tag. Verified on a 108-tick capture: 108/108 ticks
-# produce valid forward-going paths with zero exceptions. The earlier
-# ZeroDivisionError we hit on this approach was the streamlit-demo
-# plotting helper triggered by perfectly-symmetric synthetic test
-# data, not the production sort path.
-#
-# Revisit when LiDAR-side colour acquisition lands (#255) — at that
-# point the upstream tag becomes a real signal worth gating on.
-_COLOR_TO_CONETYPE = {
-    ConeColor.YELLOW:     ConeTypes.UNKNOWN,
-    ConeColor.BLUE:       ConeTypes.UNKNOWN,
-    ConeColor.ORANGE:     ConeTypes.UNKNOWN,
-    ConeColor.BIG_ORANGE: ConeTypes.UNKNOWN,
-}
+# Every cone routes to FaSTTUBe's UNKNOWN slot — the pipeline carries
+# no real colour signal (UE5 sets `bReturnPhysicalMaterial=false` at
+# the LiDAR raycast site, the wire format is XYZ-only). The library's
+# geometric sort assigns left/right by corridor topology.
 
 # Cone cull window applied in the adapter (#254). FaSTTUBe is designed
 # to consume a per-tick local view of the cone field, not the full
@@ -127,10 +97,10 @@ class FasttubeAdapter:
         # `use_unknown_cones=True` is already the default in the
         # library's trackdrive cone-sorting config (verify via
         # `fsd_path_planning.config.get_cone_sorting_config`), so we
-        # don't have to opt in explicitly. The colour-blind geometric
-        # sort path is what handles cones we route through
-        # `ConeTypes.UNKNOWN` — see the `_COLOR_TO_CONETYPE` comment
-        # above for why ORANGE is routed there (#254).
+        # don't have to opt in explicitly. We use that path because
+        # the upstream pipeline carries no real cone-colour signal
+        # (see _cones_to_arrays — every cone is packed into the
+        # UNKNOWN slot).
         self._planner = PathPlanner(mission)
         self._mission = mission
         # Rate-limited error logging — papalotis can raise on degenerate
@@ -235,19 +205,17 @@ class FasttubeAdapter:
 
     @staticmethod
     def _cones_to_arrays(cones: List[Cone]) -> List[np.ndarray]:
-        """Bucket cones into the 5-array list FaSTTUBe expects."""
-        buckets: List[List[List[float]]] = [[] for _ in range(_NUM_CONE_TYPES)]
-        for c in cones:
-            cone_type = _COLOR_TO_CONETYPE.get(c.color)
-            if cone_type is None:
-                # Unrecognised colour code — drop rather than crash.
-                # Should not happen given ConeColor is an IntEnum, but
-                # be defensive against future enum extensions.
-                continue
-            buckets[int(cone_type)].append([c.x, c.y])
+        """Pack cones into the 5-array list FaSTTUBe expects.
+
+        Every cone goes into slot 0 (UNKNOWN); the other four slots
+        stay empty. The library's colour-blind geometric sort handles
+        the assignment.
+        """
+        unknown_xy = [[c.x, c.y] for c in cones]
+        empty = np.zeros((0, 2), dtype=np.float64)
         return [
-            np.asarray(b, dtype=np.float64).reshape(-1, 2)
-            for b in buckets
+            np.asarray(unknown_xy, dtype=np.float64).reshape(-1, 2),
+            empty, empty, empty, empty,
         ]
 
 

@@ -4,7 +4,7 @@ Subscribes:
   /Conos          (visualization_msgs/MarkerArray) — world-frame cone map
                   from cone_graph_slam. Each marker carries:
                     - pose.position (x, y, z)        — world-frame cone center
-                    - color (r, g, b)                — encoded ConeColor
+                    - color (r, g, b)                — ignored (cones are position-only)
                     - id                             — persistent landmark id
 
 Publishes:
@@ -56,40 +56,8 @@ from geometry_msgs.msg import Point, PoseStamped
 
 from transforms3d.euler import quat2euler, euler2quat
 
-from path_planning.core_types import Cone, ConeColor, Pose2D
+from path_planning.core_types import Cone, Pose2D
 from path_planning.fasttube_adapter import FasttubeAdapter, PlanDebug
-
-
-# Canonical cone-color RGB tuples published by cone_graph_slam (see
-# pipeline/cone_slam/cone_slam/cone_graph_slam_node.py:519+). The
-# planner consumes BLUE, YELLOW, ORANGE, BIG_ORANGE — FaSTTUBe sorts
-# yellow/blue per side and treats orange as start/finish markers.
-CONE_COLOR_RGB = [
-    ((1.0, 1.0, 0.0), ConeColor.YELLOW),
-    ((0.0, 0.4, 1.0), ConeColor.BLUE),
-    ((1.0, 0.5, 0.0), ConeColor.ORANGE),
-    ((1.0, 0.3, 0.0), ConeColor.BIG_ORANGE),
-]
-# Per-channel L1 budget — tighter than 0.5 in any channel so a noisy
-# (1.0, 0.4, 0.0) doesn't leak into BIG_ORANGE territory.
-COLOR_MATCH_TOL = 0.30
-
-
-def _classify_cone_color(r: float, g: float, b: float) -> ConeColor | None:
-    """Return the closest canonical ConeColor, or None if unrecognized.
-
-    `None` flags an out-of-palette marker (typically a malformed publisher
-    or an UNKNOWN cone from a future SLAM revision); the adapter will
-    skip it because it has no FaSTTUBe ConeTypes mapping.
-    """
-    best = None
-    best_dist = COLOR_MATCH_TOL * 3.0
-    for (cr, cg, cb), color in CONE_COLOR_RGB:
-        d = abs(r - cr) + abs(g - cg) + abs(b - cb)
-        if d < best_dist:
-            best_dist = d
-            best = color
-    return best
 
 
 def _build_debug_markers(debug: PlanDebug) -> MarkerArray:
@@ -260,13 +228,9 @@ class Plan_Path(Node):
         for m in msg.markers:
             if m.action == Marker.DELETEALL:
                 continue
-            color = _classify_cone_color(m.color.r, m.color.g, m.color.b)
-            if color is None:
-                continue
             cones.append(Cone(
                 x=float(m.pose.position.x),
                 y=float(m.pose.position.y),
-                color=color,
             ))
 
         if not cones:
@@ -313,7 +277,7 @@ class Plan_Path(Node):
                 self._capture_fh.write(json.dumps({
                     "t_ns": self.get_clock().now().nanoseconds,
                     "pose": [pose.x, pose.y, pose.yaw],
-                    "cones": [[c.x, c.y, int(c.color)] for c in cones],
+                    "cones": [[c.x, c.y] for c in cones],
                     "n_path": len(path_points),
                     "path": [[p.x, p.y] for p in path_points],
                 }) + "\n")
