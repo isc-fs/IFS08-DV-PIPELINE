@@ -1,31 +1,37 @@
+"""LiDAR cone detection — extract per-cone (x, y, height) tuples from a
+single ground-removed point cloud.
+
+Public surface used by `cone_detection_node.py`:
+    - final_cone_result_rt(data, model=DBSCAN, debug_counters=None)
+        → list[(x, y, height_m, sigma_xy)]; runs RANSAC ground-plane removal
+          (slam.ransac.ransac2), DBSCAN clustering, and per-cluster cone
+          fitting via two_phase_cone_detection.cone_fit_2params with a
+          centroid fallback for clusters that fail the fit gates.
+    - warmup_numba_functions()
+        → eager-compiles the Numba functions on the cone-fitting hot path
+          so the first real LiDAR scan doesn't pay the JIT cost.
+
+Internal helper (not imported elsewhere):
+    - clustering_separation_rt — RANSAC + rotation correction + DBSCAN.
+
+PR-B (chore/pipeline-extract-benchmarks) deleted ~150 LOC of dev-only
+benchmark / profiling / visualization helpers (`profiling_cone_detection`,
+`solvers_benchmark`, `best_solver`, `benchmark_cone_detection`,
+`benchmark_process`, `compare_data_to_processed`, `rect2polars`, the
+`if __name__ == "__main__"` driver) along with their `cProfile`,
+`matplotlib`, and `timeit` imports. None were called from any production
+node or launch file. Git history preserves them.
 """
-========================
-cone_detection.py (v1.1)
-========================
 
-Elaborado por Sergio Jiménez para el ISC
-Permite detectar las posiciones de los conos dados los
-datos de un LIDAR. Este archivo tiene distintos benchmarks, 
-ademas de permitir visualizar la comparacion entre lo predicho 
-y los datos
+import math
 
-Novedades 1.1:
-- Añadida rect2polars
-"""
-
-from slam.ransac import ransac, ransac2
-from slam.ground_removal import cone_fit, read_lidar_data, clustering_separation
-from slam.rotaciones import vectors2matrix
-from slam.two_phase_cone_detection import *
 import numpy as np
 from sklearn.cluster import DBSCAN
-import cProfile
-import time
-import matplotlib.pyplot as plt
-import timeit
 
-# import numba
-import math
+from slam.ransac import ransac2
+from slam.ground_removal import cone_model
+from slam.rotaciones import vectors2matrix
+from slam.two_phase_cone_detection import *  # noqa: F401, F403  (cone_fit_2params + helpers used by final_cone_result_rt)
 
 
 def final_cone_result_rt(data, model=DBSCAN, debug_counters=None):
@@ -206,12 +212,6 @@ def final_cone_result_rt(data, model=DBSCAN, debug_counters=None):
     return cone_positions
 
 
-# @numba.njit
-def rect2polars(x, y):
-
-    return np.sqrt(x**2 + y**2), np.arctan2(y, x)
-
-
 def clustering_separation_rt(data, model):
     """
     Realiza la separación en clusters mediante un modelo de clustering. Primero hace ransac
@@ -257,39 +257,6 @@ def clustering_separation_rt(data, model):
     return labels, data, def_coefs
 
 
-def profiling_cone_detection():
-    """
-    Hace profiling a la funcion de sacar los conos para saber que funciones
-    son las que tardan mas
-    """
-    cProfile.run("benchmark_cone_detection(data)")
-
-
-def solvers_benchmark(data, solver, model=DBSCAN):
-    """
-    Hace el benchmark para 1 solver en concreto
-
-    Args:
-        data (np.ndarray): los datos
-        solver (str): el solver que se debe usar
-        model (sklearn.model, optional): Modelo de clustering. Defaults to DBSCAN.
-    """
-    labels, clean_data, def_coefs = clustering_separation_rt(data, model)
-    separated_data = [
-        np.array(clean_data[labels == label]) for label in np.unique(labels)
-    ]
-    for cone in separated_data:
-
-        if len(cone) > 3:
-            v = np.array([0, 0, -1 * def_coefs[0]])
-            w = np.array(def_coefs[1:])
-            lidar_distance_to_floor = np.dot(v, w) / np.linalg.norm(w)
-            # cone_positions.append((np.mean(cone[:, 0]), np.mean(cone[:, 1])))
-            clean_cone = cone[cone[:, 2] > 0.05 + lidar_distance_to_floor]
-            if len(clean_cone) > 3:
-                cone_fit(clean_cone, solver)
-
-
 def warmup_numba_functions():
     import os
     import numpy as np
@@ -328,94 +295,3 @@ def warmup_numba_functions():
     lst_sqrs_fit(M, dummy_z)
 
 
-def best_solver(data):
-    """
-    Para benchmarkear los solvers de scipy.minimize
-
-    Args:
-        data (np.ndarray): los datos
-    """
-    solvers = [
-        "Nelder-Mead",
-        "Powell",
-        "CG",
-        "BFGS",
-        # "Newton-CG",
-        "L-BFGS-B",
-        "TNC",
-        "COBYLA",
-        "SLSQP",
-        # "dogleg",
-        "trust-constr",
-        # "trust-ncg",
-        # "trust-exact",
-        # "trust-krylov",
-    ]
-    for solver in solvers:
-        execution_time = timeit.timeit(
-            lambda: solvers_benchmark(data, solver),
-            globals=globals(),
-            number=1,
-        )
-
-        print(f"Execution time {solver}: {execution_time} seconds")
-
-
-def benchmark_cone_detection(data):
-    """
-    Ejecuta el cone detection en todos los datos
-
-    Args:
-        data (np.ndarray): los datos
-    """
-    for d in data:
-        final_cone_result_rt(d)
-
-
-def benchmark_process(data):
-    """
-    Calcula cuanto tiempo se tarda en todo el dataset
-
-    Args:
-        data (np.ndarray): los datos
-    """
-    execution_time = timeit.timeit(
-        lambda: benchmark_cone_detection(data),
-        globals=globals(),
-        number=1,
-    )
-
-    print(f"Execution time: {execution_time} seconds")
-    print(f"{len(data)} data points")
-    print(f"{execution_time/len(data)} mean time")
-    print(f"{len(data)/execution_time} mean fps")
-
-
-def compare_data_to_processed(data):
-    """
-    Permite ver (en 2D) las posiciones predichas para los conos
-    y los clusters separados por el lidar para unos datos concretos
-
-    Args:
-        data (np.ndarray): los datos
-    """
-    for d in data:
-        # final_cone_result_rt now returns (x, y, height); discard height here.
-        results = final_cone_result_rt(d)
-        if not results:
-            continue
-        x = [r[0] for r in results]
-        y = [r[1] for r in results]
-        plt.scatter(x, y, marker="*")
-        clustering_separation(d, plot=True)
-
-
-if __name__ == "__main__":
-    data = read_lidar_data("puntos_lidar.txt")
-
-    final_cone_result_rt(data[0])
-    profiling_cone_detection()
-    benchmark_process(data)
-    # compare_data_to_processed(data)
-
-    # best_solver(data)
