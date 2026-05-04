@@ -58,6 +58,16 @@ from cone_slam.imu_preintegrator import ImuPreintegrator, ImuSample
 from cone_slam.landmark_db import LandmarkDb
 
 
+def _odom_to_pose3(msg: Odometry) -> "gtsam.Pose3":
+    """Convert nav_msgs/Odometry pose into gtsam.Pose3."""
+    p = msg.pose.pose.position
+    q = msg.pose.pose.orientation
+    return gtsam.Pose3(
+        gtsam.Rot3.Quaternion(q.w, q.x, q.y, q.z),
+        np.array([p.x, p.y, p.z]),
+    )
+
+
 CALIBRATION_SECONDS = 3.0
 
 # Observations beyond this body-frame range are dropped before reaching
@@ -191,6 +201,26 @@ class ConeGraphSlamNode(Node):
         )
         self.create_subscription(Float32, "/motor_rpm", self._on_rpm, rpm_qos)
 
+        # --- /testing_only/odom — sim ground truth, used only for the
+        # GT-aligned diagnostic published below. The bridge encodes this
+        # in ENU (East-North-Up); SLAM internally anchors to the car's
+        # initial pose, so direct comparison would mix two different
+        # world frames. We snapshot the GT pose at calibration-end and
+        # publish a pose-aligned residual on /cone_slam/gt_aligned.
+        # Bridge publishes BEST_EFFORT (per `sensor_qos` in
+        # ifssim_ros_wrapper.cpp:289); subscriber must match or messages
+        # silently never arrive.
+        gt_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(
+            Odometry, "/testing_only/odom", self._on_gt_odom, gt_qos)
+        self._latest_gt: Optional[Odometry] = None
+        self._gt_init_pose: Optional[gtsam.Pose3] = None
+
         # --- Publishers ---
         self._tf_broadcaster = TransformBroadcaster(self)
         self._static_tf_broadcaster = StaticTransformBroadcaster(self)
@@ -198,6 +228,17 @@ class ConeGraphSlamNode(Node):
             Odometry, "/cone_slam/state", 10)
         self._cones_pub = self.create_publisher(
             MarkerArray, "/Conos", 10)
+        # GT-aligned diagnostic odometry. Same Odometry shape as
+        # /cone_slam/state but containing the ground truth re-expressed
+        # in SLAM's anchored body-frame world. SLAM-vs-GT divergence in
+        # this frame is the actual SLAM drift; in the raw GT frame it
+        # would be that drift plus the static frame mismatch.
+        self._gt_aligned_pub = self.create_publisher(
+            Odometry, "/cone_slam/gt_aligned", 10)
+        # Scalar position-error magnitude — convenience for the
+        # Lichtblick plot, equal to ||state.position - gt_aligned.position||.
+        self._gt_error_pub = self.create_publisher(
+            Float32, "/cone_slam/gt_error_m", 10)
 
         # Anchor `map -> odom` as identity on /tf_static. We don't
         # have map-based localization (no GPS-aligned global frame),
@@ -223,6 +264,26 @@ class ConeGraphSlamNode(Node):
         # scan is what the factor graph wants.
         self._latest_rpm = float(msg.data) * RPM_TO_MS
         self._latest_rpm_t = self._time.monotonic()
+
+    def _on_gt_odom(self, msg: Odometry) -> None:
+        # Cache the latest /testing_only/odom sample. Used only to
+        # publish the SLAM-vs-GT residual on /cone_slam/gt_aligned —
+        # never feeds into the factor graph (that would defeat the
+        # purpose of a SLAM diagnostic).
+        self._latest_gt = msg
+        # Lazy alignment anchor: if SLAM has already transitioned to
+        # SLAM_RUNNING but no GT sample had arrived in time for
+        # _finish_calibration to snapshot one, take the first sample
+        # that does arrive as the anchor. Off by < 100 ms typically;
+        # immaterial for a SLAM-drift visualisation.
+        if (self._state == State.SLAM_RUNNING
+                and self._gt_init_pose is None):
+            self._gt_init_pose = _odom_to_pose3(msg)
+            self.get_logger().info(
+                f"GT alignment anchor (late): "
+                f"pos=({self._gt_init_pose.x():+.2f}, {self._gt_init_pose.y():+.2f}), "
+                f"yaw={np.degrees(self._gt_init_pose.rotation().yaw()):+.1f}°"
+            )
 
     # ----- IMU callback ------------------------------------------------------
 
@@ -272,6 +333,24 @@ class ConeGraphSlamNode(Node):
         self._latest_result = self._graph.latest()
         self._state = State.SLAM_RUNNING
         self.get_logger().info("SLAM_RUNNING — pose graph anchored at origin")
+
+        # Snapshot the GT pose at this instant. SLAM's pose at t=0 is
+        # identity (pose graph anchored at origin); GT is at whatever
+        # (ENU) world coordinates UE5 spawned the car at. Future SLAM
+        # poses are in a frame whose origin == car spawn, x = car-initial
+        # forward, y = car-initial left. To compare to GT we have to
+        # subtract this snapshot and rotate by -initial_yaw_enu.
+        if self._latest_gt is not None:
+            self._gt_init_pose = _odom_to_pose3(self._latest_gt)
+            self.get_logger().info(
+                f"GT alignment anchor: "
+                f"pos=({self._gt_init_pose.x():+.2f}, {self._gt_init_pose.y():+.2f}), "
+                f"yaw={np.degrees(self._gt_init_pose.rotation().yaw()):+.1f}°"
+            )
+        else:
+            self.get_logger().warn(
+                "no /testing_only/odom received before SLAM_RUNNING — "
+                "GT-aligned diagnostic disabled this run")
 
     # ----- Cone observation callback (scan trigger) -------------------------
 
@@ -639,6 +718,54 @@ class ConeGraphSlamNode(Node):
         msg.twist.twist.linear.y = float(-s * v_world[0] + c * v_world[1])
         msg.twist.twist.linear.z = float(v_world[2])
         self._state_pub.publish(msg)
+
+        # GT-aligned diagnostic: publish where the ground truth says
+        # the car is, expressed in SLAM's anchored body-frame world,
+        # plus the position-error magnitude. Both are zero at t=0 by
+        # construction; non-zero values are real SLAM drift, not a
+        # frame-mismatch artifact.
+        self._publish_gt_aligned(stamp, msg)
+
+    def _publish_gt_aligned(self, stamp, slam_msg: Odometry) -> None:
+        """Re-express ground truth in SLAM's anchored frame and publish.
+
+        SLAM internally anchors at identity, so the SLAM frame is:
+            origin = car spawn (the ENU pose at calibration end)
+            +x axis = car's initial forward direction
+            +y axis = car's initial left direction
+        The bridge publishes /testing_only/odom in ENU. To compare like-
+        for-like, we subtract the snapshot pose from each GT sample and
+        rotate by -initial_yaw_enu.
+        """
+        if self._gt_init_pose is None or self._latest_gt is None:
+            return
+        gt_now = _odom_to_pose3(self._latest_gt)
+        # gt_in_slam_frame = init⁻¹ · gt_now
+        gt_aligned = self._gt_init_pose.inverse().compose(gt_now)
+
+        out = Odometry()
+        out.header.stamp = stamp
+        out.header.frame_id = self.odom_frame
+        out.child_frame_id = "gt"
+        out.pose.pose.position.x = gt_aligned.x()
+        out.pose.pose.position.y = gt_aligned.y()
+        out.pose.pose.position.z = gt_aligned.z()
+        q = gt_aligned.rotation().toQuaternion()
+        out.pose.pose.orientation.w = q.w()
+        out.pose.pose.orientation.x = q.x()
+        out.pose.pose.orientation.y = q.y()
+        out.pose.pose.orientation.z = q.z()
+        self._gt_aligned_pub.publish(out)
+
+        # Position-error magnitude in metres. Plot this on a second
+        # axis to track drift growth without having to do the
+        # subtraction in the visualiser.
+        dx = slam_msg.pose.pose.position.x - gt_aligned.x()
+        dy = slam_msg.pose.pose.position.y - gt_aligned.y()
+        err = float(np.hypot(dx, dy))
+        err_msg = Float32()
+        err_msg.data = err
+        self._gt_error_pub.publish(err_msg)
 
     def _publish_cone_map(self, stamp) -> None:
         """Publish the persistent cone landmark database to /Conos.
