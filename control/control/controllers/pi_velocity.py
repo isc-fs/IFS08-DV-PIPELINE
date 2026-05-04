@@ -70,12 +70,19 @@ class PIVelocity(LongitudinalController):
         # the controller can still demand max stopping power.
         self.throttle_max = throttle_max
         self._integral = 0.0
+        # Diagnostic side-channel — last computed values, for the
+        # control node to publish on debug topics. Read these *after*
+        # compute() returns; they're undefined before the first call.
+        self.last_v_set: float = 0.0
+        self.last_kappa_max: float = 0.0
 
     def reset(self) -> None:
         self._integral = 0.0
 
     def compute(self, state: VehicleState, ref: ReferenceTrajectory) -> Tuple[float, float]:
         v_set = self._setpoint(state, ref)
+        # Stash for diagnostic publish (#260 follow-up).
+        self.last_v_set = v_set
         # Track SIGNED body-frame forward velocity (not magnitude). Using
         # |v| would feed the wrong sign back if the car ever ended up
         # going backward (e.g. pushed by collision): |v| = 5 looks like
@@ -96,6 +103,9 @@ class PIVelocity(LongitudinalController):
         # noisy (audit item #9); using the global max overshoots straights
         # adjacent to hairpins.
         kappa_max = self._max_curvature_ahead(state, ref)
+        # Stash for diagnostic publish (#260 follow-up). Float NaN
+        # would also work but Float32 publishers prefer real values.
+        self.last_kappa_max = kappa_max
         if kappa_max < 1e-3:
             v_corner = self.v_max
         else:
