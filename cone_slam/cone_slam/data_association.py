@@ -1,24 +1,38 @@
 """Data association: match this scan's cone observations to existing
 landmarks (or flag as new).
 
-Per AMZ §3.2 (Kabzan et al. arXiv:1905.05150) the recipe is:
-    color gate → Mahalanobis gate → Hungarian assignment
+Originally followed AMZ §3.2 (Kabzan et al. arXiv:1905.05150):
+    color gate (hard) → Mahalanobis gate → Hungarian assignment
 
-`associate()` accepts a `landmark_covariance_fn(id) -> 3×3 ndarray | None`
-callback. When provided, each candidate's Mahalanobis distance is
-computed in the body frame using:
+The colour hard-gate is gone (#269). Why: the upstream classifier
+(`color_classifier.classify(body_y, height)`) is a pose-relative
+heuristic — it tags a cone YELLOW when it's at body_y < -0.5 and
+BLUE when body_y > +0.5 at the moment of observation. When the car
+yaws through a corner, the body_y of the same physical cone flips
+sign within a few scans, so the new observations come in tagged with
+the *opposite* colour from the existing landmark (which is locked to
+its first-observation colour). The colour-bucket DA could not bridge
+that gap → all observations marked NEW → cascade-detector kicked in →
+SLAM rejected the whole scan. Live: at the second hairpin in
+test_submodule, yaw rotated ~64° in 1 second, the entire SLAM_OBS
+distribution flipped from B-dominated to Y-dominated, and DA went
+from 100 % association to 0 %.
 
-    Σ_innov_body = R_world→body · Σ_landmark_world · R_world→body^T
-                   + σ_obs² · I
+Replacement: position-based gating with **per-pair distance gate
+that's tighter for cross-colour matches**. Same physical cone with a
+flipped colour tag has 0 m offset, well within any cross-colour gate.
+Two *physically distinct* cones of different colour are ≥ 3 m apart in
+FS corridors, well outside the cross-colour gate. Concretely:
 
-and gated by the χ² threshold for 2 DOF (default 99 % = 9.21). When
-the covariance isn't available yet (e.g. a landmark just created on
-the same scan, before iSAM2 marginalizes it), we fall back to the
-Euclidean DISTANCE_GATE_M backstop. The Euclidean gate also stays
-active as a sanity cap regardless of Mahalanobis: two physical cones
-are at least ~3 m apart, so any match across more than DISTANCE_GATE_M
-is almost certainly a wrong-cone match no matter how loose the
-landmark's covariance might claim.
+  - Same colour: full DISTANCE_GATE_M (2 m).
+  - Different colour: CROSS_COLOR_DISTANCE_GATE_M (1 m).
+  - Mahalanobis χ² applies in both cases as the secondary gate.
+  - One Hungarian assignment over the combined cost matrix.
+
+This preserves the start-grid wrong-match safety we tried to keep
+when the fully-colour-blind variant got too greedy in cluster regions
+(yellow cones within 2 m of orange/big-orange cones at the start
+gate, observed live as a 4.6 m drift).
 
 The data flow per scan:
 
@@ -29,15 +43,12 @@ The data flow per scan:
                                                               unmatched:
                                                                 create
                                                                 landmark
-
-Color gating cuts the search 4× (FS cones come in 4 classes) before
-the Mahalanobis distance is even computed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -67,6 +78,25 @@ from cone_slam.landmark_db import Landmark, LandmarkDb
 # alongside Mahalanobis: physical cones are ~3 m apart so any wider
 # match is wrong regardless of how loose iSAM2 claims the covariance is.
 DISTANCE_GATE_M = 2.0
+
+
+# Cross-colour Euclidean gate (#269). Tighter than DISTANCE_GATE_M so
+# that cones of different colour can only associate when they're
+# *almost exactly* on top of each other — i.e. the same physical cone
+# with a flipped colour tag, not two adjacent cones from opposite
+# corridor sides.
+#
+# 1.0 m sized to:
+#   - ALLOW: same physical cone with a flipped tag (offset ≈ centroid
+#     noise, typically < 0.2 m at FS ranges, plus per-scan SLAM jitter
+#     of ~0.3-0.5 m on tight pose updates → max realistic offset ≈ 0.7 m,
+#     comfortably under 1.0 m).
+#   - REJECT: cross-corridor cones of different colour. FS layouts use
+#     corridor widths ≥ 3 m, so distinct cones of opposite colour are
+#     never within 1 m of each other.
+#   - REJECT: same-side adjacent cones of different colour. Within-side
+#     cone-pair spacing is ~3 m, well outside the gate.
+CROSS_COLOR_DISTANCE_GATE_M = 1.0
 
 
 # Time-since-association gate expansion was tested on 2026-04-29 in
@@ -181,21 +211,17 @@ def associate(
 ) -> List[Match]:
     """Match observations to landmarks. One Match per observation.
 
-    Algorithm:
-      1. Bucket landmarks by color.
-      2. For each color bucket:
-         - project landmarks into body frame using current pose
-         - for each (obs, landmark) pair:
-              · compute innovation in body frame (obs − lm_body)
-              · compute innovation covariance in body frame
-                  Σ = R_world→body · Σ_lm_world · R_world→body^T
-                      + σ_obs² · I
-              · gate by Mahalanobis χ² (≤ MAHALANOBIS_CHI2)
-              · also gate by Euclidean (≤ DISTANCE_GATE_M) as a hard
-                physical-cone-spacing backstop
-         - Hungarian assignment minimizes total χ² cost
-         - matches with finite cost get a landmark_id; the rest get -1
-      3. Concatenate per-color results.
+    Algorithm (#269 — colour as soft preference, not hard gate):
+      1. Project every landmark into body frame.
+      2. Build one (n_obs × n_lm) cost matrix:
+         - Per-pair Euclidean offset.
+         - Reject pairs above their colour-aware gate:
+              same colour    → DISTANCE_GATE_M           (2 m)
+              different col. → CROSS_COLOR_DISTANCE_GATE_M (1 m)
+         - Reject pairs that fail the Mahalanobis χ² gate.
+         - Surviving pairs get a finite Euclidean cost.
+      3. One Hungarian assignment over the whole cost matrix.
+      4. Matches with finite cost get a landmark_id; the rest get -1.
 
     `landmark_covariance_fn(id) -> 3×3 ndarray | None` is optional. If
     None or it returns None for a given id, we fall back to a default
@@ -215,10 +241,13 @@ def associate(
     matches: List[Match] = [Match(obs_index=i, landmark_id=-1)
                             for i in range(len(observations))]
 
-    # Bucket observation indices by color.
-    by_color: Dict[ConeColor, List[int]] = {}
-    for i, o in enumerate(observations):
-        by_color.setdefault(o.color, []).append(i)
+    if not observations:
+        return matches
+
+    candidates = list(db)
+    if not candidates:
+        # No landmarks yet — every obs is new.
+        return matches
 
     # World→body rotation: if R_b2w = [[c, -s], [s, c]] (yaw), then
     # R_w2b = R_b2w^T = [[c, s], [-s, c]].
@@ -230,121 +259,91 @@ def associate(
     default_lm_cov_body = (DEFAULT_LANDMARK_SIGMA_M ** 2) * np.eye(2)
     default_obs_var = DEFAULT_OBS_SIGMA_M ** 2
 
-    for color, obs_indices in by_color.items():
-        candidates = db.all_by_color(color)
-        if not candidates:
-            # No landmarks of this color exist yet — every obs is new.
-            continue
+    n_obs = len(observations)
+    n_lm = len(candidates)
+    cost = np.full((n_obs, n_lm), np.inf)
 
-        n_obs = len(obs_indices)
-        n_lm = len(candidates)
-        cost = np.full((n_obs, n_lm), np.inf)
+    # Pre-fetch landmark body-frame positions and (optionally) body-frame
+    # covariances. The covariance call is potentially expensive (iSAM2
+    # marginal computation) — once per landmark, not per (obs × lm).
+    lm_bodies = np.empty((n_lm, 2))
+    lm_cov_body = [default_lm_cov_body] * n_lm
+    for j, lm in enumerate(candidates):
+        lm_bodies[j] = _world_to_body(pose_x, pose_y, pose_yaw,
+                                      lm.position[:2])
+        if landmark_covariance_fn is not None:
+            cov_world = landmark_covariance_fn(lm.id)
+            if cov_world is not None:
+                sigma_world_xy = LANDMARK_COV_INFLATION * cov_world[:2, :2]
+                lm_cov_body[j] = R_w2b @ sigma_world_xy @ R_w2b.T
 
-        # Pre-fetch landmark body-frame positions and (optionally)
-        # body-frame covariances. The covariance call is potentially
-        # expensive (iSAM2 marginal computation) — so we do it once
-        # per landmark, not per (obs × landmark) pair.
-        lm_bodies = np.empty((n_lm, 2))
-        lm_cov_body = [default_lm_cov_body] * n_lm
-        for j, lm in enumerate(candidates):
-            lm_bodies[j] = _world_to_body(pose_x, pose_y, pose_yaw,
-                                          lm.position[:2])
-            if landmark_covariance_fn is not None:
-                cov_world = landmark_covariance_fn(lm.id)
-                if cov_world is not None:
-                    # Inflate to compensate for iSAM2's optimistic
-                    # internal estimate (see CONS_COV_INFLATION above).
-                    sigma_world_xy = LANDMARK_COV_INFLATION * cov_world[:2, :2]
-                    lm_cov_body[j] = R_w2b @ sigma_world_xy @ R_w2b.T
+    for j in range(n_lm):
+        lm = candidates[j]
+        lm_body = lm_bodies[j]
+        sigma_lm = lm_cov_body[j]
+        # Per-landmark gate expansion based on staleness (currently
+        # disabled via GATE_EXPANSION_PER_SCAN=0 — see config block above).
+        if current_step >= 0:
+            stale = max(0, current_step - lm.last_seen_step)
+            gate_mult = min(
+                GATE_EXPANSION_CAP,
+                1.0 + GATE_EXPANSION_PER_SCAN * stale)
+        else:
+            gate_mult = 1.0
 
-        for j in range(n_lm):
-            lm_body = lm_bodies[j]
-            sigma_lm = lm_cov_body[j]
-            # Per-landmark gate expansion based on staleness. When
-            # current_step is unknown (caller didn't pass it) we fall
-            # back to the static gate.
-            if current_step >= 0:
-                stale = max(0, current_step - candidates[j].last_seen_step)
-                gate_mult = min(
-                    GATE_EXPANSION_CAP,
-                    1.0 + GATE_EXPANSION_PER_SCAN * stale)
+        # Pose-uncertainty contribution to Σ_innov via the Jacobian of
+        # body-frame projection w.r.t. (yaw, x_w, y_w).
+        if pose_xy_yaw_cov is not None:
+            J = np.array([
+                [ lm_body[1], -c_yaw, -s_yaw],
+                [-lm_body[0],  s_yaw, -c_yaw],
+            ])
+            sigma_pose_contrib = (
+                POSE_COV_INFLATION * (J @ pose_xy_yaw_cov @ J.T))
+        else:
+            sigma_pose_contrib = np.zeros((2, 2))
+
+        for i in range(n_obs):
+            o = observations[i]
+            dx = o.body_x - lm_body[0]
+            dy = o.body_y - lm_body[1]
+            d_eu = float(np.hypot(dx, dy))
+
+            # Colour-aware Euclidean gate (#269).
+            if o.color == lm.color:
                 gate_eff = DISTANCE_GATE_M * gate_mult
             else:
-                gate_eff = DISTANCE_GATE_M
+                gate_eff = CROSS_COLOR_DISTANCE_GATE_M * gate_mult
+            if d_eu > gate_eff:
+                continue
 
-            # Pose-uncertainty contribution to Σ_innov via the Jacobian
-            # of body-frame projection w.r.t. (yaw, x_w, y_w). With
-            #   lm_body = R_w2b (lm_world − p),   R_w2b = [[c, s],[-s, c]]
-            # the partials are:
-            #   ∂lm_body/∂yaw = [ lm_body_y, −lm_body_x]
-            #   ∂lm_body/∂x_w = [−c, +s]
-            #   ∂lm_body/∂y_w = [−s, −c]
-            # Without this term the Mahalanobis gate collapses to ~0.3 m
-            # for tightly-constrained landmarks even when the predicted
-            # pose has drifted 1–2 m — exactly the regime where DA is
-            # most needed. With it, uncertain pose → wider gate, certain
-            # pose → tighter gate.
-            if pose_xy_yaw_cov is not None:
-                J = np.array([
-                    [ lm_body[1], -c_yaw, -s_yaw],
-                    [-lm_body[0],  s_yaw, -c_yaw],
-                ])
-                # Inflate the pose marginal too (same rationale as
-                # the landmark inflation above).
-                sigma_pose_contrib = (
-                    POSE_COV_INFLATION * (J @ pose_xy_yaw_cov @ J.T))
-            else:
-                sigma_pose_contrib = np.zeros((2, 2))
+            obs_var = (o.sigma_xy ** 2) if o.sigma_xy > 0 \
+                else default_obs_var
+            sigma_innov = (sigma_lm
+                           + obs_var * np.eye(2)
+                           + sigma_pose_contrib
+                           + COV_FLOOR_VAR_M2 * np.eye(2))
+            innov = np.array([dx, dy])
+            try:
+                sol = np.linalg.solve(sigma_innov, innov)
+            except np.linalg.LinAlgError:
+                continue
+            d2 = float(innov @ sol)
+            if d2 <= MAHALANOBIS_CHI2:
+                # Mahalanobis as gate, Euclidean as Hungarian cost.
+                cost[i, j] = d_eu
 
-            for ii, obs_idx in enumerate(obs_indices):
-                o = observations[obs_idx]
-                dx = o.body_x - lm_body[0]
-                dy = o.body_y - lm_body[1]
-                d_eu = float(np.hypot(dx, dy))
-                if d_eu > gate_eff:
-                    # Euclidean physical-spacing backstop — skip
-                    # before doing the matrix math. Per-landmark
-                    # expansion via gate_eff lets stale landmarks
-                    # be re-acquired after a pose-drift window.
-                    continue
-                obs_var = (o.sigma_xy ** 2) if o.sigma_xy > 0 \
-                    else default_obs_var
-                # Σ_innov = (4× Σ_lm) + σ_obs² I + (4× JΣ_poseJᵀ) + floor
-                # The floor adds (0.5 m)² to each diagonal so the gate
-                # never collapses below physical-cone-spacing bounds
-                # even when iSAM2 reports near-zero uncertainty.
-                sigma_innov = (sigma_lm
-                               + obs_var * np.eye(2)
-                               + sigma_pose_contrib
-                               + COV_FLOOR_VAR_M2 * np.eye(2))
-                innov = np.array([dx, dy])
-                try:
-                    sol = np.linalg.solve(sigma_innov, innov)
-                except np.linalg.LinAlgError:
-                    continue
-                d2 = float(innov @ sol)
-                if d2 <= MAHALANOBIS_CHI2:
-                    # Mahalanobis as gate, Euclidean as Hungarian cost.
-                    # Mahalanobis-squared distance varies wildly with
-                    # tight-vs-loose covariances and was making
-                    # Hungarian prefer "information-cheap" but
-                    # physically-wrong matches in dense cone scenes.
-                    # Once the gate has confirmed a match is plausible,
-                    # the assignment cost should be physical proximity.
-                    cost[ii, j] = d_eu
+    # Hungarian doesn't accept +∞; replace with a large finite value.
+    big = 1e6
+    cost_solver = np.where(np.isinf(cost), big, cost)
 
-        # Hungarian doesn't accept +∞; replace with a large finite value.
-        big = 1e6
-        cost_solver = np.where(np.isinf(cost), big, cost)
-
-        row_ind, col_ind = linear_sum_assignment(cost_solver)
-        for r, c_ in zip(row_ind, col_ind):
-            if cost[r, c_] < np.inf:
-                obs_idx = obs_indices[r]
-                matches[obs_idx] = Match(
-                    obs_index=obs_idx,
-                    landmark_id=candidates[c_].id,
-                )
-            # else: gated out, stays as new (-1)
+    row_ind, col_ind = linear_sum_assignment(cost_solver)
+    for r, c_ in zip(row_ind, col_ind):
+        if cost[r, c_] < np.inf:
+            matches[r] = Match(
+                obs_index=r,
+                landmark_id=candidates[c_].id,
+            )
+        # else: gated out, stays as new (-1)
 
     return matches
