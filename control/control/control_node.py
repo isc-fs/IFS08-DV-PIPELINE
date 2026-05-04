@@ -137,7 +137,12 @@ class ControlNode(Node):
         # a setpoint drop. Tune up later once tire physics is known.
         self.declare_parameter("a_lat_max", 3.0)
         self.declare_parameter("a_dec_max", 4.0)
-        self.declare_parameter("lookahead_min", 1.5)
+        # Lowered 1.5 → 1.0 to widen the band where the β·R radius cap
+        # (in pure_pursuit.py) can actually bind. Previous default left
+        # hairpins between R ≈ 1.4 and 2.1 m unguarded — the cap was
+        # silently re-floored back to L_min and Pure Pursuit overshot
+        # the apex (test_submodule first hairpin, #260 follow-up).
+        self.declare_parameter("lookahead_min", 1.0)
         self.declare_parameter("lookahead_k", 0.5)
         self.declare_parameter("kp_v", 0.5)
         self.declare_parameter("ki_v", 0.05)
