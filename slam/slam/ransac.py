@@ -127,12 +127,31 @@ def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=200):
     # rate) the slow path costs ~30-60 ms/scan, enough to push Cone_Detection
     # CPU-bound so SLAM starts dropping scans (Δ_to_t_end < 0). Materialising
     # the slice once removes the per-iteration overhead.
-    A_xy = np.ascontiguousarray(A[:, :-1])
-    A_z = np.ascontiguousarray(A[:, -1])
+    A_xy_full = np.ascontiguousarray(A[:, :-1])
+    A_z_full = np.ascontiguousarray(A[:, -1])
+    data_size = len(data)
+    # Subsample for the iteration loop (#247). RANSAC's consensus
+    # probability depends on the *inlier ratio*, not absolute count —
+    # running max_iter iterations against 5 000 random points finds
+    # the same ground plane as the full ~95 k LiDAR cloud at
+    # ~19× the cost per iteration. Each iteration's `A_xy.dot(...)`
+    # is BLAS-parallel and was sustaining 8-10 cores at 90% on the
+    # full cloud. The final inlier set is computed against the FULL
+    # data in the return statement, so callers see the same outliers
+    # mask they always have.
+    N_SUBSAMPLE = 5000
+    if data_size > N_SUBSAMPLE:
+        sub_idx = np.random.choice(data_size, N_SUBSAMPLE, replace=False)
+        A_xy = np.ascontiguousarray(A_xy_full[sub_idx])
+        A_z = np.ascontiguousarray(A_z_full[sub_idx])
+        iter_data_size = N_SUBSAMPLE
+    else:
+        A_xy = A_xy_full
+        A_z = A_z_full
+        iter_data_size = data_size
     k = float(max_iter)
     support = 0
     iters = 0
-    data_size = len(data)
 
     # Sentinel z-up plane so def_coefs is never None even on a degenerate
     # cloud where no random sample finds enough inliers to beat support=0.
@@ -145,6 +164,9 @@ def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=200):
 
     while iters < k and iters < max_iter:
         points_ind = np.random.choice(data_size, m, replace=False)
+        # Sample the m anchors from the FULL cloud — the iteration
+        # subsample is only used to score consensus cheaply, not to
+        # constrain which points can define a candidate plane.
         points = A[points_ind]
         # Se calcula el hiperplano con producto vectorial en vez de svd (numba no lo ejecuta bien con svd)
         vectors = points[1:][:, 1:] - points[0][1:]
@@ -168,7 +190,7 @@ def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=200):
         if support_aux > support:
             support = support_aux
             def_coefs = coefs
-            inlier_ratio = support / data_size
+            inlier_ratio = support / iter_data_size
             # Refine the iteration budget toward the standard RANSAC
             # bound. Guard the perfect-inlier case (log(0) = -inf) and
             # never let k climb above max_iter — degenerate scans must
@@ -180,9 +202,11 @@ def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=200):
         iters += 1
     if def_coefs[-1] < 0:
         def_coefs = -1 * def_coefs
+    # Final inlier mask over the FULL cloud (callers expect indices
+    # into `data`, not into the iteration subsample).
     return (
         np.where(
-            np.abs(A_xy.dot(def_coefs[:-1] / (-1 * def_coefs[-1])) - A_z)
+            np.abs(A_xy_full.dot(def_coefs[:-1] / (-1 * def_coefs[-1])) - A_z_full)
             < threshold
         ),
         def_coefs,
