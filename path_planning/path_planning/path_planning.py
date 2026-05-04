@@ -52,12 +52,12 @@ from tf2_ros.transform_listener import TransformListener
 
 from visualization_msgs.msg import Marker, MarkerArray
 from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Point, PoseStamped
 
 from transforms3d.euler import quat2euler, euler2quat
 
 from path_planning.core_types import Cone, ConeColor, Pose2D
-from path_planning.fasttube_adapter import FasttubeAdapter
+from path_planning.fasttube_adapter import FasttubeAdapter, PlanDebug
 
 
 # Canonical cone-color RGB tuples published by cone_graph_slam (see
@@ -92,6 +92,65 @@ def _classify_cone_color(r: float, g: float, b: float) -> ConeColor | None:
     return best
 
 
+def _build_debug_markers(debug: PlanDebug) -> MarkerArray:
+    """Pack the FaSTTUBe per-side sorted cones into a MarkerArray.
+
+    Three layers, all in `odom` frame:
+      - `left_chain`  blue line strip + spheres   — left_with_virtual
+      - `right_chain` yellow line strip + spheres — right_with_virtual
+      - DELETEALL leader so previous-frame markers don't accumulate
+        when the cone field shrinks (e.g. car drives past cones).
+
+    "with_virtual" is what the library *settled on* after cross-side
+    matching, not the raw sorted input. So virtually-matched cones (the
+    library's inference for missing-side cones) appear in the chain
+    too — useful when debugging a one-sided observation case.
+    """
+    arr = MarkerArray()
+
+    clear = Marker()
+    clear.action = Marker.DELETEALL
+    clear.header.frame_id = "odom"
+    arr.markers.append(clear)
+
+    for ns, color_rgba, idx, xy in (
+        ("left_chain",  (0.10, 0.45, 1.0, 0.9), 1, debug.left_with_virtual),
+        ("right_chain", (1.0, 0.95, 0.10, 0.9), 2, debug.right_with_virtual),
+    ):
+        if xy is None or xy.size == 0:
+            continue
+
+        line = Marker()
+        line.header.frame_id = "odom"
+        line.ns = ns
+        line.id = idx
+        line.type = Marker.LINE_STRIP
+        line.action = Marker.ADD
+        line.scale.x = 0.10
+        line.color.r, line.color.g, line.color.b, line.color.a = color_rgba
+        for x, y in xy:
+            p = Point()
+            p.x = float(x); p.y = float(y); p.z = 0.05
+            line.points.append(p)
+        arr.markers.append(line)
+
+        spheres = Marker()
+        spheres.header.frame_id = "odom"
+        spheres.ns = ns
+        spheres.id = idx + 10
+        spheres.type = Marker.SPHERE_LIST
+        spheres.action = Marker.ADD
+        spheres.scale.x = spheres.scale.y = spheres.scale.z = 0.30
+        spheres.color.r, spheres.color.g, spheres.color.b, spheres.color.a = color_rgba
+        for x, y in xy:
+            p = Point()
+            p.x = float(x); p.y = float(y); p.z = 0.10
+            spheres.points.append(p)
+        arr.markers.append(spheres)
+
+    return arr
+
+
 def _pose_stamped(x: float, y: float, yaw: float) -> PoseStamped:
     p = PoseStamped()
     p.header.frame_id = "odom"
@@ -111,6 +170,13 @@ class Plan_Path(Node):
         super().__init__("Plan_Path")
 
         self.publisher_path = self.create_publisher(Path, "Path", 10)
+        # Debug overlay (#254) — three layers in one MarkerArray showing
+        # FaSTTUBe's per-side sorted cones (with virtual cones for
+        # missing sides). Visualises whether the colour-blind sort is
+        # putting cones on the side a human would intuitively call
+        # left/right. Frame matches /Path (`odom`).
+        self.publisher_debug = self.create_publisher(
+            MarkerArray, "/path_planning/debug", 10)
         self.create_subscription(
             MarkerArray, "Conos", self._on_cones, 10)
 
@@ -215,9 +281,18 @@ class Plan_Path(Node):
             yaw=float(yaw),
         )
 
-        path_points = self._adapter.plan(cones, pose)
+        path_points, debug = self._adapter.plan(cones, pose)
 
-        # Tick capture: dump (cones, pose, n_path) for offline replay.
+        # Always publish the debug overlay (even when the path is empty —
+        # shows what cones FaSTTUBe assigned to each side, which is the
+        # most useful signal when the planner just gave up).
+        self.publisher_debug.publish(_build_debug_markers(debug))
+
+        # Tick capture: dump (cones, pose, path xy) for offline replay
+        # and path-vs-CSV-centerline analysis (#254). Path is dumped as
+        # a flat list of [x, y] pairs in `odom` frame so the offline
+        # tool can compute perpendicular distance to the loaded track
+        # CSV without re-running the planner.
         if self._capture_fh is not None:
             try:
                 self._capture_fh.write(json.dumps({
@@ -225,6 +300,7 @@ class Plan_Path(Node):
                     "pose": [pose.x, pose.y, pose.yaw],
                     "cones": [[c.x, c.y, int(c.color)] for c in cones],
                     "n_path": len(path_points),
+                    "path": [[p.x, p.y] for p in path_points],
                 }) + "\n")
                 self._capture_fh.flush()
             except Exception:
