@@ -1,26 +1,18 @@
-"""LiDAR cone detection — extract per-cone (x, y, height) tuples from a
-single ground-removed point cloud.
+"""LiDAR cone detection — extract per-cone (x, y, height, σ_xy) tuples
+from a single ground-removed point cloud.
 
 Public surface used by `cone_detection_node.py`:
     - final_cone_result_rt(data, model=DBSCAN, debug_counters=None)
-        → list[(x, y, height_m, sigma_xy)]; runs RANSAC ground-plane removal
-          (slam.ransac.ransac2), DBSCAN clustering, and per-cluster cone
-          fitting via two_phase_cone_detection.cone_fit_2params with a
-          centroid fallback for clusters that fail the fit gates.
+        Runs RANSAC ground-plane removal (cone_detection.ransac.ransac2),
+        DBSCAN clustering, and per-cluster cone fitting via
+        two_phase_cone_detection.cone_fit_2params with a centroid
+        fallback for clusters that fail the fit gates.
     - warmup_numba_functions()
-        → eager-compiles the Numba functions on the cone-fitting hot path
-          so the first real LiDAR scan doesn't pay the JIT cost.
+        Eager-compiles the Numba functions on the cone-fitting hot path
+        so the first real LiDAR scan doesn't pay the JIT cost.
 
-Internal helper (not imported elsewhere):
+Internal helper:
     - clustering_separation_rt — RANSAC + rotation correction + DBSCAN.
-
-PR-B (chore/pipeline-extract-benchmarks) deleted ~150 LOC of dev-only
-benchmark / profiling / visualization helpers (`profiling_cone_detection`,
-`solvers_benchmark`, `best_solver`, `benchmark_cone_detection`,
-`benchmark_process`, `compare_data_to_processed`, `rect2polars`, the
-`if __name__ == "__main__"` driver) along with their `cProfile`,
-`matplotlib`, and `timeit` imports. None were called from any production
-node or launch file. Git history preserves them.
 """
 
 import math
@@ -30,27 +22,28 @@ from sklearn.cluster import DBSCAN
 
 from cone_detection.ransac import ransac2
 from cone_detection.ground_removal import cone_model
-from cone_detection.rotaciones import vectors2matrix
+from cone_detection.rotations import vectors2matrix
 from cone_detection.two_phase_cone_detection import *  # noqa: F401, F403  (cone_fit_2params + helpers used by final_cone_result_rt)
 
 
 def final_cone_result_rt(data, model=DBSCAN, debug_counters=None):
-    """
-    Permite sacar los conos a partir de los datos del lidar. Version
-    para Real Time. Aplica RANSAC, Clustering y el ajuste de cono. Esta hecha
-    para solo hacer una medida del lidar de una vez
+    """Detect cones in a single LiDAR scan (real-time path).
+
+    Pipeline: RANSAC ground-plane removal → DBSCAN clustering → per-
+    cluster two-phase cone fit, with a cluster-centroid fallback when
+    the parametric fit lands outside the cone-shape envelope.
 
     Args:
-        data (np.ndarray): los datos del lidar
-        model (sklearn.model, optional): modelo de clustering empleado. Sirve una implementacion
-                                         propia si es una clase con metodo fit_transform. Defaults to DBSCAN.
-        debug_counters (dict, optional): if provided, gets populated with
-            per-filter-stage cluster counts for diagnostics. Keys:
-            n_input_points, n_clusters, after_min_pts, after_height_gate,
-            after_fit_or_centroid, accepted, far_dropped, fit_used, centroid_used.
+        data: (N, 3) array of LiDAR returns in the LiDAR frame.
+        model: clustering class with a sklearn-style `fit_predict` API.
+            Currently DBSCAN; passed in to keep the call site flexible.
+        debug_counters: optional dict; if provided, gets populated with
+            per-filter-stage cluster counts: n_input_points, n_clusters,
+            after_min_pts, after_height_gate, after_fit_or_centroid,
+            accepted, far_dropped, fit_used, centroid_used.
 
     Returns:
-        float, float: las posiciones x e y de la punta del cono (a y b de los parametros del cono)
+        list of (x, y, height_m, sigma_xy) — one per accepted cone.
     """
 
     if debug_counters is not None:
@@ -213,47 +206,41 @@ def final_cone_result_rt(data, model=DBSCAN, debug_counters=None):
 
 
 def clustering_separation_rt(data, model):
-    """
-    Realiza la separación en clusters mediante un modelo de clustering. Primero hace ransac
-    (se podría cambiar por cualquiera de las otras implementaciones), deshace las posibles rotaciones
-    de los datos por el movimiento del coche y despues hace el clustering. Pensada para RT
+    """Ground removal + rotation correction + clustering, single scan.
+
+    RANSAC fits the ground plane, the outliers (cone returns) are
+    rotated so the plane normal aligns with +z (cancels any pitch/roll
+    from the moving vehicle), and DBSCAN clusters them.
 
     Args:
-        data (str): ruta a los datos
-        model (sklearn_model): el modelo de clustering de sklearn. Podría usarse una implementación propia si
-                               se implementa como una clase con un metodo fit_predict que hace el ajuste y devuelve
-                               las predicciones
-
+        data: (N, 3) raw LiDAR returns.
+        model: clustering class — kept for API symmetry; the live path
+            always uses DBSCAN with the tuning below.
 
     Returns:
-        np.ndarray, np.ndarray, np.ndarray: las etiquetas para saber a que cluster pertenece cada cono,
-                                            los datos con la correccion de rotacion y los coeficientes
-                                            del plano sacado por ransac
+        (labels, rotated_outliers, plane_coefs) — DBSCAN per-point cluster
+        labels, the corresponding outlier points after rotation, and
+        the [bias, n_x, n_y, n_z] plane coefficients from RANSAC.
     """
     A = np.c_[np.ones(data.shape[0]), data]
     inliers, def_coefs = ransac2(A, prob=0.9999, threshold=0.05)
-    # COrreccion de rotacion (transformamos el vector normal al plano en un vector vertical, solo componente z)
+    # Rotate so the plane normal becomes +z; pitch/roll from car motion
+    # gets cancelled and downstream height gates work in a clean frame.
     k = np.zeros(data.shape[1])
     k[-1] = 1
-
     outliers = np.ones(data.shape[0], dtype=bool)
     outliers[inliers] = False
     data = (data @ vectors2matrix(k, def_coefs[1:] / np.linalg.norm(def_coefs[1:])))[
         outliers
     ]
-    # OTRAS OPCIONES DE MODELOS (por ahora he puesto DBSCAN)
-    # clust_model = model()
-    # clust_model = AgglomerativeClustering(
-    #     n_clusters=None,
-    #     linkage="ward",
-    #     compute_full_tree=True,
-    #     distance_threshold=0.5,
-    # )
     if len(data) == 0:
         return np.array([]), data, def_coefs
+    # DBSCAN tuning: eps=0.3 m matches a small FS cone's extent at
+    # close range; min_samples=2 is the floor for "real cluster vs
+    # single noisy return". Both are the empirical sweet spot for
+    # the Hesai ATX_S01 at our scan rates.
     clust_model = DBSCAN(eps=0.3, min_samples=2)
     labels = clust_model.fit_predict(data)
-
     return labels, data, def_coefs
 
 

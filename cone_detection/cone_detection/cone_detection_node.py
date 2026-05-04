@@ -1,47 +1,35 @@
+"""ROS 2 node wrapping cone_detection.final_cone_result_rt.
+
+Subscribes to /fsds/lidar/Lidar1 (sensor_msgs/PointCloud2) and
+publishes:
+  - /Conos_raw     — every detected cone (MarkerArray, base_link frame).
+                     marker.scale.x carries per-cone σ_xy for SLAM;
+                     marker.scale.z carries cluster height for the
+                     downstream big-orange-vs-small classifier.
+  - /Conos_Orange  — big-orange cones only, kept on a separate stream
+                     so the autonomous-stop control logic doesn't need
+                     to filter the full cone list.
+
+Held in its own ROS node (rather than fused into cone_graph_slam) so
+the Numba JIT compile happens once at startup and persists across
+SLAM/control restarts during dev.
 """
-========================
-slam.py (v1.0)
-========================
 
-Elaborado por Jaime Perez para el ISC
-Este nodo va separado del resto de slam para no cargar Numba para cada nodo
-
-Contiene tres nodos:
-1. Cone_Detection: Publica los resultados de final_cone_result_rt() este Nodo se puede mantener incendido y asi no hay que esperar
-    a que compile cada vez que hay que probar. Numba tarda en optimizar el codigo y es tedioso hacerlo cada vez que se quiere probar.
-"""
-
-import sys
-import os
-import time
 import numpy as np
-import cv2 as cv
-import math
 
 import rclpy
 from rclpy.node import Node
-
-from sensor_msgs.msg import PointCloud2
-from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import Odometry
-import sensor_msgs.msg as sensor_msgs
-import std_msgs.msg as std_msgs
-
-from visualization_msgs.msg import Marker
-from visualization_msgs.msg import MarkerArray
-
-from cone_detection.cone_detection import final_cone_result_rt, warmup_numba_functions
-
-from fs_msgs.msg import Track, Cone
-
-import cProfile, pstats, io
-
 from rclpy.qos import (
     QoSDurabilityPolicy,
     QoSHistoryPolicy,
     QoSProfile,
     QoSReliabilityPolicy,
 )
+
+from sensor_msgs.msg import PointCloud2
+from visualization_msgs.msg import Marker, MarkerArray
+
+from cone_detection.cone_detection import final_cone_result_rt, warmup_numba_functions
 
 QOS_LATEST = QoSProfile(
     reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -52,9 +40,7 @@ QOS_LATEST = QoSProfile(
 
 
 class Cone_Detection(Node):
-    """Publica los resultados de final_cone_result_rt() este Nodo se puede mantener encendido y asi no hay que esperar
-    a que compile cada vez que hay que probar
-    """
+    """Publishes per-scan cone observations from final_cone_result_rt."""
 
     # Cluster-height threshold separating big-orange cones (505 mm tall per
     # DS Table 1) from small blue/yellow/orange cones (325 mm). Live-measured
@@ -69,7 +55,6 @@ class Cone_Detection(Node):
 
     def __init__(self):
         super().__init__("Cone_Detection")
-        # Publicar
         self.publisher_MarkerArray = self.create_publisher(MarkerArray, "Conos_raw", 10)
         # Dedicated stream of big-orange cones (the FS finish-line markers).
         # Kept separate from /Conos_raw so SLAM's blue/yellow classifier
@@ -77,13 +62,12 @@ class Cone_Detection(Node):
         # (autonomous-stop logic in the control node) can subscribe without
         # filtering the whole cone list. Positions are in the car frame.
         self.publisher_Orange = self.create_publisher(MarkerArray, "Conos_Orange", 10)
-        # Subscribir
         self.subscription = self.create_subscription(
             PointCloud2, "/fsds/lidar/Lidar1", self.listener_callback, QOS_LATEST
         )
         warmup_numba_functions()
 
-        self.n_conos = 0
+        self.n_cones = 0
         # Per-second diagnostic accumulator for the cluster-filter pipeline.
         # Each LiDAR scan populates per-stage cluster counts via
         # final_cone_result_rt(debug_counters=...); we sum across scans and
@@ -100,14 +84,16 @@ class Cone_Detection(Node):
         raw = np.frombuffer(msg.data, dtype=np.float32).reshape(num_points, floats_per_point)
         point_cloud = raw[:, :3]  # take only x, y, z
 
-        conos = []
+        cones = []
         per_scan_diag = {}
-        try:  ###A veces da error de division por cero. El try: es para evitar que crashe
-            conos = final_cone_result_rt(point_cloud, debug_counters=per_scan_diag)
-        except Exception as e:
+        # final_cone_result_rt has been observed to occasionally throw a
+        # ZeroDivisionError on degenerate clusters; swallow and log so a
+        # single bad scan doesn't take down the node.
+        try:
+            cones = final_cone_result_rt(point_cloud, debug_counters=per_scan_diag)
+        except Exception:
             import traceback
             self.get_logger().error(traceback.format_exc())
-            pass
 
         # Pre-compute per-side tallies for the diagnostic. Cone_Detection
         # doesn't itself colour-classify (SLAM does that downstream), but
@@ -116,7 +102,7 @@ class Cone_Detection(Node):
         # accepted cone." Used to determine whether a cone-imbalance in
         # the SLAM map (#189) starts here in detection or downstream.
         n_left = n_right = n_centerline = n_bigorange = 0
-        for entry in conos:
+        for entry in cones:
             b = float(entry[1])  # body-y; +Y = left in REP-103
             h = float(entry[2]) if len(entry) >= 3 else 0.0
             if h > self.BIG_ORANGE_HEIGHT_THRESHOLD_M:
@@ -159,14 +145,12 @@ class Cone_Detection(Node):
             self._diag = {}
             self._diag_n_scans = 0
             self._diag_last_log_ns = now_ns
-        self.get_logger().debug(str(len(conos)))
+        self.get_logger().debug(str(len(cones)))
         markerArray = MarkerArray()
-
-        ###Aprovechar el metodo MarkerArray() para mandar resultados de final_cone_result_rt()
         orangeArray = MarkerArray()
         i = 0
         orange_i = 0
-        for entry in conos:
+        for entry in cones:
             # Backward compat: legacy shapes were (x, y) and (x, y, height);
             # current shape is (x, y, height, sigma_xy).
             a = float(entry[0])
@@ -184,16 +168,13 @@ class Cone_Detection(Node):
             marker.pose.position.y = b
             marker.pose.position.z = 0.0
 
-            ###Hacer compatible con RVIZ####
-            marker.header.frame_id = "base_link"  ##El mapa esta en el sistema de referencia Odom no el coche
+            # /Conos_raw is published in the body frame; SLAM transforms
+            # to the world frame downstream.
+            marker.header.frame_id = "base_link"
             marker.type = marker.CUBE
-            if (
-                i == 0
-            ):  ##En el pimer elemeto se le dice a RVIZ que elimine los registros. Mas info en Wiki RVIZ MarkerArray
-                marker.action = 3  # ELIMINAR TODO 3
-            else:
-                marker.action = marker.ADD  # Añadir marcardo
-
+            # First marker in the array clears whatever RViz/Foxglove
+            # was holding from the previous scan (DELETEALL = 3).
+            marker.action = 3 if i == 0 else marker.ADD
             marker.header.stamp = msg.header.stamp
             # marker.scale carries per-cone measurement metadata for
             # downstream SLAM, layered on top of the visualization-size
@@ -216,8 +197,6 @@ class Cone_Detection(Node):
             marker.pose.orientation.w = 1.0
             marker.id = i
             i += 1
-            ###Hacer compatible con RVIZ####
-
             markerArray.markers.append(marker)
 
             if is_big_orange:
@@ -251,13 +230,8 @@ class Cone_Detection(Node):
         self.publisher_Orange.publish(orangeArray)
 
 
-"""
-Llamadas a Objetos para ROS2
-"""
-
-
 def cone_detection(args=None):
+    """Entry point: spin Cone_Detection until SIGINT."""
     rclpy.init(args=args)
-
     cone = Cone_Detection()
     rclpy.spin(cone)
