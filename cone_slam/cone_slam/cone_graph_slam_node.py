@@ -471,25 +471,47 @@ class ConeGraphSlamNode(Node):
         # observed on trackA_manual_001602 around t≈80 s is: a single
         # scan flips DA from "steady, mostly-associated" to "mostly
         # new" (e.g., obs=8 new=6 assoc=2). The optimizer then jumps
-        # pose ~17 m to accommodate the falsely-new landmarks and the
-        # graph never recovers. Detection: if the new-rate suddenly
-        # spikes when (a) we have ≥5 observations to be statistically
+        # pose to accommodate the falsely-new landmarks and the graph
+        # never recovers. Detection: if the new-rate suddenly spikes
+        # when (a) we have ≥5 observations to be statistically
         # meaningful, (b) we're past the early-discovery phase
         # (step > 30, so most cones in the local map are mature),
         # (c) >60 % of obs are flagged new — the predicted pose is
-        # likely wrong and committing the staged factors will corrupt
-        # the graph. Drop the IMU factor too and re-try on the next
-        # scan from the same prev pose.
+        # likely wrong and committing the cone factors would corrupt
+        # the graph.
+        #
+        # Recovery (#273): commit the IMU factor only, skip the cone
+        # factors. Earlier behaviour discarded EVERYTHING (the IMU
+        # factor too) and returned, freezing the graph at the prev
+        # committed pose. While the car physically moved during the
+        # skipped scans, the predicted pose for the next scan stayed
+        # stale — so when DA recovered, observed cones were all far
+        # from their landmarks (even further apart than the real drift
+        # the IMU would have indicated), producing yet more "all-new"
+        # scans, more skips, more drift. By committing the IMU we keep
+        # pose dead-reckoning during the skipped window; drift over a
+        # few hundred ms of IMU-only update is much smaller than over
+        # the same window of pose-freeze.
         n_new_pre  = sum(1 for m in matches if m.landmark_id == -1)
         total_pre  = len(matches)
         if (total_pre >= 5
                 and self._graph.step > 30
                 and n_new_pre > int(0.60 * total_pre)):
             self.get_logger().warn(
-                f"skip scan: DA-failure spike "
+                f"skip cone factors: DA-failure spike "
                 f"(obs={total_pre} new={n_new_pre} "
-                f"assoc={total_pre - n_new_pre}) — pose-jump rejected")
-            self._graph.discard_staged()
+                f"assoc={total_pre - n_new_pre}) — IMU-only update")
+            # Commit the staged IMU factor + bias-RW factor (the only
+            # things staged at this point — cone factors are staged
+            # only after this check). iSAM2 advances pose by IMU
+            # prediction; no cone constraints applied this scan.
+            result = self._graph.commit()
+            self._latest_result = result
+            self._preint.update_bias(result.bias)
+            self._db.update_from_estimate(self._graph.landmark_position)
+            self._publish_tf(stamp, result)
+            self._publish_state(stamp, result)
+            self._publish_cone_map(stamp)
             per_scan["skipped"] = 1
             self._accumulate_obs_diag(per_scan)
             return
