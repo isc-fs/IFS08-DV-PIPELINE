@@ -70,6 +70,19 @@ _COLOR_TO_CONETYPE = {
 # behind-the-car cones that the planner has no use for.
 _CULL_RANGE_M = 25.0
 
+# Maximum path arc-length we publish on /Path (#260). FaSTTUBe extrapolates
+# missing-side cones via cross-side matching when only one side is
+# observed; on tight turns (one-sided LiDAR observation typical at corner
+# exits) the extrapolation can run 30+ m past actual cone returns. The
+# tail of the path is then geometrically unsupported — the controller's
+# Pure Pursuit lookahead can land in that extrapolated region. Capping
+# the published path at 12 m of arc length keeps the controller looking
+# only at well-supported geometry. 12 m comfortably exceeds Pure
+# Pursuit's adaptive Ld at any speed we'd reach at FS-Driverless events
+# (Ld ≤ 8 m for the lookahead_max default), so the controller is never
+# starved.
+_MAX_PATH_ARC_M = 12.0
+
 
 @dataclass
 class PlanDebug:
@@ -184,10 +197,23 @@ class FasttubeAdapter:
         if path is None or path.size == 0:
             return [], debug
 
-        # path is (M, 4) with columns (s, x, y, curvature). We only need
-        # x, y — yaw recomputed below, curvature is dropped (controller
-        # builds its own from the lookahead point).
-        xy = np.asarray(path[:, 1:3], dtype=np.float64)
+        # path is (M, 4) with columns (s, x, y, curvature). Cap the arc
+        # length we publish so the controller never chases the
+        # virtually-extrapolated tail (#260). `s` is monotonically
+        # increasing from 0 at the path's first point, so we just slice
+        # to the prefix where s ≤ _MAX_PATH_ARC_M.
+        s = np.asarray(path[:, 0], dtype=np.float64)
+        within_cap = s <= _MAX_PATH_ARC_M
+        # Always keep at least 2 points so the controller has a tangent.
+        # On a degenerate path that's all virtual past 0 m, this still
+        # gives Pure Pursuit something to chase rather than zero-out
+        # steering.
+        n_kept = int(np.sum(within_cap))
+        if n_kept < 2:
+            n_kept = min(2, path.shape[0])
+            within_cap = np.zeros_like(within_cap)
+            within_cap[:n_kept] = True
+        xy = np.asarray(path[within_cap, 1:3], dtype=np.float64)
         if xy.shape[0] < 2:
             return [], debug
         return _xy_to_path_points(xy), debug

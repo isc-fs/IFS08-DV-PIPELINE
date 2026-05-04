@@ -22,9 +22,10 @@ from path_planning.fasttube_adapter import (
     FasttubeAdapter,
     PlanDebug,
     _COLOR_TO_CONETYPE,
+    _CULL_RANGE_M,
+    _MAX_PATH_ARC_M,
     _NUM_CONE_TYPES,
     _cull_cones,
-    _CULL_RANGE_M,
 )
 from path_planning.core_types import Cone, ConeColor, Pose2D
 
@@ -229,3 +230,35 @@ def test_cull_respects_pose_yaw() -> None:
     out = _cull_cones(cones, pose, _CULL_RANGE_M)
     assert len(out) == 1
     assert out[0].y == pytest.approx(5.0)
+
+
+# --- Path forward-distance cap (#260) ---------------------------------------
+
+
+def test_path_arc_length_capped() -> None:
+    """A long straight track produces a long FaSTTUBe path; we should
+    only publish up to _MAX_PATH_ARC_M of arc length so the controller
+    never sees the virtually-extrapolated tail."""
+    adapter = FasttubeAdapter()
+    # 30 cone pairs along world-x at 3 m spacing → ~90 m of corridor;
+    # FaSTTUBe will produce a path much longer than _MAX_PATH_ARC_M.
+    cones = _straight_track(n_pairs=30, spacing=3.0)
+    path, _ = adapter.plan(cones, _car_at_origin())
+
+    assert len(path) >= 2
+    # Arc length of the published path = sum of segment lengths.
+    arc = 0.0
+    for i in range(1, len(path)):
+        dx = path[i].x - path[i - 1].x
+        dy = path[i].y - path[i - 1].y
+        arc += math.hypot(dx, dy)
+    # Allow a small overshoot — the cap is on the s column of the (M, 4)
+    # array; the slice keeps points whose s ≤ cap, so the *last kept*
+    # point can sit slightly under the cap and the published arc-length
+    # equals the cap value at that point. We assert a hard upper bound
+    # of 1.5× the cap as a sanity check (any much higher implies the
+    # cap isn't being applied at all).
+    assert arc <= _MAX_PATH_ARC_M * 1.5, (
+        f"path arc {arc:.2f}m should be capped near {_MAX_PATH_ARC_M}m, "
+        f"got 50%+ over"
+    )
