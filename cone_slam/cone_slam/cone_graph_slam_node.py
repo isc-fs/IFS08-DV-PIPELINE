@@ -51,7 +51,8 @@ from std_msgs.msg import Float32
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 from visualization_msgs.msg import Marker, MarkerArray
 
-from cone_slam.color_classifier import ConeColor, classify
+# color_classifier deleted: SLAM is position-only, no per-cone colour
+# anywhere. Visualization renders all landmarks with the same colour.
 from cone_slam.data_association import DISTANCE_GATE_M, Observation, associate
 from cone_slam.factor_graph import FactorGraph, ScanResult
 from cone_slam.imu_preintegrator import ImuPreintegrator, ImuSample
@@ -410,38 +411,13 @@ class ConeGraphSlamNode(Node):
                     predicted_yaw=_pred_yaw,
                 )
 
-        # Parse cone observations + classify color per cone.
+        # Parse cone observations from /Conos_raw markers.
         observations = self._observations_from_markers(msg)
 
-        # Drop ORANGE / BIG_ORANGE observations entirely. Rationale:
-        #   - Orange cones are only used downstream for start/finish-line
-        #     detection by control_node, which subscribes directly to
-        #     cone_detection's `/Conos_Orange` stream — it does NOT depend
-        #     on the SLAM map for big-orange identity.
-        #   - The path planner doesn't need them either: oranges had been
-        #     mapped to FaSTTUBe's UNKNOWN slot, contributing nothing
-        #     useful to either side chain.
-        #   - The SLAM-side colour classifier flickers on cones near the
-        #     yellow/orange centre band. With orange landmarks in the map,
-        #     a single cone alternately tagged YELLOW and ORANGE across
-        #     scans creates two co-located landmarks (different colour
-        #     buckets in DA can't merge them), poisoning the planner with
-        #     half-density per side. Observed live in test_submodule.
-        # Filtering at the source eliminates the duplication, keeps the
-        # colour-gated DA as-is (no risk of cross-colour wrong matches in
-        # cluster regions), and we lose nothing we currently rely on. If
-        # we later need orange in SLAM (lap counting, skidpad), revisit.
-        observations = [o for o in observations
-                        if o.color not in (ConeColor.ORANGE,
-                                           ConeColor.BIG_ORANGE)]
-
-        # Per-scan obs-by-colour tally for the SLAM_OBS diagnostic.
-        per_scan = {f"obs_{c.name.lower()}": 0
-                    for c in (ConeColor.YELLOW, ConeColor.BLUE,
-                              ConeColor.ORANGE, ConeColor.BIG_ORANGE)}
-        for o in observations:
-            per_scan[f"obs_{o.color.name.lower()}"] += 1
-        per_scan["obs_total"] = len(observations)
+        # Per-scan obs tally for the SLAM_OBS diagnostic. No colour
+        # breakdown anymore — the body_y classifier is gone, every
+        # cone is just a position.
+        per_scan = {"obs_total": len(observations)}
 
         # Run data association against the predicted body-frame position
         # of every existing landmark, using the iSAM2-predicted pose
@@ -540,13 +516,11 @@ class ConeGraphSlamNode(Node):
             if m.landmark_id == -1:
                 world_xyz = self._body_to_world(
                     o.body_x, o.body_y, pred_x, pred_y, pred_yaw)
-                lm = self._db.create(o.color, world_xyz, self._graph.step)
+                lm = self._db.create(world_xyz, self._graph.step)
                 self._graph.stage_new_landmark(lm.id, world_xyz)
                 self._graph.stage_cone_observation(
                     lm.id, o.body_x, o.body_y, o.sigma_xy)
                 n_new += 1
-                per_scan[f"new_{o.color.name.lower()}"] = (
-                    per_scan.get(f"new_{o.color.name.lower()}", 0) + 1)
                 if self._lm_capture_fh is not None:
                     try:
                         import math as _math, json as _json
@@ -561,7 +535,6 @@ class ConeGraphSlamNode(Node):
                             "range_m": rng,
                             "bearing_deg": bearing_deg,
                             "height": o.height,
-                            "color": int(o.color),
                             "pose_yaw_deg": _math.degrees(pred_yaw),
                             "world_xyz": [float(world_xyz[0]),
                                           float(world_xyz[1]),
@@ -575,8 +548,8 @@ class ConeGraphSlamNode(Node):
                 self._graph.stage_cone_observation(
                     m.landmark_id, o.body_x, o.body_y, o.sigma_xy)
                 n_assoc += 1
-                per_scan[f"assoc_{o.color.name.lower()}"] = (
-                    per_scan.get(f"assoc_{o.color.name.lower()}", 0) + 1)
+        per_scan["new"] = n_new
+        per_scan["assoc"] = n_assoc
 
         self._accumulate_obs_diag(per_scan)
 
@@ -653,8 +626,7 @@ class ConeGraphSlamNode(Node):
     def _accumulate_obs_diag(self, per_scan: dict) -> None:
         """Accumulate per-scan obs/assoc/new counters and emit a
         per-second SLAM_OBS log line. Compares observations entering
-        SLAM (after colour classification) with what survives data
-        association — i.e., shows whether SLAM is dropping a colour."""
+        SLAM with what survives data association."""
         for k, v in per_scan.items():
             self._obs_diag[k] = self._obs_diag.get(k, 0) + v
         self._obs_n_scans += 1
@@ -673,14 +645,8 @@ class ConeGraphSlamNode(Node):
         self.get_logger().info(
             f"SLAM_OBS (avg/scan over {n}): "
             f"obs={_avg('obs_total'):4.1f} "
-            f"(B={_avg('obs_blue'):3.1f} Y={_avg('obs_yellow'):3.1f} "
-            f"O={_avg('obs_orange'):3.1f} BO={_avg('obs_big_orange'):3.1f}) "
-            f"assoc={_avg('assoc_blue')+_avg('assoc_yellow')+_avg('assoc_orange')+_avg('assoc_big_orange'):4.1f} "
-            f"(B={_avg('assoc_blue'):3.1f} Y={_avg('assoc_yellow'):3.1f} "
-            f"O={_avg('assoc_orange'):3.1f} BO={_avg('assoc_big_orange'):3.1f}) "
-            f"new={_avg('new_blue')+_avg('new_yellow')+_avg('new_orange')+_avg('new_big_orange'):3.1f} "
-            f"(B={_avg('new_blue'):3.1f} Y={_avg('new_yellow'):3.1f} "
-            f"O={_avg('new_orange'):3.1f} BO={_avg('new_big_orange'):3.1f}) "
+            f"assoc={_avg('assoc'):4.1f} "
+            f"new={_avg('new'):3.1f} "
             f"skip={_avg('skipped'):.1f}"
         )
         self._obs_diag = {}
@@ -720,9 +686,7 @@ class ConeGraphSlamNode(Node):
             # back to its range-only formula for backward compat.
             sigma_xy = m.scale.x if (m.scale.x > 0.0 and m.scale.x != 0.1) else -1.0
             out.append(Observation(
-                body_x=x, body_y=y, height=height,
-                color=classify(y, height),
-                sigma_xy=sigma_xy,
+                body_x=x, body_y=y, height=height, sigma_xy=sigma_xy,
             ))
         return out
 
@@ -875,15 +839,14 @@ class ConeGraphSlamNode(Node):
         delete_all.action = Marker.DELETEALL
         out.markers.append(delete_all)
 
-        rgb_by_color = {
-            ConeColor.YELLOW: (1.0, 1.0, 0.0),
-            ConeColor.BLUE: (0.0, 0.4, 1.0),
-            ConeColor.ORANGE: (1.0, 0.5, 0.0),
-            ConeColor.BIG_ORANGE: (1.0, 0.3, 0.0),
-        }
-
+        # Single neutral colour for every landmark — SLAM has no
+        # per-cone colour anymore. Yellow for visibility on dark
+        # backgrounds; the path planner ignores the colour anyway and
+        # routes everything through ConeTypes.UNKNOWN (#268). The
+        # per-cone marker.id still encodes the persistent landmark id
+        # so downstream consumers (path_planning) can identify cones
+        # across scans.
         for lm in self._db:
-            r, g, b = rgb_by_color[lm.color]
             m = Marker()
             m.header.stamp = stamp
             m.header.frame_id = self.odom_frame
@@ -896,10 +859,10 @@ class ConeGraphSlamNode(Node):
             m.pose.orientation.w = 1.0
             m.scale.x = 0.2
             m.scale.y = 0.2
-            m.scale.z = 0.5 if lm.color == ConeColor.BIG_ORANGE else 0.3
-            m.color.r = float(r)
-            m.color.g = float(g)
-            m.color.b = float(b)
+            m.scale.z = 0.3
+            m.color.r = 1.0
+            m.color.g = 1.0
+            m.color.b = 0.0
             m.color.a = 1.0
             out.markers.append(m)
 
