@@ -38,9 +38,14 @@ class Pose2D:
 
 @dataclass(frozen=True)
 class PathPoint:
-    x: float          # world frame
-    y: float          # world frame
-    yaw: float        # radians, tangent direction
+    x: float           # world frame
+    y: float           # world frame
+    yaw: float         # radians, tangent direction
+    # Signed curvature (1/m) at this path point. Positive = left turn,
+    # negative = right turn, 0 on straights. Sourced from FaSTTUBe's
+    # analytical B-spline curvature when available; controller-side
+    # finite-difference fallback when not.
+    curvature: float = 0.0
 
 
 def world_to_body(pts_xy: np.ndarray, pose: Pose2D) -> np.ndarray:

@@ -214,9 +214,15 @@ class FasttubeAdapter:
             within_cap = np.zeros_like(within_cap)
             within_cap[:n_kept] = True
         xy = np.asarray(path[within_cap, 1:3], dtype=np.float64)
+        # Curvature is the 4th column. FaSTTUBe computes it analytically
+        # from the path B-spline, which is much smoother than the
+        # finite-difference recompute the controller would do otherwise.
+        # We pass it through so the longitudinal controller can see
+        # corners earlier and more reliably.
+        kappa = np.asarray(path[within_cap, 3], dtype=np.float64)
         if xy.shape[0] < 2:
             return [], debug
-        return _xy_to_path_points(xy), debug
+        return _xy_to_path_points(xy, kappa), debug
 
     @staticmethod
     def _cones_to_arrays(cones: List[Cone]) -> List[np.ndarray]:
@@ -266,8 +272,16 @@ def _cull_cones(cones: List[Cone], pose: Pose2D, max_range_m: float) -> List[Con
     return out
 
 
-def _xy_to_path_points(xy: np.ndarray) -> List[PathPoint]:
-    """Convert (M, 2) world-frame samples to PathPoint with finite-difference yaw."""
+def _xy_to_path_points(xy: np.ndarray,
+                       kappa: Optional[np.ndarray] = None) -> List[PathPoint]:
+    """Convert (M, 2) world-frame samples + optional κ to PathPoints.
+
+    Yaw is recomputed from finite differences (FaSTTUBe outputs include
+    yaw implicitly via consecutive xy, no need to pass it through).
+    Curvature comes through verbatim from the library when provided;
+    defaults to 0 otherwise (the controller will fall back to its own
+    finite-difference computation if every PathPoint reads κ=0).
+    """
     n = xy.shape[0]
     out: List[PathPoint] = []
     for i in range(n):
@@ -280,5 +294,7 @@ def _xy_to_path_points(xy: np.ndarray) -> List[PathPoint]:
             dx = xy[i, 0] - xy[i - 1, 0]
             dy = xy[i, 1] - xy[i - 1, 1]
         yaw = float(np.arctan2(dy, dx))
-        out.append(PathPoint(x=float(xy[i, 0]), y=float(xy[i, 1]), yaw=yaw))
+        k = float(kappa[i]) if kappa is not None else 0.0
+        out.append(PathPoint(x=float(xy[i, 0]), y=float(xy[i, 1]),
+                             yaw=yaw, curvature=k))
     return out

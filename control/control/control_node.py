@@ -55,6 +55,12 @@ class ControlNode(Node):
         self._latest_odom: Optional[Odometry] = None
         self._latest_path_xs: list[float] = []
         self._latest_path_ys: list[float] = []
+        # Per-pose curvature from path_planning, smuggled through
+        # `pose.position.z` (FaSTTUBe analytical κ; see path_planning's
+        # _pose_stamped). Empty when no path has arrived yet; the
+        # ReferenceTrajectory builder falls back to its own finite-
+        # difference κ when this list is empty or all-zero.
+        self._latest_path_kappas: list[float] = []
         # Big-orange forward distances (base_link frame) — captured at the
         # tick when the gate is first detected, then frozen as a stop anchor
         # in odom frame (see _on_orange / _stop_distance).
@@ -120,9 +126,23 @@ class ControlNode(Node):
         # Tunables — passed to the strategy constructors. Keep flat: each
         # strategy reads what it needs, ignores the rest.
         self.declare_parameter("v_max", 3.0)  # tuning experiment — completable-lap baseline
-        self.declare_parameter("a_lat_max", 6.0)
+        # a_lat_max governs corner braking: v_corner = sqrt(R · a_lat_max).
+        # 6.0 m/s² (~0.6 g lateral) was the original default — fine for
+        # a real FS car on slicks, too generous for the IFS-08 sim's
+        # tire envelope. With a_lat_max=6 and v_max=3, even a 1.5 m
+        # radius hairpin yields v_corner ≥ v_max → setpoint never drops
+        # → controller carries v_max into the apex and goes off (#260
+        # follow-up). Dropped to 3.0 m/s² (~0.3 g): v_corner < v_max
+        # whenever R < 3 m, so any FS-style hairpin actually triggers
+        # a setpoint drop. Tune up later once tire physics is known.
+        self.declare_parameter("a_lat_max", 3.0)
         self.declare_parameter("a_dec_max", 4.0)
-        self.declare_parameter("lookahead_min", 1.5)
+        # Lowered 1.5 → 1.0 to widen the band where the β·R radius cap
+        # (in pure_pursuit.py) can actually bind. Previous default left
+        # hairpins between R ≈ 1.4 and 2.1 m unguarded — the cap was
+        # silently re-floored back to L_min and Pure Pursuit overshot
+        # the apex (test_submodule first hairpin, #260 follow-up).
+        self.declare_parameter("lookahead_min", 1.0)
         self.declare_parameter("lookahead_k", 0.5)
         self.declare_parameter("kp_v", 0.5)
         self.declare_parameter("ki_v", 0.05)
@@ -176,6 +196,10 @@ class ControlNode(Node):
     def _on_path(self, msg: Path) -> None:
         self._latest_path_xs = [p.pose.position.x for p in msg.poses]
         self._latest_path_ys = [p.pose.position.y for p in msg.poses]
+        # Side-channel: pose.position.z carries the planner's per-pose
+        # curvature (FaSTTUBe analytical κ). See path_planning's
+        # _pose_stamped for the encoding rationale.
+        self._latest_path_kappas = [p.pose.position.z for p in msg.poses]
 
     def _on_orange(self, msg: MarkerArray) -> None:
         """Latch a stop anchor on the first tick we see ≥2 big-orange cones,
@@ -246,7 +270,10 @@ class ControlNode(Node):
         cmd.brake = 0.0
 
         state = self._build_state()
-        ref = ReferenceTrajectory.from_xy(self._latest_path_xs, self._latest_path_ys)
+        ref = ReferenceTrajectory.from_xy(
+            self._latest_path_xs, self._latest_path_ys,
+            kappa=self._latest_path_kappas or None,
+        )
 
         if state is None or ref.empty:
             self._cmd_pub.publish(cmd)

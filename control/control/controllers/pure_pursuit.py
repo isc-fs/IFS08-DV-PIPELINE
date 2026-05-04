@@ -11,14 +11,15 @@ Curvature of the chasing arc:
 
 where α is the angle from the vehicle heading to the target point.
 
-Adaptive lookahead: Ld = clamp(L_min + k·v, L_min, min(L_max, β·R_local)).
-Constant L_min floors it at low speed (lookahead never collapses to zero),
-velocity term stretches it on straights, and the β·R_local cap keeps it
-below the local turn radius — Pure Pursuit's chase target must land *inside*
-the curve, not past the apex on the next straight (#260). β ≈ 0.7 is the
-standard Pure Pursuit rule of thumb. R_local = 1 / max|κ| over the next
-lookahead window of the path; we read κ from `ref.curvature` rather than
-recomputing.
+Adaptive lookahead: Ld = min(L_max, L_min + k·v) capped above by β·R_local
+on curves, and floored at a small absolute minimum (0.5 m) so the chase
+target never collapses onto the car. The L_min term is the *low-speed*
+floor on straights — it intentionally does not reapply after the radius
+cap, because on a hairpin tighter than L_min/β the radius cap is the only
+thing keeping the chase target inside the curve. β ≈ 0.7 is the standard
+Pure Pursuit rule of thumb (Coulter '92 §4; AMZ / MIT FSAE references).
+R_local = 1 / max|κ| over the next lookahead window of the path; we read
+κ from `ref.curvature` rather than recomputing. (#260)
 
 Why Pure Pursuit (vs Stanley) for FS:
   - Stable at v→0 (no `softening_gain` denominator hack)
@@ -40,7 +41,7 @@ from control.models.bicycle import KinematicBicycle
 
 class PurePursuit(LateralController):
     def __init__(self,
-                 lookahead_min: float = 1.5,
+                 lookahead_min: float = 1.0,
                  lookahead_k: float = 0.5,
                  lookahead_max: float = 8.0,
                  # Pure Pursuit theory: chase target must land inside the
@@ -81,10 +82,15 @@ class PurePursuit(LateralController):
         if kappa_max > 1e-3:
             radius_cap = self.lookahead_radius_factor / kappa_max
             Ld = min(Ld, radius_cap)
-            # And re-floor at L_min — even on a hairpin we must look
-            # at least L_min ahead, otherwise Pure Pursuit destabilises
-            # at low speed (the chase target collapses onto the car).
-            Ld = max(Ld, self.lookahead_min)
+            # Hard absolute floor — keep Ld off zero so the chase target
+            # never collapses onto the car, but DO NOT re-floor at
+            # lookahead_min: on hairpins tighter than L_min/β the radius
+            # cap is the only thing keeping the chase target inside the
+            # curve, and refloor would defeat that. test_submodule's
+            # first hairpin has R ≈ 2 m, β·R = 1.4 m; with the previous
+            # L_min=1.5 m refloor the cap was silently lost and Pure
+            # Pursuit overshot the apex. (#260 follow-up)
+            Ld = max(Ld, 0.5)
 
         # Anchor to where we are on the path. Reuse the nearest-index
         # we computed for the radius cap above.

@@ -47,7 +47,7 @@ _DT = 1.0 / 40.0
 class PIVelocity(LongitudinalController):
     def __init__(self,
                  v_max: float = 12.0,
-                 a_lat_max: float = 6.0,
+                 a_lat_max: float = 3.0,
                  a_dec_max: float = 4.0,
                  kp: float = 0.5,
                  ki: float = 0.05,
@@ -125,18 +125,21 @@ class PIVelocity(LongitudinalController):
         return max(0.0, min(self.v_max, v_corner, v_stop))
 
     def _max_curvature_ahead(self, state: VehicleState, ref: ReferenceTrajectory) -> float:
-        """Maximum |κ| within `current_speed × horizon_s` arc length ahead of
-        the car's nearest point on the path. Falls back to a 5 m window at
-        low speed so we still see corners when v ≈ 0."""
+        """Maximum |κ| ahead of the car's nearest point, over the entire
+        path.
+
+        Originally windowed by `current_speed × horizon_s`, but with the
+        path-output cap from PR #261 (12 m of arc length), the corner
+        can't physically be further than the path is long. Scanning the
+        full forward portion catches corners early — including hairpins
+        whose curvature is concentrated at one or two points along an
+        otherwise-straight approach (#260 follow-up).
+        """
         if not ref.curvature:
             return 0.0
         nearest = _nearest_index(state.x, state.y, ref.x, ref.y)
-        s_anchor = ref.s[nearest]
-        window = max(5.0, state.speed * self.lookahead_curvature_s)
         kmax = 0.0
-        for i in range(nearest, len(ref.s)):
-            if ref.s[i] - s_anchor > window:
-                break
+        for i in range(nearest, len(ref.curvature)):
             k = abs(ref.curvature[i])
             if k > kmax:
                 kmax = k

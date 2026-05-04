@@ -126,17 +126,17 @@ def test_lookahead_capped_on_tight_curve() -> None:
     )
 
 
-def test_lookahead_floors_at_lmin_on_extreme_curves() -> None:
-    """A 1 m radius bend would push Ld → 0.7 m, below L_min=1.5. The
-    floor must keep it at 1.5 — Pure Pursuit destabilises if the chase
-    target collapses to the car."""
-    pp = PurePursuit(lookahead_min=1.5, lookahead_k=0.5, lookahead_max=8.0,
+def test_lookahead_stable_on_extreme_curves() -> None:
+    """A 1 m radius bend pushes the radius cap to β·R = 0.7 m, below
+    L_min. The radius cap wins (no L_min refloor) so Pure Pursuit can
+    actually steer inside the curve; only the absolute 0.5 m hard floor
+    keeps the chase target off the car. Output must stay finite and
+    non-trivially steered."""
+    pp = PurePursuit(lookahead_min=1.0, lookahead_k=0.5, lookahead_max=8.0,
                      lookahead_radius_factor=0.7)
     ref = _circular_path(radius_m=1.0)
-    # Just check it doesn't blow up / NaN.
     steer = pp.compute(_state_at_origin(speed=5.0), ref)
     assert math.isfinite(steer)
-    # Output should be saturated-ish (deep into the steering range).
     assert abs(steer) > 0.1
 
 
