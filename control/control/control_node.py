@@ -29,7 +29,7 @@ from rclpy.time import Time
 
 from fs_msgs.msg import ControlCommand
 from nav_msgs.msg import Odometry, Path
-from std_msgs.msg import Empty
+from std_msgs.msg import Empty, Float32
 from visualization_msgs.msg import MarkerArray
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -87,6 +87,16 @@ class ControlNode(Node):
         self._ebs_reset_pub.publish(Empty())
         self._ebs_reset_retries = 4
         self._ebs_reset_timer = self.create_timer(0.5, self._republish_ebs_reset)
+
+        # Diagnostic publishers (#260 follow-up). v_set tracks the
+        # longitudinal controller's setpoint each tick; kappa_max
+        # exposes the local curvature it's reacting to. Plotted
+        # alongside SLAM v in slam_debug.json — if v_set doesn't drop
+        # going into a corner, the velocity profile isn't being honoured
+        # and that's why the car carries too much speed into the apex.
+        self._v_set_pub = self.create_publisher(Float32, "/control/v_set_mps", 10)
+        self._kappa_max_pub = self.create_publisher(
+            Float32, "/control/kappa_max_per_m", 10)
 
         # Subscribers
         self.create_subscription(Path, "Path", self._on_path, 10)
@@ -276,6 +286,19 @@ class ControlNode(Node):
         # convention.
         cmd.steering = float(max(-1.0, min(1.0, -steering_norm)))
         self._cmd_pub.publish(cmd)
+
+        # Diagnostic publish (#260 follow-up). v_set vs SLAM v shows
+        # whether the velocity controller is honouring corner-radius
+        # braking; kappa_max shows whether it's even seeing the corner.
+        # Both expose internal state that's otherwise only visible in
+        # the per-tick log line — having them as topics lets Lichtblick
+        # plot them against time alongside the SLAM speed trace.
+        v_set_msg = Float32()
+        v_set_msg.data = float(getattr(self.longitudinal, "last_v_set", 0.0))
+        self._v_set_pub.publish(v_set_msg)
+        kappa_msg = Float32()
+        kappa_msg.data = float(getattr(self.longitudinal, "last_kappa_max", 0.0))
+        self._kappa_max_pub.publish(kappa_msg)
 
         # Heartbeat — every ~0.5 s. Tells us at a glance whether each
         # stage is producing what we expect.
