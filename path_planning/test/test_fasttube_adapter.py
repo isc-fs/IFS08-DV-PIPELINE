@@ -1,8 +1,10 @@
-"""Smoke tests for the FaSTTUBe adapter (PR #243).
+"""Smoke tests for the FaSTTUBe adapter.
 
 These cover the *integration* surface — type translation, empty-input
-safety, frame conventions — not the planner's geometric correctness.
-The library itself is upstream-tested at https://github.com/papalotis/ft-fsd-path-planning.
+safety, frame conventions, the new colour-agnostic ORANGE→UNKNOWN
+routing (#254), and the cone cull window — not the planner's geometric
+correctness. The library itself is upstream-tested at
+https://github.com/papalotis/ft-fsd-path-planning.
 """
 from __future__ import annotations
 
@@ -18,8 +20,11 @@ fsd_path_planning = pytest.importorskip("fsd_path_planning")
 
 from path_planning.fasttube_adapter import (
     FasttubeAdapter,
+    PlanDebug,
     _COLOR_TO_CONETYPE,
     _NUM_CONE_TYPES,
+    _cull_cones,
+    _CULL_RANGE_M,
 )
 from path_planning.core_types import Cone, ConeColor, Pose2D
 
@@ -65,14 +70,12 @@ def _car_at_origin() -> Pose2D:
 def test_straight_track_returns_nonempty_path() -> None:
     """Smoke: dense straight track → adapter produces a forward path."""
     adapter = FasttubeAdapter()
-    cones = _straight_track()
-    pose = _car_at_origin()
-
-    path = adapter.plan(cones, pose)
+    path, debug = adapter.plan(_straight_track(), _car_at_origin())
 
     assert len(path) >= 5, (
         f"expected ≥5 path points on a clean straight track, got {len(path)}"
     )
+    assert isinstance(debug, PlanDebug)
     # Path should be roughly monotonic forward in world-X (the car heads
     # along +X). Allow small backsteps from spline interpolation but
     # demand a meaningful forward distance overall.
@@ -83,7 +86,9 @@ def test_straight_track_returns_nonempty_path() -> None:
 
 
 def test_color_mapping_buckets_by_cone_type() -> None:
-    """Each ConeColor lands in its expected FaSTTUBe ConeTypes slot."""
+    """ConeColor → ConeTypes mapping (#254): blue/yellow get LEFT/RIGHT,
+    orange/big-orange both get UNKNOWN so the library's colour-blind
+    sort handles them rather than dropping them in matching."""
     cones = [
         Cone(x=1.0, y=+1.5, color=ConeColor.BLUE),
         Cone(x=1.0, y=-1.5, color=ConeColor.YELLOW),
@@ -94,33 +99,39 @@ def test_color_mapping_buckets_by_cone_type() -> None:
     arrays = FasttubeAdapter._cones_to_arrays(cones)
 
     assert len(arrays) == _NUM_CONE_TYPES
-    # Slot 0 = UNKNOWN: nothing maps here today.
-    assert arrays[0].shape == (0, 2)
+    # Slot 0 = UNKNOWN: holds the orange + big-orange cones.
+    assert arrays[0].shape == (2, 2), (
+        "ORANGE + BIG_ORANGE should both route to UNKNOWN slot 0"
+    )
     # Slot 1 = RIGHT/YELLOW: 1 cone.
     assert arrays[int(_COLOR_TO_CONETYPE[ConeColor.YELLOW])].shape == (1, 2)
     # Slot 2 = LEFT/BLUE: 2 cones.
     assert arrays[int(_COLOR_TO_CONETYPE[ConeColor.BLUE])].shape == (2, 2)
-    # Slot 3 = ORANGE_SMALL: 1 cone.
-    assert arrays[int(_COLOR_TO_CONETYPE[ConeColor.ORANGE])].shape == (1, 2)
-    # Slot 4 = ORANGE_BIG: 1 cone.
-    assert arrays[int(_COLOR_TO_CONETYPE[ConeColor.BIG_ORANGE])].shape == (1, 2)
+    # Slots 3 (ORANGE_SMALL) and 4 (ORANGE_BIG) are now empty: the
+    # library drops them in matching, so we deliberately don't put
+    # cones there.
+    assert arrays[3].shape == (0, 2)
+    assert arrays[4].shape == (0, 2)
 
 
 def test_empty_input_returns_empty_path() -> None:
     """No cones in → no path out, no exception."""
     adapter = FasttubeAdapter()
-    assert adapter.plan([], _car_at_origin()) == []
+    path, debug = adapter.plan([], _car_at_origin())
+    assert path == []
+    assert isinstance(debug, PlanDebug)
+    assert debug.left_with_virtual.shape == (0, 2)
+    assert debug.right_with_virtual.shape == (0, 2)
 
 
 def test_one_cone_input_returns_empty_path() -> None:
     """Single cone is degenerate — adapter should swallow any library
-    error and return [], not propagate."""
+    error and return ([], PlanDebug()), not propagate."""
     adapter = FasttubeAdapter()
     cones = [Cone(x=1.0, y=0.0, color=ConeColor.BLUE)]
-    # Shouldn't raise. May return [] or possibly a tiny path; both are
-    # acceptable, the contract is "doesn't crash the node".
-    path = adapter.plan(cones, _car_at_origin())
+    path, debug = adapter.plan(cones, _car_at_origin())
     assert isinstance(path, list)
+    assert isinstance(debug, PlanDebug)
 
 
 def test_pose_rotation_rotates_path() -> None:
@@ -132,18 +143,13 @@ def test_pose_rotation_rotates_path() -> None:
 
     # Reference: car heading +X, straight track along +X.
     cones_x = _straight_track()
-    pose_x = Pose2D(x=0.0, y=0.0, yaw=0.0)
-    path_x = adapter.plan(cones_x, pose_x)
+    path_x, _ = adapter.plan(cones_x, Pose2D(x=0.0, y=0.0, yaw=0.0))
     assert len(path_x) >= 5
 
     # Rotated: car heading +Y, track rotated 90° CCW so it still extends
     # ahead of the car.
-    cones_y: List[Cone] = []
-    for c in cones_x:
-        cones_y.append(Cone(x=-c.y, y=+c.x, color=c.color))
-    pose_y = Pose2D(x=0.0, y=0.0, yaw=math.pi / 2.0)
-
-    path_y = adapter.plan(cones_y, pose_y)
+    cones_y = [Cone(x=-c.y, y=+c.x, color=c.color) for c in cones_x]
+    path_y, _ = adapter.plan(cones_y, Pose2D(x=0.0, y=0.0, yaw=math.pi / 2.0))
     assert len(path_y) >= 5
 
     # In the rotated frame, the path should head along +Y.
@@ -158,5 +164,68 @@ def test_path_points_have_finite_yaw() -> None:
     """Yaw is recomputed from finite differences — must be finite for
     every point including the tail (which reuses the previous segment)."""
     adapter = FasttubeAdapter()
-    path = adapter.plan(_straight_track(), _car_at_origin())
+    path, _ = adapter.plan(_straight_track(), _car_at_origin())
     assert all(np.isfinite(p.yaw) for p in path)
+
+
+def test_orange_cones_dont_disable_planning() -> None:
+    """Whole-track ORANGE input (the worst-case SLAM mis-classify) still
+    yields a valid path — the colour-blind sort sorts the cones by
+    geometry rather than dropping them (#254 acceptance)."""
+    adapter = FasttubeAdapter()
+    # Take a normal track but tag every cone ORANGE.
+    cones = [
+        Cone(x=c.x, y=c.y, color=ConeColor.ORANGE)
+        for c in _straight_track()
+    ]
+    path, _ = adapter.plan(cones, _car_at_origin())
+    assert len(path) >= 5, (
+        f"all-ORANGE input should still plan via colour-blind sort, "
+        f"got {len(path)} points"
+    )
+
+
+# --- Cone cull (range + behind-car) -----------------------------------------
+
+
+def test_cull_drops_cones_behind_car() -> None:
+    """`_cull_cones` filters body_x ≤ 0 (cones already passed)."""
+    pose = Pose2D(x=10.0, y=0.0, yaw=0.0)  # car at (10, 0) facing +X
+    cones = [
+        Cone(x=15.0, y=+1.5, color=ConeColor.BLUE),   # ahead — keep
+        Cone(x=5.0,  y=+1.5, color=ConeColor.BLUE),   # behind — drop
+        Cone(x=10.5, y=-1.5, color=ConeColor.YELLOW), # ahead — keep
+        Cone(x=10.0, y=-1.5, color=ConeColor.YELLOW), # body_x≈0 — drop (≤ 0)
+    ]
+    out = _cull_cones(cones, pose, _CULL_RANGE_M)
+    kept_x = sorted(c.x for c in out)
+    assert kept_x == [10.5, 15.0]
+
+
+def test_cull_drops_cones_beyond_range() -> None:
+    """`_cull_cones` filters cones farther than max_range_m."""
+    pose = Pose2D(x=0.0, y=0.0, yaw=0.0)
+    cones = [
+        Cone(x=10.0, y=0.0, color=ConeColor.BLUE),    # 10 m — keep
+        Cone(x=24.0, y=0.0, color=ConeColor.BLUE),    # 24 m — keep (< 25)
+        Cone(x=26.0, y=0.0, color=ConeColor.BLUE),    # 26 m — drop (> 25)
+        Cone(x=50.0, y=0.0, color=ConeColor.BLUE),    # 50 m — drop
+    ]
+    out = _cull_cones(cones, pose, _CULL_RANGE_M)
+    kept_x = sorted(c.x for c in out)
+    assert kept_x == [10.0, 24.0]
+
+
+def test_cull_respects_pose_yaw() -> None:
+    """Cull uses body-frame x; "behind the car" depends on yaw."""
+    # Car at origin, facing +Y (90°). Cones at +Y are ahead; +X are right.
+    pose = Pose2D(x=0.0, y=0.0, yaw=math.pi / 2.0)
+    cones = [
+        Cone(x=0.0, y=+5.0, color=ConeColor.BLUE),    # ahead (body_x = +5)
+        Cone(x=0.0, y=-5.0, color=ConeColor.BLUE),    # behind (body_x = -5)
+        Cone(x=+5.0, y=0.0, color=ConeColor.YELLOW),  # body_x = 0 → drop
+        Cone(x=-5.0, y=0.0, color=ConeColor.YELLOW),  # body_x = 0 → drop
+    ]
+    out = _cull_cones(cones, pose, _CULL_RANGE_M)
+    assert len(out) == 1
+    assert out[0].y == pytest.approx(5.0)
