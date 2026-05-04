@@ -120,6 +120,21 @@ class ConeGraphSlamNode(Node):
         self.base_frame = self.declare_parameter(
             "base_frame", "base_link").value
 
+        # --- Pose-jump sanity check thresholds (#273 follow-up) ---
+        # Maximum allowed deviation between iSAM2's optimized pose and
+        # the IMU-predicted pose at each scan. When a wrong cone match
+        # passes the DA gate, iSAM2 snaps pose to fit the bad factor;
+        # the sanity check catches that and re-anchors at the IMU
+        # prediction.
+        # 0.8 m: bigger than any legitimate single-scan iSAM2 correction
+        #         (typical IMU drift over 100 ms is sub-decimeter, the
+        #         correction iSAM2 applies via cone factors is at most
+        #         a few centimeters per scan once the map has matured).
+        # 0.3 rad (~17°): ditto for yaw — much more than any legitimate
+        #         single-scan refinement.
+        self.declare_parameter("pose_jump_max_pos_m", 0.8)
+        self.declare_parameter("pose_jump_max_yaw_rad", 0.3)
+
         # --- Components ---
         self._preint = ImuPreintegrator()
         self._graph = FactorGraph()
@@ -565,8 +580,38 @@ class ConeGraphSlamNode(Node):
 
         self._accumulate_obs_diag(per_scan)
 
-        # Commit IMU + cone factors in one iSAM2 update.
-        result = self._graph.commit()
+        # Commit IMU + cone factors with a post-commit pose-jump
+        # sanity check (#273 follow-up). The cascade detector above
+        # catches *symptoms* — bursts of all-NEW observations — but
+        # only AFTER a bad cone match has already snapped pose. The
+        # sanity check below catches the *cause*: an iSAM2 update
+        # that pushes pose far from where IMU prediction says we are.
+        # When it fires, a strong prior at the IMU-predicted pose is
+        # added and the graph is re-optimized; pose at this step lands
+        # near IMU prediction instead of where the bad cone factor
+        # tried to drag it.
+        # Gate the sanity check the same way the cascade detector is
+        # gated: only fire after the early-discovery phase
+        # (`step > 30`). Reason: iSAM2 refines the IMU bias estimate
+        # over the first ~30 scans, during which the optimized pose
+        # legitimately deviates from the IMU prediction by tens of cm
+        # as it incorporates the first cone constraints. Triggering
+        # the corrective prior in that window pins the pose to the
+        # uncalibrated-bias prediction and prevents iSAM2 from
+        # converging.
+        max_pos_dev_m = self.get_parameter("pose_jump_max_pos_m").value
+        max_yaw_dev_rad = self.get_parameter("pose_jump_max_yaw_rad").value
+        if self._graph.step > 30:
+            result, was_corrected = self._graph.commit_with_pose_sanity_check(
+                predicted_pose, max_pos_dev_m, max_yaw_dev_rad)
+            if was_corrected:
+                self.get_logger().warn(
+                    f"pose-jump rejected: snapped to IMU prediction at "
+                    f"step={self._graph.step} "
+                    f"(thresholds: {max_pos_dev_m:.2f} m, "
+                    f"{np.degrees(max_yaw_dev_rad):.1f}°)")
+        else:
+            result = self._graph.commit()
         self._latest_result = result
         self._preint.update_bias(result.bias)
 
