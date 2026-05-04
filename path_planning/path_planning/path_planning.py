@@ -254,17 +254,3 @@ def plan_path(args=None) -> None:
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
-
-# Legacy `Reset` service-client entry point. The /reset RPC was removed
-# from the bridge, so this is a no-op stub kept only for setup.py
-# back-compat — calling `Reset` now exits cleanly with one warning
-# rather than spinning forever waiting for a non-existent service.
-def reiniciar(args=None) -> None:
-    rclpy.init(args=args)
-    node = rclpy.create_node("path_planning_reset_stub")
-    node.get_logger().warn(
-        "path_planning Reset entry point is a stub — /reset is not exposed by "
-        "the current bridge. No action taken.")
-    node.destroy_node()
-    rclpy.shutdown()

@@ -3,7 +3,7 @@
 <package format="3">
   <name>path_planning</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Centerline path planner: subscribes to the SLAM cone map (/Conos), runs the FaSTTUBe per-side cone-sort + cross-side matching algorithm, and publishes a smooth nav_msgs/Path on /Path for the controller.</description>
   <maintainer email="jaimeperezgil21@gmail.com">jaime</maintainer>
   <license>Apache-2.0</license>
 

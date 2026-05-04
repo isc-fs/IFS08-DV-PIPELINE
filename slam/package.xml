@@ -3,7 +3,7 @@
 <package format="3">
   <name>slam</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>LiDAR cone detection: ground removal (RANSAC), DBSCAN clustering, and per-cluster cone fitting that publishes raw cone observations on /Conos_raw for downstream factor-graph SLAM in cone_slam.</description>
   <maintainer email="jaimeperezgil21@gmail.com">jaime</maintainer>
   <license>Apache-2.0</license>
 

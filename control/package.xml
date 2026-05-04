@@ -3,9 +3,9 @@
 <package format="3">
   <name>control</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Vehicle controller: pure-pursuit lateral steering + PI longitudinal velocity tracking, with EBS / regen / autonomous-stop logic. Consumes /Path and the SLAM odometry, publishes /control_command.</description>
   <maintainer email="jaimeperezgil21@gmail.com">jaime</maintainer>
-  <license>TODO: License declaration</license>
+  <license>Apache-2.0</license>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -17,13 +17,12 @@ setup(
     zip_safe=True,
     maintainer='jaime',
     maintainer_email='jaimeperezgil21@gmail.com',
-    description='TODO: Package description',
+    description='Centerline path planner: subscribes to the SLAM cone map (/Conos), runs the FaSTTUBe per-side cone-sort + cross-side matching algorithm, and publishes a smooth nav_msgs/Path on /Path for the controller.',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'Plan_Path = path_planning.path_planning:plan_path',
-            'Reset = path_planning.path_planning:reiniciar',
         ],
     },
 )
