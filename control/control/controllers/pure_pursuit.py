@@ -11,9 +11,14 @@ Curvature of the chasing arc:
 
 where α is the angle from the vehicle heading to the target point.
 
-Adaptive lookahead: Ld = clamp(k · v + L_min, L_min, L_max). Constant L_min
-floors it at low speed (lookahead never collapses to zero), velocity term
-stretches it on straights to smooth out steering.
+Adaptive lookahead: Ld = clamp(L_min + k·v, L_min, min(L_max, β·R_local)).
+Constant L_min floors it at low speed (lookahead never collapses to zero),
+velocity term stretches it on straights, and the β·R_local cap keeps it
+below the local turn radius — Pure Pursuit's chase target must land *inside*
+the curve, not past the apex on the next straight (#260). β ≈ 0.7 is the
+standard Pure Pursuit rule of thumb. R_local = 1 / max|κ| over the next
+lookahead window of the path; we read κ from `ref.curvature` rather than
+recomputing.
 
 Why Pure Pursuit (vs Stanley) for FS:
   - Stable at v→0 (no `softening_gain` denominator hack)
@@ -38,10 +43,20 @@ class PurePursuit(LateralController):
                  lookahead_min: float = 1.5,
                  lookahead_k: float = 0.5,
                  lookahead_max: float = 8.0,
+                 # Pure Pursuit theory: chase target must land inside the
+                 # curve, i.e. Ld ≤ β·R for some β < 1. β=0.7 is a common
+                 # FS-Driverless and ground-vehicle Pure Pursuit value
+                 # (e.g. Coulter '92 §4 recommends Ld < radius; AMZ /
+                 # MIT FSAE references use 0.6–0.8). On a 4 m hairpin
+                 # this caps Ld at 2.8 m vs the previous unconstrained
+                 # 4 m at 5 m/s — keeps the controller from chasing a
+                 # past-apex target through the corner. (#260)
+                 lookahead_radius_factor: float = 0.7,
                  model: KinematicBicycle | None = None):
         self.lookahead_min = lookahead_min
         self.lookahead_k = lookahead_k
         self.lookahead_max = lookahead_max
+        self.lookahead_radius_factor = lookahead_radius_factor
         self.model = model or KinematicBicycle()
 
     def compute(self, state: VehicleState, ref: ReferenceTrajectory) -> float:
@@ -49,17 +64,31 @@ class PurePursuit(LateralController):
             return 0.0
 
         # Adaptive lookahead. Use scalar speed, not vx, so reverse motion
-        # doesn't shrink Ld below the floor.
+        # doesn't shrink Ld below the floor. The R_local cap is applied
+        # below once we know what's ahead on the path.
         Ld = max(self.lookahead_min,
                  min(self.lookahead_max,
                      self.lookahead_min + self.lookahead_k * state.speed))
 
-        # Find the index of the path point closest to the car (in odom frame).
-        # This anchors us to where we are on the path; we then walk forward by
-        # arc length Ld to pick the target. Doing a fresh nearest-search every
-        # tick avoids the "anchor stuck" failure mode of the old controller —
-        # there is no per-tick state carried between calls.
-        nearest = _nearest_index(state.x, state.y, ref.x, ref.y)
+        # Curvature-adaptive cap (#260). Walk forward from `nearest`
+        # along the path and find the tightest κ within the *current*
+        # Ld window — that's the corner the controller is about to
+        # enter. Cap Ld at β·R_local so the chase target stays inside
+        # the curve. Doing this *before* picking target_idx means the
+        # target search uses the capped Ld directly; no second pass.
+        nearest_for_cap = _nearest_index(state.x, state.y, ref.x, ref.y)
+        kappa_max = _max_kappa_in_window(ref, nearest_for_cap, Ld)
+        if kappa_max > 1e-3:
+            radius_cap = self.lookahead_radius_factor / kappa_max
+            Ld = min(Ld, radius_cap)
+            # And re-floor at L_min — even on a hairpin we must look
+            # at least L_min ahead, otherwise Pure Pursuit destabilises
+            # at low speed (the chase target collapses onto the car).
+            Ld = max(Ld, self.lookahead_min)
+
+        # Anchor to where we are on the path. Reuse the nearest-index
+        # we computed for the radius cap above.
+        nearest = nearest_for_cap
 
         # Target = first path point at least Ld of arc length past `nearest`.
         # Falls back to the last point if Ld would walk past path end —
@@ -100,6 +129,30 @@ class PurePursuit(LateralController):
 
         steer_rad = self.model.steer_for_curvature(kappa)
         return self.model.normalize_steer(steer_rad)
+
+
+def _max_kappa_in_window(ref: ReferenceTrajectory, nearest: int,
+                         window_m: float) -> float:
+    """Maximum |κ| from `nearest` over `window_m` of arc length ahead.
+
+    Reads the path's pre-computed curvature from `ref.curvature` —
+    populated by `ReferenceTrajectory.from_xy` (controller side, finite
+    differences over the path xy). Returns 0.0 on a path with no
+    curvature samples (degenerate / very short).
+    """
+    if not ref.curvature:
+        return 0.0
+    if nearest >= len(ref.curvature):
+        return 0.0
+    s_anchor = ref.s[nearest]
+    kmax = 0.0
+    for i in range(nearest, len(ref.s)):
+        if ref.s[i] - s_anchor > window_m:
+            break
+        k = abs(ref.curvature[i])
+        if k > kmax:
+            kmax = k
+    return kmax
 
 
 def _nearest_index(x: float, y: float, xs, ys) -> int:
