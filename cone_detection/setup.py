@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 import os
 from glob import glob
 
-package_name = 'slam'
+package_name = 'cone_detection'
 
 setup(
     name=package_name,
@@ -23,7 +23,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'Cone_Detection = slam.cone_detection_node:cone_detection',
+            'Cone_Detection = cone_detection.cone_detection_node:cone_detection',
         ],
     },
 )

@@ -30,7 +30,7 @@ import std_msgs.msg as std_msgs
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 
-from slam.cone_detection import final_cone_result_rt, warmup_numba_functions
+from cone_detection.cone_detection import final_cone_result_rt, warmup_numba_functions
 
 from fs_msgs.msg import Track, Cone
 
