@@ -86,10 +86,17 @@ def test_straight_track_returns_nonempty_path() -> None:
     )
 
 
-def test_color_mapping_buckets_by_cone_type() -> None:
-    """ConeColor → ConeTypes mapping (#254): blue/yellow get LEFT/RIGHT,
-    orange/big-orange both get UNKNOWN so the library's colour-blind
-    sort handles them rather than dropping them in matching."""
+def test_color_mapping_routes_everything_to_unknown() -> None:
+    """ConeColor → ConeTypes mapping (#254, #189 follow-up).
+
+    All colours map to UNKNOWN. The cone-classification audit showed
+    the upstream "color" signal is invented (no LiDAR colour acquisition
+    anywhere in the pipeline; `classify()` is geometric body_y sign +
+    height) and mis-tags 30-50 % of cones — feeding that into FaSTTUBe's
+    colour-aware sort poisons the per-side seed selection. Routing
+    everything to UNKNOWN forces the library's geometric sort, which
+    assigns sides from corridor topology.
+    """
     cones = [
         Cone(x=1.0, y=+1.5, color=ConeColor.BLUE),
         Cone(x=1.0, y=-1.5, color=ConeColor.YELLOW),
@@ -100,19 +107,12 @@ def test_color_mapping_buckets_by_cone_type() -> None:
     arrays = FasttubeAdapter._cones_to_arrays(cones)
 
     assert len(arrays) == _NUM_CONE_TYPES
-    # Slot 0 = UNKNOWN: holds the orange + big-orange cones.
-    assert arrays[0].shape == (2, 2), (
-        "ORANGE + BIG_ORANGE should both route to UNKNOWN slot 0"
-    )
-    # Slot 1 = RIGHT/YELLOW: 1 cone.
-    assert arrays[int(_COLOR_TO_CONETYPE[ConeColor.YELLOW])].shape == (1, 2)
-    # Slot 2 = LEFT/BLUE: 2 cones.
-    assert arrays[int(_COLOR_TO_CONETYPE[ConeColor.BLUE])].shape == (2, 2)
-    # Slots 3 (ORANGE_SMALL) and 4 (ORANGE_BIG) are now empty: the
-    # library drops them in matching, so we deliberately don't put
-    # cones there.
-    assert arrays[3].shape == (0, 2)
-    assert arrays[4].shape == (0, 2)
+    # Slot 0 = UNKNOWN: holds all 5 cones.
+    assert arrays[0].shape == (5, 2)
+    # Slots 1..4 (RIGHT, LEFT, ORANGE_SMALL, ORANGE_BIG) all empty.
+    for slot in range(1, _NUM_CONE_TYPES):
+        assert arrays[slot].shape == (0, 2), (
+            f"slot {slot} should be empty under colour-blind routing")
 
 
 def test_empty_input_returns_empty_path() -> None:
