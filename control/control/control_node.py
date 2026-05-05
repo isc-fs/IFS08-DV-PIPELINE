@@ -311,7 +311,29 @@ class ControlNode(Node):
         # positive = RIGHT (clockwise). Flip here so every controller can be
         # written in math without each one needing to know about the wire
         # convention.
-        cmd.steering = float(max(-1.0, min(1.0, -steering_norm)))
+        # Sign convention boundary already applied (positive = LEFT in
+        # the strategy contract → flip to UE5/Chaos convention here).
+        # Soft cap during the first metre of motion: the planner publishes
+        # a centerline computed from the first cone observations that's
+        # often off-axis (FaSTTUBe's L/R sort can be asymmetric on the
+        # initial scan, FOV asymmetry, or virtual-cone insertion on a
+        # sparse side), and pure pursuit at Ld≈1 m saturates whenever the
+        # lookahead point is more than ~14° off-centre. The result is a
+        # visible startup yank that goes away once the car has moved
+        # enough for the planner to see both rows symmetrically. The
+        # ramp clips |steer| to a value that grows linearly from 0.3 at
+        # travelled=0 to 1.0 at travelled≥1 m. Not a real fix — that
+        # belongs in the planner — but the saturated startup value is a
+        # degenerate-geometry artifact, not a useful command, so capping
+        # it loses no information. See #298.
+        STARTUP_RAMP_DIST_M = 1.0
+        STARTUP_STEER_MIN = 0.3
+        if self._travelled < STARTUP_RAMP_DIST_M:
+            ramp = self._travelled / STARTUP_RAMP_DIST_M
+            startup_cap = STARTUP_STEER_MIN + (1.0 - STARTUP_STEER_MIN) * ramp
+        else:
+            startup_cap = 1.0
+        cmd.steering = float(max(-startup_cap, min(startup_cap, -steering_norm)))
         self._cmd_pub.publish(cmd)
 
         # Diagnostic publish (#260 follow-up). v_set vs SLAM v shows
