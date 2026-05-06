@@ -75,6 +75,13 @@ class ControlNode(Node):
         self._travelled: float = 0.0
         self._last_pose_xy: Optional[tuple[float, float]] = None
 
+        # Last published command — input to the actuator slew limiter
+        # (see _tick). Initialised to zero so the very first tick can
+        # ramp from zero like a real actuator at rest.
+        self._last_throttle: float = 0.0
+        self._last_regen:    float = 0.0
+        self._last_steering: float = 0.0
+
         # TF listener (cone_graph_slam publishes odom→base_link)
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
@@ -148,6 +155,20 @@ class ControlNode(Node):
         self.declare_parameter("ki_v", 0.05)
         self.declare_parameter("deadband_v", 0.2)
         self.declare_parameter("throttle_max", 0.6)
+        # Actuator slew limits (units = command-units per second). The
+        # sim takes commands instantaneously; real actuators don't.
+        # These rate-limit the published command at the boundary so
+        # every strategy benefits without changing the strategies. See
+        # #306 (GT-as-SLAM diagnostic) for the bang-bang traces these
+        # caps are designed to absorb. Values approximate IFS-08:
+        #   throttle: 0→1 in 0.5 s (EMRAX inverter ramp + throttle map)
+        #   regen:    0→1 in 0.3 s (regen torque response is faster)
+        #   steering: ~90° rack travel in 0.2 s ≈ 5.0 normalized/s
+        # Each can be raised by parameter for debugging without code
+        # changes; setting to a very large number disables that cap.
+        self.declare_parameter("throttle_rate", 2.0)
+        self.declare_parameter("regen_rate", 3.33)
+        self.declare_parameter("steering_rate", 5.0)
         # Stop-latch guard. The FS start gate is also big-orange, so we
         # need to drive at least one lap-ish before the first orange
         # detection counts as the finish. Trackdrive courses are >100 m
@@ -334,6 +355,29 @@ class ControlNode(Node):
         else:
             startup_cap = 1.0
         cmd.steering = float(max(-startup_cap, min(startup_cap, -steering_norm)))
+
+        # ----- actuator slew limiter (#306) ------------------------
+        # Rate-limit each channel at the publish boundary. The
+        # PI velocity loop's "u >= deadband → throttle = u, u <=
+        # -deadband → regen = -u" rule is bang-bang as soon as
+        # measured velocity oscillates around v_set, and Pure Pursuit
+        # commands large steering swings the moment the path's
+        # endpoint jitters. Both produce visible thrash in
+        # /control_command without any actuator model in between.
+        # The sim takes commands instantaneously, so without this cap
+        # the wheels and motor torque step infinitely fast — not what
+        # any real car would do. Values declared in _declare_params.
+        dt = 1.0 / self.PUBLISH_RATE_HZ
+        thr_step  = self._p("throttle_rate") * dt
+        regen_step = self._p("regen_rate")   * dt
+        steer_step = self._p("steering_rate") * dt
+        cmd.throttle = _slew(self._last_throttle, cmd.throttle, thr_step)
+        cmd.brake    = _slew(self._last_regen,    cmd.brake,    regen_step)
+        cmd.steering = _slew(self._last_steering, cmd.steering, steer_step)
+        self._last_throttle = cmd.throttle
+        self._last_regen    = cmd.brake
+        self._last_steering = cmd.steering
+
         self._cmd_pub.publish(cmd)
 
         # Diagnostic publish (#260 follow-up). v_set vs SLAM v shows
@@ -376,6 +420,18 @@ class ControlNode(Node):
             vy=o.twist.twist.linear.y,
             yaw_rate=o.twist.twist.angular.z,
         )
+
+
+def _slew(prev: float, target: float, max_step: float) -> float:
+    """Clamp `target` so it differs from `prev` by no more than
+    `max_step`. `max_step` should be positive (rate × dt). Returns the
+    rate-limited value to publish AND to feed back as `prev` next tick.
+    """
+    if target > prev + max_step:
+        return prev + max_step
+    if target < prev - max_step:
+        return prev - max_step
+    return target
 
 
 def main(args=None) -> None:
