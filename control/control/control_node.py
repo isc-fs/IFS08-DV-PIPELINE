@@ -74,6 +74,16 @@ class ControlNode(LifecycleNode):
         self.longitudinal: Optional[LongitudinalController] = None
 
         # Latest input state. Reset on every activate.
+        # /cone_slam/state and /odom are split sources post-#360:
+        #   _latest_pose ← /cone_slam/state, used for absolute pose
+        #     (drift-corrected via SLAM cone associations)
+        #   _latest_odom ← /odom, used for body-frame twist (high-rate
+        #     dead-reckoning from sim_supervisor's IMU+RPM filter, or
+        #     from the uDV on the real car).
+        # Pre-#360 these were the same topic (cone_slam/state) which
+        # coupled velocity estimate quality to SLAM DA stability — a
+        # cone-only-DA cascade would corrupt velocity feeding control.
+        self._latest_pose: Optional[Odometry] = None
         self._latest_odom: Optional[Odometry] = None
         self._latest_path_xs: list[float] = []
         self._latest_path_ys: list[float] = []
@@ -107,6 +117,7 @@ class ControlNode(LifecycleNode):
         self._v_set_pub = None
         self._kappa_max_pub = None
         self._sub_path = None
+        self._sub_pose = None
         self._sub_odom = None
         self._sub_orange = None
         self._tick_timer = None
@@ -166,6 +177,7 @@ class ControlNode(LifecycleNode):
             f"longitudinal={type(self.longitudinal).__name__})")
 
         # Reset all per-run state so deactivate→activate is a fresh run.
+        self._latest_pose = None
         self._latest_odom = None
         self._latest_path_xs = []
         self._latest_path_ys = []
@@ -189,8 +201,16 @@ class ControlNode(LifecycleNode):
         # Subscriptions
         self._sub_path = self.create_subscription(
             Path, "Path", self._on_path, 10)
+        # Absolute pose — comes from SLAM at LiDAR tick rate (~10 Hz).
+        # Used for x/y/yaw and the gate-latch body→world projection.
+        self._sub_pose = self.create_subscription(
+            Odometry, "/cone_slam/state", self._on_pose, 10)
+        # Body-frame twist — comes from sim_supervisor (or uDV on the
+        # real car) at ~100 Hz from the IMU+RPM complementary filter.
+        # Drifty over time but high-rate, so the controller's velocity
+        # tracking has fresh data every 40 Hz tick.
         self._sub_odom = self.create_subscription(
-            Odometry, "/cone_slam/state", self._on_odom, 10)
+            Odometry, "/odom", self._on_odom, 10)
         self._sub_orange = self.create_subscription(
             MarkerArray, "/Conos_Orange", self._on_orange, 10)
 
@@ -204,10 +224,12 @@ class ControlNode(LifecycleNode):
         self, state: LifecycleState
     ) -> TransitionCallbackReturn:
         self.get_logger().info("on_deactivate: dropping timers + subs")
-        for sub in (self._sub_path, self._sub_odom, self._sub_orange):
+        for sub in (self._sub_path, self._sub_pose, self._sub_odom,
+                    self._sub_orange):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_path = None
+        self._sub_pose = None
         self._sub_odom = None
         self._sub_orange = None
         for tmr in (self._tick_timer, self._ebs_reset_timer):
@@ -221,10 +243,12 @@ class ControlNode(LifecycleNode):
         self, state: LifecycleState
     ) -> TransitionCallbackReturn:
         self.get_logger().info("on_cleanup: destroying publishers + TF")
-        for sub in (self._sub_path, self._sub_odom, self._sub_orange):
+        for sub in (self._sub_path, self._sub_pose, self._sub_odom,
+                    self._sub_orange):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_path = None
+        self._sub_pose = None
         self._sub_odom = None
         self._sub_orange = None
         for tmr in (self._tick_timer, self._ebs_reset_timer):
@@ -339,7 +363,16 @@ class ControlNode(LifecycleNode):
 
     # ----------------------------------------------------------- subscriptions
 
+    def _on_pose(self, msg: Odometry) -> None:
+        """SLAM absolute pose (drift-corrected). Twist field on this
+        message is ignored — we read body-frame velocity from /odom
+        instead (see _on_odom)."""
+        self._latest_pose = msg
+
     def _on_odom(self, msg: Odometry) -> None:
+        """Dead-reckoning Odometry from sim_supervisor (or uDV on the
+        real car). Pose field on this message drifts over time; we
+        consume only the twist for body-frame velocity."""
         self._latest_odom = msg
 
     def _on_path(self, msg: Path) -> None:
@@ -364,9 +397,12 @@ class ControlNode(LifecycleNode):
         distance from the car to the anchor in odom frame.
 
         The cones come in base_link (vehicle frame), so we transform via
-        the latest odom pose — close enough at the moment of latch since
-        the car is still ~10 m from the gate."""
-        if self._stop_latched or self._latest_odom is None:
+        the latest *absolute* pose — close enough at the moment of latch
+        since the car is still ~10 m from the gate. Uses /cone_slam/state
+        rather than /odom because the stop anchor is a long-lived
+        world-frame point and dead-reckoning drift would walk it
+        across laps."""
+        if self._stop_latched or self._latest_pose is None:
             return
         if len(msg.markers) < 2:
             return
@@ -376,8 +412,8 @@ class ControlNode(LifecycleNode):
         n = len(msg.markers)
         sx = sum(m.pose.position.x for m in msg.markers) / n
         sy = sum(m.pose.position.y for m in msg.markers) / n
-        # base_link → odom using current odom pose
-        o = self._latest_odom
+        # base_link → odom using current absolute pose from SLAM
+        o = self._latest_pose
         q = o.pose.pose.orientation
         _, _, yaw = quat2euler([q.w, q.x, q.y, q.z])
         cos_y, sin_y = math.cos(yaw), math.sin(yaw)
@@ -534,19 +570,30 @@ class ControlNode(LifecycleNode):
             )
 
     def _build_state(self) -> Optional[VehicleState]:
-        if self._latest_odom is None:
+        """Compose VehicleState from two sources:
+          • pose (x, y, yaw) from /cone_slam/state — SLAM's drift-
+            corrected absolute pose, ~10 Hz.
+          • twist (vx, vy, yaw_rate) from /odom — sim_supervisor's
+            (or uDV's) dead-reckoning IMU+RPM filter, ~100 Hz.
+
+        Both must be present before the controller can make a
+        decision; the strategies need both pose (for path
+        projection) and twist (for velocity tracking). Returns
+        None until both topics have produced their first message —
+        the tick fail-safes to zero command in that window."""
+        if self._latest_pose is None or self._latest_odom is None:
             return None
-        o = self._latest_odom
-        # Pose in odom frame. Yaw via quat2euler.
-        q = o.pose.pose.orientation
-        roll, pitch, yaw = quat2euler([q.w, q.x, q.y, q.z])
+        p = self._latest_pose
+        t = self._latest_odom
+        q = p.pose.pose.orientation
+        _, _, yaw = quat2euler([q.w, q.x, q.y, q.z])
         return VehicleState(
-            x=o.pose.pose.position.x,
-            y=o.pose.pose.position.y,
+            x=p.pose.pose.position.x,
+            y=p.pose.pose.position.y,
             yaw=yaw,
-            vx=o.twist.twist.linear.x,
-            vy=o.twist.twist.linear.y,
-            yaw_rate=o.twist.twist.angular.z,
+            vx=t.twist.twist.linear.x,
+            vy=t.twist.twist.linear.y,
+            yaw_rate=t.twist.twist.angular.z,
         )
 
 
