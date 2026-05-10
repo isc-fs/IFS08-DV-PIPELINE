@@ -1,0 +1,30 @@
+# ActivateMode — mission_control_node → mode_manager_node.
+#
+# Asks mode_manager to drive every autonomy LifecycleNode through
+# `configure` then `activate`, propagating the mission flag so each
+# node selects the correct strategy (trackdrive / autocross / accel /
+# skidpad).
+#
+# This is a one-shot service, not an action: mission_control awaits
+# the response. Heartbeats during configure/activate are emitted by
+# mission_control_node back to the supervisor on the StartMission
+# action — this layer is fast enough that internal heartbeats are
+# not needed.
+#
+# Mission values:
+#   "trackdrive" | "autocross" | "accel" | "skidpad"
+#
+# Empty string deactivates+cleans up every autonomy node (used when
+# the supervisor cancels Phase 1 to switch missions).
+
+# ---------------- Request ----------------
+string mission
+
+---
+# ---------------- Response ----------------
+# True if every autonomy LifecycleNode reached `active` (or, for
+# empty mission, returned to `unconfigured`).
+bool ok
+
+# Per-node diagnostic when ok=false. Empty on success.
+string message

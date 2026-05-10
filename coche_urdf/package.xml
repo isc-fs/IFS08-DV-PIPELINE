@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>coche_urdf</name>
+  <version>0.0.1</version>
+  <description>
+    Minimal IFS-08 URDF for the DV pipeline's robot_state_publisher.
+
+    This is a *placeholder* URDF: chassis box + four cylindrical
+    wheels + steering joints, with rough IFS-08 dimensions. Good
+    enough for TF publishing and basic Foxglove visualisation; not
+    representative of the real chassis geometry, has no collision
+    geometry, no inertials.
+
+    A real URDF (re-authored from SolidWorks, with proper meshes,
+    inertials, and tight wheel kinematics) is the eventual
+    replacement — see issue #142 (CoG bias) for the related physics
+    asset rework.
+  </description>
+  <maintainer email="raul@isc-fs.com">Raul Moran</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>joint_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

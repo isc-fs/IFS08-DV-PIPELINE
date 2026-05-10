@@ -35,7 +35,11 @@ from typing import Optional
 import numpy as np
 
 import rclpy
-from rclpy.node import Node
+from rclpy.lifecycle import (
+    LifecycleNode,
+    TransitionCallbackReturn,
+    State as LifecycleState,
+)
 from rclpy.qos import (
     QoSDurabilityPolicy,
     QoSHistoryPolicy,
@@ -111,17 +115,37 @@ class State(Enum):
     SLAM_RUNNING = 3
 
 
-class ConeGraphSlamNode(Node):
+class ConeGraphSlamNode(LifecycleNode):
+    """Cone-graph SLAM as a managed LifecycleNode.
+
+    Lifecycle layout:
+
+      on_configure  declare parameters (re-readable on every
+                    re-configure), instantiate components (preint /
+                    graph / db), open the optional landmark capture
+                    file, create lifecycle publishers + TF
+                    broadcasters, emit the map→odom static identity.
+      on_activate   reset state machine to INIT_WAITING_IMU, create
+                    the four subscriptions (/imu, /Conos_raw,
+                    /motor_rpm, /testing_only/odom), super().on_activate
+                    flips lifecycle pubs to emitting state.
+      on_deactivate destroy subscriptions; pubs go quiet via super().
+      on_cleanup    destroy publishers + broadcasters, close the
+                    capture file, drop component refs.
+    """
+
+    NODE_NAME = "slam_node"
+
     def __init__(self) -> None:
-        super().__init__("cone_graph_slam")
+        super().__init__(self.NODE_NAME)
 
-        # --- Frames (REP-105) ---
-        self.odom_frame = self.declare_parameter(
-            "odom_frame", "odom").value
-        self.base_frame = self.declare_parameter(
-            "base_frame", "base_link").value
-
-        # --- Pose-jump sanity check thresholds (#273 follow-up) ---
+        # --- Parameter declarations live in __init__ so they exist
+        # before configure (mode_manager will eventually pre-set the
+        # mission strategy flag via parameters).
+        # Frames (REP-105):
+        self.declare_parameter("odom_frame", "odom")
+        self.declare_parameter("base_frame", "base_link")
+        # Pose-jump sanity check thresholds (#273 follow-up).
         # Maximum allowed deviation between iSAM2's optimized pose and
         # the IMU-predicted pose at each scan. When a wrong cone match
         # passes the DA gate, iSAM2 snaps pose to fit the bad factor;
@@ -136,13 +160,66 @@ class ConeGraphSlamNode(Node):
         self.declare_parameter("pose_jump_max_pos_m", 0.8)
         self.declare_parameter("pose_jump_max_yaw_rad", 0.3)
 
-        # --- Components ---
-        self._preint = ImuPreintegrator()
-        self._graph = FactorGraph()
-        self._db = LandmarkDb()
+        # I/O references — populated in on_configure / on_activate.
+        self.odom_frame: str = ""
+        self.base_frame: str = ""
+        self._preint: Optional[ImuPreintegrator] = None
+        self._graph: Optional[FactorGraph] = None
+        self._db: Optional[LandmarkDb] = None
         self._latest_result: Optional[ScanResult] = None
         self._state = State.INIT_WAITING_IMU
         self._calib_started_t: Optional[float] = None
+
+        self._lm_capture_path: str = ""
+        self._lm_capture_fh = None
+
+        self._obs_diag: dict = {}
+        self._obs_n_scans = 0
+        self._obs_last_log_ns = 0
+
+        import time as _time
+        self._time = _time
+        self._latest_rpm: Optional[float] = None
+        self._latest_rpm_t: Optional[float] = None
+        self._latest_gt: Optional[Odometry] = None
+        self._gt_init_pose: Optional[gtsam.Pose3] = None
+
+        # Subscription handles (created in on_activate)
+        self._sub_imu = None
+        self._sub_cones = None
+        self._sub_rpm = None
+        self._sub_gt = None
+
+        # Publisher / broadcaster handles (created in on_configure)
+        self._tf_broadcaster = None
+        self._static_tf_broadcaster = None
+        self._state_pub = None
+        self._cones_pub = None
+        self._gt_aligned_pub = None
+        self._gt_error_pub = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle transitions
+    # ------------------------------------------------------------------
+    def on_configure(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_configure: components + publishers + static TF")
+
+        self.odom_frame = self.get_parameter("odom_frame").value
+        self.base_frame = self.get_parameter("base_frame").value
+
+        # Components
+        self._preint = ImuPreintegrator()
+        self._graph = FactorGraph()
+        self._db = LandmarkDb()
+        self._latest_result = None
+        self._state = State.INIT_WAITING_IMU
+        self._calib_started_t = None
+        self._latest_rpm = None
+        self._latest_rpm_t = None
+        self._latest_gt = None
+        self._gt_init_pose = None
 
         # Optional per-landmark creation diagnostic. When DV_SLAM_LANDMARK_CAPTURE
         # is set to a writable path, every new landmark dumps one JSON line
@@ -153,7 +230,6 @@ class ConeGraphSlamNode(Node):
         # hypothesis is confirmed.
         import os as _os
         self._lm_capture_path = _os.environ.get("DV_SLAM_LANDMARK_CAPTURE", "")
-        self._lm_capture_fh = None
         if self._lm_capture_path:
             try:
                 self._lm_capture_fh = open(self._lm_capture_path, "w")
@@ -163,26 +239,68 @@ class ConeGraphSlamNode(Node):
                 self.get_logger().error(f"landmark capture open failed: {ex}")
                 self._lm_capture_fh = None
 
-        # Per-second SLAM observation diagnostic. Breaks every scan's
-        # cones into (incoming, associated, new) per colour, plus
-        # cascade-skipped scans. Used to find where yellow cones
-        # disappear in tight corners (#189): if obs has 7 yellow but
-        # assoc+new totals only 1 yellow, the loss is in SLAM (DA gate
-        # / pose-jump rejection); if obs already has 1 yellow, the
-        # loss is upstream in Cone_Detection.
+        # Publishers (lifecycle — silent until on_activate)
+        self._state_pub = self.create_lifecycle_publisher(
+            Odometry, "/cone_slam/state", 10)
+        self._cones_pub = self.create_lifecycle_publisher(
+            MarkerArray, "/Conos", 10)
+        # GT-aligned diagnostic odometry. Same Odometry shape as
+        # /cone_slam/state but containing the ground truth re-expressed
+        # in SLAM's anchored body-frame world. SLAM-vs-GT divergence in
+        # this frame is the actual SLAM drift; in the raw GT frame it
+        # would be that drift plus the static frame mismatch.
+        self._gt_aligned_pub = self.create_lifecycle_publisher(
+            Odometry, "/cone_slam/gt_aligned", 10)
+        # Scalar position-error magnitude — convenience for the
+        # Lichtblick plot, equal to ||state.position - gt_aligned.position||.
+        self._gt_error_pub = self.create_lifecycle_publisher(
+            Float32, "/cone_slam/gt_error_m", 10)
+
+        # TF broadcasters are non-lifecycle (tf2 doesn't ship lifecycle
+        # variants). Created here so the static `map -> odom` identity
+        # can land before any subscriber comes up.
+        self._tf_broadcaster = TransformBroadcaster(self)
+        self._static_tf_broadcaster = StaticTransformBroadcaster(self)
+        # Anchor `map -> odom` as identity on /tf_static. We don't
+        # have map-based localization (no GPS-aligned global frame),
+        # so the SLAM odom frame IS effectively the map frame for
+        # downstream consumers. Without this static, Lichtblick's 3D
+        # panel has no root and nothing renders — the cone map and
+        # the trajectory both anchor on `odom`, which dangles off
+        # /tf_static at recording time. The transform itself is
+        # identity; the publisher exists purely to give visualizers
+        # a parent frame to walk from.
+        self._publish_map_to_odom_static()
+
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_activate(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info(
+            "on_activate: subscriptions + state-machine reset "
+            f"(odom='{self.odom_frame}', base='{self.base_frame}')")
+
+        # Reset state machine and runtime state. A deactivate→activate
+        # cycle should look like a fresh run, not a resumed one — the
+        # IMU preintegrator can't bridge the deactivated gap, and any
+        # downstream consumer reading /tf during the gap will already
+        # have stale data.
+        self._state = State.INIT_WAITING_IMU
+        self._calib_started_t = None
+        self._latest_result = None
+        self._preint = ImuPreintegrator()
+        self._graph = FactorGraph()
+        self._db = LandmarkDb()
+        self._latest_rpm = None
+        self._latest_rpm_t = None
+        self._latest_gt = None
+        self._gt_init_pose = None
         self._obs_diag = {}
         self._obs_n_scans = 0
         self._obs_last_log_ns = 0
 
-        # Latest /motor_rpm sample. Wall-clock timestamp because the
-        # bridge stamps it with node_->now() (no header.stamp on
-        # std_msgs/Float32). Used for staleness check inside _on_cones.
-        import time as _time
-        self._time = _time
-        self._latest_rpm: Optional[float] = None
-        self._latest_rpm_t: Optional[float] = None
-
-        # --- Subscriptions ---
+        # Subscriptions.
         # Bigger IMU queue than qos_profile_sensor_data's default 10:
         # at 400 Hz we get ~40 samples per 100 ms scan window, and
         # rclpy's single-threaded executor cannot service the IMU
@@ -196,13 +314,13 @@ class ConeGraphSlamNode(Node):
             depth=2000,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
-        self.create_subscription(Imu, "/imu", self._on_imu, imu_qos)
+        self._sub_imu = self.create_subscription(
+            Imu, "/imu", self._on_imu, imu_qos)
         # /Conos_raw is the scan trigger AND the source of cone
         # observations. Cone_Detection publishes ~10 Hz, in base_link
         # frame, with cone height encoded on marker.scale.z.
-        self.create_subscription(
-            MarkerArray, "/Conos_raw",
-            self._on_cones, 10)
+        self._sub_cones = self.create_subscription(
+            MarkerArray, "/Conos_raw", self._on_cones, 10)
 
         # /motor_rpm — bridge publishes at 100 Hz from getCarState().
         # We don't fire on every sample; we cache the latest and consume
@@ -215,15 +333,16 @@ class ConeGraphSlamNode(Node):
             depth=10,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
-        self.create_subscription(Float32, "/motor_rpm", self._on_rpm, rpm_qos)
+        self._sub_rpm = self.create_subscription(
+            Float32, "/motor_rpm", self._on_rpm, rpm_qos)
 
-        # --- /testing_only/odom — sim ground truth, used only for the
-        # GT-aligned diagnostic published below. The bridge encodes this
-        # in ENU (East-North-Up); SLAM internally anchors to the car's
-        # initial pose, so direct comparison would mix two different
-        # world frames. We snapshot the GT pose at calibration-end and
-        # publish a pose-aligned residual on /cone_slam/gt_aligned.
-        # Bridge publishes BEST_EFFORT (per `sensor_qos` in
+        # /testing_only/odom — sim ground truth, used only for the
+        # GT-aligned diagnostic. The bridge encodes this in ENU
+        # (East-North-Up); SLAM internally anchors to the car's initial
+        # pose, so direct comparison would mix two different world
+        # frames. We snapshot the GT pose at calibration-end and publish
+        # a pose-aligned residual on /cone_slam/gt_aligned. Bridge
+        # publishes BEST_EFFORT (per `sensor_qos` in
         # ifssim_ros_wrapper.cpp:289); subscriber must match or messages
         # silently never arrive.
         gt_qos = QoSProfile(
@@ -232,44 +351,78 @@ class ConeGraphSlamNode(Node):
             depth=10,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
-        self.create_subscription(
+        self._sub_gt = self.create_subscription(
             Odometry, "/testing_only/odom", self._on_gt_odom, gt_qos)
-        self._latest_gt: Optional[Odometry] = None
-        self._gt_init_pose: Optional[gtsam.Pose3] = None
 
-        # --- Publishers ---
-        self._tf_broadcaster = TransformBroadcaster(self)
-        self._static_tf_broadcaster = StaticTransformBroadcaster(self)
-        self._state_pub = self.create_publisher(
-            Odometry, "/cone_slam/state", 10)
-        self._cones_pub = self.create_publisher(
-            MarkerArray, "/Conos", 10)
-        # GT-aligned diagnostic odometry. Same Odometry shape as
-        # /cone_slam/state but containing the ground truth re-expressed
-        # in SLAM's anchored body-frame world. SLAM-vs-GT divergence in
-        # this frame is the actual SLAM drift; in the raw GT frame it
-        # would be that drift plus the static frame mismatch.
-        self._gt_aligned_pub = self.create_publisher(
-            Odometry, "/cone_slam/gt_aligned", 10)
-        # Scalar position-error magnitude — convenience for the
-        # Lichtblick plot, equal to ||state.position - gt_aligned.position||.
-        self._gt_error_pub = self.create_publisher(
-            Float32, "/cone_slam/gt_error_m", 10)
+        return super().on_activate(state)
 
-        # Anchor `map -> odom` as identity on /tf_static. We don't
-        # have map-based localization (no GPS-aligned global frame),
-        # so the SLAM odom frame IS effectively the map frame for
-        # downstream consumers. Without this static, Lichtblick's 3D
-        # panel has no root and nothing renders — the cone map and
-        # the trajectory both anchor on `odom`, which dangles off
-        # /tf_static at recording time. The transform itself is
-        # identity; the publisher exists purely to give visualizers
-        # a parent frame to walk from.
-        self._publish_map_to_odom_static()
+    def on_deactivate(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_deactivate: dropping subscriptions")
+        for sub in (self._sub_imu, self._sub_cones,
+                    self._sub_rpm, self._sub_gt):
+            if sub is not None:
+                self.destroy_subscription(sub)
+        self._sub_imu = None
+        self._sub_cones = None
+        self._sub_rpm = None
+        self._sub_gt = None
+        return super().on_deactivate(state)
 
-        self.get_logger().info(
-            "cone_graph_slam initialized — waiting for IMU "
-            f"(odom='{self.odom_frame}', base='{self.base_frame}')")
+    def on_cleanup(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_cleanup: destroying publishers + components")
+        for sub in (self._sub_imu, self._sub_cones,
+                    self._sub_rpm, self._sub_gt):
+            if sub is not None:
+                self.destroy_subscription(sub)
+        self._sub_imu = None
+        self._sub_cones = None
+        self._sub_rpm = None
+        self._sub_gt = None
+
+        for pub in (self._state_pub, self._cones_pub,
+                    self._gt_aligned_pub, self._gt_error_pub):
+            if pub is not None:
+                self.destroy_publisher(pub)
+        self._state_pub = None
+        self._cones_pub = None
+        self._gt_aligned_pub = None
+        self._gt_error_pub = None
+
+        # tf2 broadcasters are not lifecycle-aware; drop the refs.
+        self._tf_broadcaster = None
+        self._static_tf_broadcaster = None
+
+        # Components
+        self._preint = None
+        self._graph = None
+        self._db = None
+        self._latest_result = None
+
+        if self._lm_capture_fh is not None:
+            try:
+                self._lm_capture_fh.close()
+            except Exception:
+                pass
+            self._lm_capture_fh = None
+
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_shutdown(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_shutdown")
+        # Reuse cleanup logic — shutdown after cleanup is a no-op.
+        if self._lm_capture_fh is not None:
+            try:
+                self._lm_capture_fh.close()
+            except Exception:
+                pass
+            self._lm_capture_fh = None
+        return TransitionCallbackReturn.SUCCESS
 
     # ----- RPM callback ------------------------------------------------------
 

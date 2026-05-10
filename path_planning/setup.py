@@ -22,7 +22,9 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'Plan_Path = path_planning.path_planning:plan_path',
+            # Lifecycle entry. ROS node name "path_planning_node" matches
+            # the AUTONOMY_LIFECYCLE_NODES list in mode_manager.
+            'path_planning_node = path_planning.path_planning:main',
         ],
     },
 )

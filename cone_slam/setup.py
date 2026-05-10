@@ -20,10 +20,12 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            # Main SLAM node: subscribes /imu + /lidar/Lidar1 (PR A timing
-            # trigger; PR B switches to /Conos_raw); publishes /tf
-            # (odom → base_link) and /cone_slam/state.
-            "cone_graph_slam = cone_slam.cone_graph_slam_node:main",
+            # Lifecycle SLAM node. ROS node name is "slam_node" to match
+            # the AUTONOMY_LIFECYCLE_NODES list in mode_manager. Subscribes
+            # /imu + /Conos_raw + /motor_rpm + /testing_only/odom (active
+            # state only); publishes /tf (odom → base_link),
+            # /cone_slam/state, /Conos, GT-aligned diagnostics.
+            "slam_node = cone_slam.cone_graph_slam_node:main",
         ],
     },
 )

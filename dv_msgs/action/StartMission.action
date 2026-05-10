@@ -1,0 +1,41 @@
+# StartMission — Phase 1 of the runtime action protocol.
+#
+# Sent: sim_supervisor_node → mission_control_node
+#
+# Carries the chosen mission. mission_control_node drives mode_manager
+# to bring up the right lifecycle nodes with the right strategy flag,
+# emits periodic heartbeats while configure/activate is in flight, and
+# reports ready/failed at the end. Cancellable — switching mission
+# during this window re-enters Phase 1 for the new mission without a
+# full container restart.
+#
+# Once `ready=true` arrives, the supervisor opens a separate
+# RuntimeControl action for Phase 2.
+
+# ---------------- Goal ----------------
+# Mission identifier. Must be one of:
+#   "trackdrive" | "autocross" | "accel" | "skidpad"
+string mission
+
+---
+# ---------------- Result ----------------
+# True if all autonomy lifecycle nodes reached `active` inside the
+# startup window; false if any failed to configure/activate.
+bool ready
+
+# Human-readable diagnostic when ready=false. Empty string on success.
+string message
+
+---
+# ---------------- Feedback ----------------
+# Heartbeat. mission_control_node emits one of these periodically so a
+# crashed startup is detectable from the supervisor side without
+# polling every lifecycle node directly.
+#
+# Stage values:
+#   "configuring"  — mode_manager is calling change_state to configure
+#   "activating"   — mode_manager is calling change_state to activate
+#   "warming_up"   — autonomy nodes active; e.g. Numba JIT compile
+#   "ready"        — all done, result imminent
+string stage
+builtin_interfaces/Time stamp

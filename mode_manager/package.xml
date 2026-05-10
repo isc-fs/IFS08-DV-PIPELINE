@@ -1,14 +1,20 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>cone_slam</name>
+  <name>mode_manager</name>
   <version>0.0.1</version>
   <description>
-    Cone-association graph SLAM for the IFS-08 driverless pipeline.
-    Replaces dense LiDAR-IMU scan-matching SLAM (fast_LIMO) with a GTSAM
-    factor graph: IMU preintegration factors between pose nodes, cone
-    BearingRange observation factors, optional GPS factors. iSAM2 backend.
-    See docs/cone_graph_slam_design.md for the full design.
+    mode_manager_node — fans out lifecycle change_state calls to the
+    autonomy nodes (perception, slam, path_planning, control) and
+    passes them the mission-specific strategy flag so each node knows
+    which inner behaviour to run (trackdrive / autocross / accel /
+    skidpad).
+
+    Exposes one service: `activate_mode` (custom srv) — request
+    carries the mission name; reply tells mission_control_node whether
+    every autonomy node reached `active`.
+
+    See docs/autonomy_pipeline.md §"Roles inside mission management".
   </description>
   <maintainer email="raul@isc-fs.com">Raul Moran</maintainer>
   <license>MIT</license>
@@ -17,13 +23,6 @@
 
   <depend>rclpy</depend>
   <depend>lifecycle_msgs</depend>
-  <depend>std_msgs</depend>
-  <depend>sensor_msgs</depend>
-  <depend>nav_msgs</depend>
-  <depend>geometry_msgs</depend>
-  <depend>visualization_msgs</depend>
-  <depend>tf2_ros</depend>
-  <depend>tf2_geometry_msgs</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

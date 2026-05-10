@@ -23,15 +23,17 @@ import math
 from typing import Optional
 
 import rclpy
-from rclpy.node import Node
+from rclpy.lifecycle import (
+    LifecycleNode,
+    TransitionCallbackReturn,
+    State as LifecycleState,
+)
 from rclpy.qos import QoSProfile, DurabilityPolicy
-from rclpy.time import Time
 
 from fs_msgs.msg import ControlCommand
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Empty, Float32
 from visualization_msgs.msg import MarkerArray
-from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from transforms3d.euler import quat2euler
@@ -43,15 +45,35 @@ from control.controllers.pure_pursuit import PurePursuit
 from control.controllers.pi_velocity import PIVelocity
 
 
-class ControlNode(Node):
+class ControlNode(LifecycleNode):
+    """Lifecycle-managed vehicle controller.
+
+    Lifecycle layout:
+      on_configure   declare parameters, build strategies, create
+                     lifecycle publishers + TF listener.
+      on_activate    create the 3 subscriptions, the 40 Hz tick timer,
+                     and the EBS-reset retry timer (publishes the
+                     initial reset latched). All per-run state
+                     (travelled distance, last commands, stop latch)
+                     reset here so deactivate→activate looks like a
+                     fresh run.
+      on_deactivate  destroy subscriptions + timers; pubs go quiet via
+                     super().
+      on_cleanup     destroy publishers, drop TF + strategies.
+    """
+
+    NODE_NAME = "control_node"
     PUBLISH_RATE_HZ = 40.0
 
     def __init__(self) -> None:
-        super().__init__("control")
+        super().__init__(self.NODE_NAME)
         self._declare_params()
-        self._build_strategies()
 
-        # Latest input state, refreshed by callbacks
+        # Strategy refs — built in on_configure once params are visible.
+        self.lateral: Optional[LateralController] = None
+        self.longitudinal: Optional[LongitudinalController] = None
+
+        # Latest input state. Reset on every activate.
         self._latest_odom: Optional[Odometry] = None
         self._latest_path_xs: list[float] = []
         self._latest_path_ys: list[float] = []
@@ -66,40 +88,57 @@ class ControlNode(Node):
         # in odom frame (see _on_orange / _stop_distance).
         self._stop_anchor_xy: Optional[tuple[float, float]] = None
         self._stop_latched: bool = False
-        # Travel distance (odom-frame) used as the gate-latch guard. The FS
-        # start gate is also big-orange, so a naive "latch on first sighting"
-        # snaps onto the start cones and the controller immediately tries to
-        # brake to a stop. The lap-min-distance guard suppresses the latch
-        # until we've travelled past where the start cones could possibly be.
-        self._origin_xy: Optional[tuple[float, float]] = None
+        # Travel distance (odom-frame) used as the gate-latch guard.
         self._travelled: float = 0.0
         self._last_pose_xy: Optional[tuple[float, float]] = None
 
-        # Last published command — input to the actuator slew limiter
-        # (see _tick). Initialised to zero so the very first tick can
-        # ramp from zero like a real actuator at rest.
+        # Last published command — input to the actuator slew limiter.
         self._last_throttle: float = 0.0
         self._last_regen:    float = 0.0
         self._last_steering: float = 0.0
+        self._tick_count: int = 0
 
-        # TF listener (cone_graph_slam publishes odom→base_link)
-        self._tf_buffer = Buffer()
-        self._tf_listener = TransformListener(self._tf_buffer, self)
+        # I/O handles, set in on_configure / on_activate.
+        self._tf_buffer: Optional[Buffer] = None
+        self._tf_listener: Optional[TransformListener] = None
+        self._cmd_pub = None
+        self._ebs_pub = None
+        self._ebs_reset_pub = None
+        self._v_set_pub = None
+        self._kappa_max_pub = None
+        self._sub_path = None
+        self._sub_odom = None
+        self._sub_orange = None
+        self._tick_timer = None
+        self._ebs_reset_timer = None
+        self._ebs_reset_retries = 0
 
-        # Publishers
-        self._cmd_pub = self.create_publisher(ControlCommand, "/control_command", 10)
+    # ------------------------------------------------------------------
+    # Lifecycle transitions
+    # ------------------------------------------------------------------
+    def on_configure(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_configure: strategies + publishers + TF")
+        self._build_strategies()
+
+        # Publishers — lifecycle-aware so they go silent when deactivated.
+        self._cmd_pub = self.create_lifecycle_publisher(
+            ControlCommand, "/control_command", 10)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self._ebs_pub = self.create_publisher(Empty, "/signal/ebs", latched)
+        self._ebs_pub = self.create_lifecycle_publisher(
+            Empty, "/signal/ebs", latched)
         # /signal/ebs_reset clears the bridge's `ebs_triggered_` gate, which
         # otherwise drops every /control_command silently after a previous
         # ActivateEbs (incl. mission_control's RES-activate at event_start
         # before the autonomy boots). Latched + retry: a single publish can
         # race the bridge's subscriber readiness, so we re-fire a few times
         # while the bridge is connecting.
-        self._ebs_reset_pub = self.create_publisher(Empty, "/signal/ebs_reset", latched)
-        self._ebs_reset_pub.publish(Empty())
-        self._ebs_reset_retries = 4
-        self._ebs_reset_timer = self.create_timer(0.5, self._republish_ebs_reset)
+        # NOTE: per docs/autonomy_pipeline.md the supervisor will eventually
+        # own /signal/ebs_reset; keep it here until the supervisor's
+        # action wiring lands so the bridge gate actually clears.
+        self._ebs_reset_pub = self.create_lifecycle_publisher(
+            Empty, "/signal/ebs_reset", latched)
 
         # Diagnostic publishers (#260 follow-up). v_set tracks the
         # longitudinal controller's setpoint each tick; kappa_max
@@ -107,23 +146,112 @@ class ControlNode(Node):
         # alongside SLAM v in slam_debug.json — if v_set doesn't drop
         # going into a corner, the velocity profile isn't being honoured
         # and that's why the car carries too much speed into the apex.
-        self._v_set_pub = self.create_publisher(Float32, "/control/v_set_mps", 10)
-        self._kappa_max_pub = self.create_publisher(
+        self._v_set_pub = self.create_lifecycle_publisher(
+            Float32, "/control/v_set_mps", 10)
+        self._kappa_max_pub = self.create_lifecycle_publisher(
             Float32, "/control/kappa_max_per_m", 10)
 
-        # Subscribers
-        self.create_subscription(Path, "Path", self._on_path, 10)
-        self.create_subscription(Odometry, "/cone_slam/state", self._on_odom, 10)
-        self.create_subscription(MarkerArray, "/Conos_Orange", self._on_orange, 10)
+        # TF listener — cone_graph_slam publishes odom→base_link.
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        # Tick
-        self.create_timer(1.0 / self.PUBLISH_RATE_HZ, self._tick)
+        return TransitionCallbackReturn.SUCCESS
 
+    def on_activate(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
         self.get_logger().info(
-            f"control_node: lateral={self.lateral.__class__.__name__} "
-            f"longitudinal={self.longitudinal.__class__.__name__} "
-            f"@ {self.PUBLISH_RATE_HZ:.0f} Hz"
-        )
+            f"on_activate: subs + 40 Hz timer "
+            f"(lateral={type(self.lateral).__name__}, "
+            f"longitudinal={type(self.longitudinal).__name__})")
+
+        # Reset all per-run state so deactivate→activate is a fresh run.
+        self._latest_odom = None
+        self._latest_path_xs = []
+        self._latest_path_ys = []
+        self._latest_path_kappas = []
+        self._stop_anchor_xy = None
+        self._stop_latched = False
+        self._travelled = 0.0
+        self._last_pose_xy = None
+        self._last_throttle = 0.0
+        self._last_regen = 0.0
+        self._last_steering = 0.0
+        self._tick_count = 0
+
+        # Clear the bridge's EBS gate now and keep retrying briefly to
+        # win the subscriber-matching race.
+        self._ebs_reset_retries = 4
+        self._ebs_reset_pub.publish(Empty())
+        self._ebs_reset_timer = self.create_timer(
+            0.5, self._republish_ebs_reset)
+
+        # Subscriptions
+        self._sub_path = self.create_subscription(
+            Path, "Path", self._on_path, 10)
+        self._sub_odom = self.create_subscription(
+            Odometry, "/cone_slam/state", self._on_odom, 10)
+        self._sub_orange = self.create_subscription(
+            MarkerArray, "/Conos_Orange", self._on_orange, 10)
+
+        # 40 Hz tick
+        self._tick_timer = self.create_timer(
+            1.0 / self.PUBLISH_RATE_HZ, self._tick)
+
+        return super().on_activate(state)
+
+    def on_deactivate(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_deactivate: dropping timers + subs")
+        for sub in (self._sub_path, self._sub_odom, self._sub_orange):
+            if sub is not None:
+                self.destroy_subscription(sub)
+        self._sub_path = None
+        self._sub_odom = None
+        self._sub_orange = None
+        for tmr in (self._tick_timer, self._ebs_reset_timer):
+            if tmr is not None:
+                self.destroy_timer(tmr)
+        self._tick_timer = None
+        self._ebs_reset_timer = None
+        return super().on_deactivate(state)
+
+    def on_cleanup(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_cleanup: destroying publishers + TF")
+        for sub in (self._sub_path, self._sub_odom, self._sub_orange):
+            if sub is not None:
+                self.destroy_subscription(sub)
+        self._sub_path = None
+        self._sub_odom = None
+        self._sub_orange = None
+        for tmr in (self._tick_timer, self._ebs_reset_timer):
+            if tmr is not None:
+                self.destroy_timer(tmr)
+        self._tick_timer = None
+        self._ebs_reset_timer = None
+        for pub in (self._cmd_pub, self._ebs_pub, self._ebs_reset_pub,
+                    self._v_set_pub, self._kappa_max_pub):
+            if pub is not None:
+                self.destroy_publisher(pub)
+        self._cmd_pub = None
+        self._ebs_pub = None
+        self._ebs_reset_pub = None
+        self._v_set_pub = None
+        self._kappa_max_pub = None
+        self._tf_listener = None
+        self._tf_buffer = None
+        self.lateral = None
+        self.longitudinal = None
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_shutdown(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_shutdown")
+        return TransitionCallbackReturn.SUCCESS
 
     # ------------------------------------------------------------------ params
 

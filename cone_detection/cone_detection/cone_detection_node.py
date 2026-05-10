@@ -1,4 +1,4 @@
-"""ROS 2 node wrapping cone_detection.final_cone_result_rt.
+"""ROS 2 LifecycleNode wrapping cone_detection.final_cone_result_rt.
 
 Subscribes to /fsds/lidar/Lidar1 (sensor_msgs/PointCloud2) and
 publishes:
@@ -13,12 +13,28 @@ publishes:
 Held in its own ROS node (rather than fused into cone_graph_slam) so
 the Numba JIT compile happens once at startup and persists across
 SLAM/control restarts during dev.
+
+Lifecycle layout (driven by mode_manager → change_state):
+
+  on_configure    create lifecycle publishers + run Numba JIT warmup
+                  (the expensive ~10-20 s step). Lands during Phase 1
+                  `warming_up`; supervisor heartbeats absorb the
+                  delay so downstream timeouts don't trip.
+  on_activate     create LiDAR subscription, reset per-second diag
+                  counters, super().on_activate() flips publishers to
+                  emitting state.
+  on_deactivate   destroy LiDAR subscription so a deactivated node
+                  doesn't burn CPU parsing dropped scans.
+  on_cleanup      destroy publishers, reset all state. Re-configuring
+                  re-runs warmup (rare; normally the container holds
+                  the node in inactive between missions).
 """
 
 import numpy as np
 
 import rclpy
-from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn, State
 from rclpy.qos import (
     QoSDurabilityPolicy,
     QoSHistoryPolicy,
@@ -39,8 +55,10 @@ QOS_LATEST = QoSProfile(
 )
 
 
-class Cone_Detection(Node):
-    """Publishes per-scan cone observations from final_cone_result_rt."""
+class ConeDetectionNode(LifecycleNode):
+    """LifecycleNode publishing per-scan cone observations."""
+
+    NODE_NAME = "cone_detection_node"
 
     # Cluster-height threshold separating big-orange cones (505 mm tall per
     # DS Table 1) from small blue/yellow/orange cones (325 mm). Live-measured
@@ -54,30 +72,82 @@ class Cone_Detection(Node):
     BIG_ORANGE_HEIGHT_THRESHOLD_M = 0.30
 
     def __init__(self):
-        super().__init__("Cone_Detection")
-        self.publisher_MarkerArray = self.create_publisher(MarkerArray, "Conos_raw", 10)
+        super().__init__(self.NODE_NAME)
+        # All I/O is created in on_configure / on_activate. Keep
+        # __init__ side-effect-free so a freshly constructed but
+        # unconfigured node holds no resources.
+        self._pub_markers = None
+        self._pub_orange = None
+        self._sub = None
+        self._reset_diag()
+
+    # ------------------------------------------------------------------
+    # Lifecycle transitions
+    # ------------------------------------------------------------------
+    def on_configure(self, state: State) -> TransitionCallbackReturn:
+        self.get_logger().info("on_configure: creating publishers + Numba warmup")
+        self._pub_markers = self.create_lifecycle_publisher(
+            MarkerArray, "Conos_raw", 10,
+        )
         # Dedicated stream of big-orange cones (the FS finish-line markers).
         # Kept separate from /Conos_raw so SLAM's blue/yellow classifier
         # doesn't need to learn about orange, and so downstream consumers
         # (autonomous-stop logic in the control node) can subscribe without
         # filtering the whole cone list. Positions are in the car frame.
-        self.publisher_Orange = self.create_publisher(MarkerArray, "Conos_Orange", 10)
-        self.subscription = self.create_subscription(
-            PointCloud2, "/fsds/lidar/Lidar1", self.listener_callback, QOS_LATEST
+        self._pub_orange = self.create_lifecycle_publisher(
+            MarkerArray, "Conos_Orange", 10,
         )
+        # Numba JIT compile — the dominant cost of bringing this node up.
+        # Lives in on_configure (not on_activate) so an inactive→active
+        # toggle is instant.
+        self.get_logger().info("warming up Numba kernels (10-20 s)")
         warmup_numba_functions()
+        self.get_logger().info("Numba warmup complete")
+        return TransitionCallbackReturn.SUCCESS
 
-        self.n_cones = 0
-        # Per-second diagnostic accumulator for the cluster-filter pipeline.
-        # Each LiDAR scan populates per-stage cluster counts via
-        # final_cone_result_rt(debug_counters=...); we sum across scans and
-        # log a single summary line per second. Helps localise where cones
-        # are getting filtered out (issue #177).
-        self._diag = {}
-        self._diag_n_scans = 0
-        self._diag_last_log_ns = 0
+    def on_activate(self, state: State) -> TransitionCallbackReturn:
+        self.get_logger().info("on_activate: subscribing to /fsds/lidar/Lidar1")
+        self._reset_diag()
+        self._sub = self.create_subscription(
+            PointCloud2, "/fsds/lidar/Lidar1", self.listener_callback, QOS_LATEST,
+        )
+        return super().on_activate(state)
 
+    def on_deactivate(self, state: State) -> TransitionCallbackReturn:
+        self.get_logger().info("on_deactivate: dropping LiDAR subscription")
+        if self._sub is not None:
+            self.destroy_subscription(self._sub)
+            self._sub = None
+        return super().on_deactivate(state)
+
+    def on_cleanup(self, state: State) -> TransitionCallbackReturn:
+        self.get_logger().info("on_cleanup: destroying publishers")
+        if self._sub is not None:
+            self.destroy_subscription(self._sub)
+            self._sub = None
+        if self._pub_markers is not None:
+            self.destroy_publisher(self._pub_markers)
+            self._pub_markers = None
+        if self._pub_orange is not None:
+            self.destroy_publisher(self._pub_orange)
+            self._pub_orange = None
+        self._reset_diag()
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_shutdown(self, state: State) -> TransitionCallbackReturn:
+        self.get_logger().info("on_shutdown")
+        return TransitionCallbackReturn.SUCCESS
+
+    # ------------------------------------------------------------------
+    # Per-scan callback (unchanged from the pre-lifecycle version)
+    # ------------------------------------------------------------------
     def listener_callback(self, msg):
+        # Defensive: shouldn't fire if subscription was destroyed first
+        # in on_deactivate, but a single-threaded executor can't
+        # guarantee mid-callback teardown safety.
+        if self._pub_markers is None:
+            return
+
         # Parse PointCloud2 using point_step to handle any field layout (xyz, xyz+padding, xyzi, etc.)
         floats_per_point = msg.point_step // 4  # bytes per point / 4 bytes per float32
         num_points = msg.width * msg.height
@@ -221,17 +291,39 @@ class Cone_Detection(Node):
                 orange_i += 1
                 orangeArray.markers.append(orange)
 
-        self.publisher_MarkerArray.publish(markerArray)
+        self._pub_markers.publish(markerArray)
         # Publish even when the current scan has no big-orange cones so
         # downstream consumers don't keep a stale cache when the gate exits
         # the LiDAR FoV at close range (the sensor is mounted 1.4 m forward
         # of the car, so cones at the start gate leave the ±60° H-FOV before
         # the car has physically passed them).
-        self.publisher_Orange.publish(orangeArray)
+        self._pub_orange.publish(orangeArray)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _reset_diag(self) -> None:
+        self.n_cones = 0
+        # Per-second diagnostic accumulator for the cluster-filter pipeline.
+        # Each LiDAR scan populates per-stage cluster counts via
+        # final_cone_result_rt(debug_counters=...); we sum across scans and
+        # log a single summary line per second. Helps localise where cones
+        # are getting filtered out (issue #177).
+        self._diag = {}
+        self._diag_n_scans = 0
+        self._diag_last_log_ns = 0
 
 
-def cone_detection(args=None):
-    """Entry point: spin Cone_Detection until SIGINT."""
+def main(args=None) -> None:
+    """Entry point: spin ConeDetectionNode under MultiThreadedExecutor."""
     rclpy.init(args=args)
-    cone = Cone_Detection()
-    rclpy.spin(cone)
+    node = ConeDetectionNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()

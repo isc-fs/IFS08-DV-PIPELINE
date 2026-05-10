@@ -23,7 +23,9 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'Cone_Detection = cone_detection.cone_detection_node:cone_detection',
+            # Lifecycle entry. Node name "cone_detection_node" matches the
+            # AUTONOMY_LIFECYCLE_NODES list in mode_manager.
+            'cone_detection_node = cone_detection.cone_detection_node:main',
         ],
     },
 )

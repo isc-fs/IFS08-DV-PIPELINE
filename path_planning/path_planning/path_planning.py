@@ -1,4 +1,4 @@
-"""Path planning ROS 2 node — thin adapter around the FaSTTUBe planner.
+"""Path planning ROS 2 LifecycleNode — thin adapter around FaSTTUBe.
 
 Subscribes:
   /Conos          (visualization_msgs/MarkerArray) — world-frame cone map
@@ -21,6 +21,16 @@ Algorithm: delegated to `fasttube_adapter.FasttubeAdapter`, which wraps
 is only the ROS 2 plumbing — color decoding, TF lookup, message-shape
 conversion, and per-second instrumentation.
 
+Lifecycle layout:
+
+  on_configure   create lifecycle publishers (/Path + debug overlay),
+                 TF buffer/listener, FaSTTUBe adapter, open optional
+                 DV_PLANNER_CAPTURE file.
+  on_activate    create /Conos subscription, reset rate stats.
+  on_deactivate  destroy /Conos subscription.
+  on_cleanup     destroy publishers, drop adapter + TF listener, close
+                 capture file.
+
 History:
   - PR #243 replaced the in-house Delaunay+best-first walker with the
     FaSTTUBe library. The walker was poisoned by orange-classified false
@@ -41,10 +51,14 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List
+from typing import List, Optional
 
 import rclpy
-from rclpy.node import Node
+from rclpy.lifecycle import (
+    LifecycleNode,
+    TransitionCallbackReturn,
+    State as LifecycleState,
+)
 
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -148,41 +162,33 @@ def _pose_stamped(x: float, y: float, yaw: float,
     return p
 
 
-class Plan_Path(Node):
+class PathPlanningNode(LifecycleNode):
+    """Lifecycle-managed FaSTTUBe planner adapter.
+
+    See module docstring for I/O and the lifecycle split.
+    """
+
+    NODE_NAME = "path_planning_node"
+
     def __init__(self) -> None:
-        super().__init__("Plan_Path")
+        super().__init__(self.NODE_NAME)
 
-        self.publisher_path = self.create_publisher(Path, "Path", 10)
-        # Debug overlay (#254) — three layers in one MarkerArray showing
-        # FaSTTUBe's per-side sorted cones (with virtual cones for
-        # missing sides). Visualises whether the colour-blind sort is
-        # putting cones on the side a human would intuitively call
-        # left/right. Frame matches /Path (`odom`).
-        self.publisher_debug = self.create_publisher(
-            MarkerArray, "/path_planning/debug", 10)
-        self.create_subscription(
-            MarkerArray, "Conos", self._on_cones, 10)
+        # I/O references — populated in on_configure / on_activate.
+        self.publisher_path = None
+        self.publisher_debug = None
+        self._sub = None
 
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_buffer: Optional[Buffer] = None
+        self.tf_listener: Optional[TransformListener] = None
 
-        # FaSTTUBe planner instance. Reused across cone callbacks; the
-        # library is stateless for trackdrive (the only mission this
-        # node currently supports — issue #243 covers skidpad/accel).
-        self._adapter = FasttubeAdapter()
+        self._adapter: Optional[FasttubeAdapter] = None
 
         # Per-second instrumentation. Each callback falls into exactly
         # one bucket; rates are logged every ~1 s in _maybe_log_stats.
         # In a healthy run cb≈publish; everything else is a starvation
         # signal.
-        self._stats = {
-            "callbacks": 0,
-            "no_cones": 0,        # 0 cones after color decode
-            "tf_miss": 0,         # TF lookup failed
-            "plan_empty": 0,      # adapter returned []
-            "publish": 0,
-        }
-        self._stats_prev = dict(self._stats)
+        self._stats: dict = {}
+        self._stats_prev: dict = {}
         self._stats_last_log_ns = 0
 
         # Optional per-tick capture: when DV_PLANNER_CAPTURE is set to
@@ -192,8 +198,37 @@ class Plan_Path(Node):
         # actual SLAM-derived data — synthetic geometries miss the
         # frame-to-frame-instability + sparse-cone failure modes that
         # show up in PIE.
-        self._capture_path = os.environ.get("DV_PLANNER_CAPTURE", "")
+        self._capture_path: str = ""
         self._capture_fh = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle transitions
+    # ------------------------------------------------------------------
+    def on_configure(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_configure: publishers + TF + adapter + capture")
+
+        self.publisher_path = self.create_lifecycle_publisher(
+            Path, "Path", 10)
+        # Debug overlay (#254) — three layers in one MarkerArray showing
+        # FaSTTUBe's per-side sorted cones (with virtual cones for
+        # missing sides). Visualises whether the colour-blind sort is
+        # putting cones on the side a human would intuitively call
+        # left/right. Frame matches /Path (`odom`).
+        self.publisher_debug = self.create_lifecycle_publisher(
+            MarkerArray, "/path_planning/debug", 10)
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # FaSTTUBe planner instance. Reused across cone callbacks; the
+        # library is stateless for trackdrive (the only mission this
+        # node currently supports — issue #243 covers skidpad/accel).
+        self._adapter = FasttubeAdapter()
+
+        # Optional capture file
+        self._capture_path = os.environ.get("DV_PLANNER_CAPTURE", "")
         if self._capture_path:
             try:
                 self._capture_fh = open(self._capture_path, "w")
@@ -202,6 +237,77 @@ class Plan_Path(Node):
             except OSError as ex:
                 self.get_logger().error(f"capture open failed: {ex}")
                 self._capture_fh = None
+
+        self._reset_stats()
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_activate(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_activate: subscribing to /Conos")
+        self._reset_stats()
+        self._sub = self.create_subscription(
+            MarkerArray, "Conos", self._on_cones, 10)
+        return super().on_activate(state)
+
+    def on_deactivate(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_deactivate: dropping /Conos subscription")
+        if self._sub is not None:
+            self.destroy_subscription(self._sub)
+            self._sub = None
+        return super().on_deactivate(state)
+
+    def on_cleanup(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_cleanup: destroying publishers + TF")
+        if self._sub is not None:
+            self.destroy_subscription(self._sub)
+            self._sub = None
+        for pub in (self.publisher_path, self.publisher_debug):
+            if pub is not None:
+                self.destroy_publisher(pub)
+        self.publisher_path = None
+        self.publisher_debug = None
+        self.tf_listener = None
+        self.tf_buffer = None
+        self._adapter = None
+        if self._capture_fh is not None:
+            try:
+                self._capture_fh.close()
+            except Exception:
+                pass
+            self._capture_fh = None
+        self._reset_stats()
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_shutdown(
+        self, state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        self.get_logger().info("on_shutdown")
+        if self._capture_fh is not None:
+            try:
+                self._capture_fh.close()
+            except Exception:
+                pass
+            self._capture_fh = None
+        return TransitionCallbackReturn.SUCCESS
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _reset_stats(self) -> None:
+        self._stats = {
+            "callbacks": 0,
+            "no_cones": 0,        # 0 cones after color decode
+            "tf_miss": 0,         # TF lookup failed
+            "plan_empty": 0,      # adapter returned []
+            "publish": 0,
+        }
+        self._stats_prev = dict(self._stats)
+        self._stats_last_log_ns = 0
 
     def _maybe_log_stats(self) -> None:
         now_ns = self.get_clock().now().nanoseconds
@@ -221,7 +327,16 @@ class Plan_Path(Node):
         self._stats_prev = dict(self._stats)
         self._stats_last_log_ns = now_ns
 
+    # ------------------------------------------------------------------
+    # Cone callback (unchanged behaviour from pre-lifecycle version)
+    # ------------------------------------------------------------------
     def _on_cones(self, msg: MarkerArray) -> None:
+        # Defensive: subscription is destroyed before publishers in
+        # on_deactivate, but a callback already inflight when deactivate
+        # fires can race past that.
+        if self.publisher_path is None or self._adapter is None:
+            return
+
         self._stats["callbacks"] += 1
 
         cones: List[Cone] = []
@@ -300,10 +415,10 @@ class Plan_Path(Node):
         self._maybe_log_stats()
 
 
-def plan_path(args=None) -> None:
-    """Entry point: spin Plan_Path until SIGINT."""
+def main(args=None) -> None:
+    """Entry point: spin PathPlanningNode until SIGINT."""
     rclpy.init(args=args)
-    node = Plan_Path()
+    node = PathPlanningNode()
     try:
         rclpy.spin(node)
     finally:

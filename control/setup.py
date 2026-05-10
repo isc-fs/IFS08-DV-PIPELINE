@@ -22,7 +22,9 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'Control = control.control_node:main',
+            # Lifecycle entry. ROS node name "control_node" matches the
+            # AUTONOMY_LIFECYCLE_NODES list in mode_manager.
+            'control_node = control.control_node:main',
         ],
     },
 )
