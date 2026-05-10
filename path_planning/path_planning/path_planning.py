@@ -1,20 +1,24 @@
 """Path planning ROS 2 LifecycleNode — thin adapter around FaSTTUBe.
 
 Subscribes:
-  /Conos          (visualization_msgs/MarkerArray) — world-frame cone map
-                  from cone_graph_slam. Each marker carries:
-                    - pose.position (x, y, z)        — world-frame cone center
+  /Conos          (visualization_msgs/MarkerArray) — map-frame cone map
+                  from slam_node (was odom-frame pre-#382). Each
+                  marker carries:
+                    - pose.position (x, y, z)        — map-frame cone center
                     - color (r, g, b)                — ignored (cones are position-only)
                     - id                             — persistent landmark id
 
 Publishes:
-  /Path           (nav_msgs/Path) — interpolated centerline in `odom`,
-                  consumed by control.
+  /Path           (nav_msgs/Path) — interpolated centerline in `map`
+                  frame (was `odom` pre-#382), consumed by control.
 
 Looks up TF:
-  odom → base_link  for car position + heading. cone_graph_slam owns
-                    this transform; if it's missing we skip the tick
-                    rather than fall back on a stale or wrong frame.
+  map → base_link  for car position + heading. The chain
+                   map→odom→base_link resolves to SLAM's drift-
+                   corrected absolute pose: slam_node owns map→odom,
+                   sim_supervisor owns odom→base_link. If either edge
+                   is missing we skip the tick rather than fall back
+                   on a stale or wrong frame.
 
 Algorithm: delegated to `fasttube_adapter.FasttubeAdapter`, which wraps
 `fsd_path_planning.PathPlanner` (FaSTTUBe / papalotis, MIT). This module
@@ -77,7 +81,7 @@ from path_planning.fasttube_adapter import FasttubeAdapter, PlanDebug
 def _build_debug_markers(debug: PlanDebug) -> MarkerArray:
     """Pack the FaSTTUBe per-side sorted cones into a MarkerArray.
 
-    Three layers, all in `odom` frame:
+    Three layers, all in `map` frame (was `odom` pre-#382):
       - `left_chain`  blue line strip + spheres   — left_with_virtual
       - `right_chain` yellow line strip + spheres — right_with_virtual
       - DELETEALL leader so previous-frame markers don't accumulate
@@ -92,7 +96,7 @@ def _build_debug_markers(debug: PlanDebug) -> MarkerArray:
 
     clear = Marker()
     clear.action = Marker.DELETEALL
-    clear.header.frame_id = "odom"
+    clear.header.frame_id = "map"
     arr.markers.append(clear)
 
     for ns, color_rgba, idx, xy in (
@@ -103,7 +107,7 @@ def _build_debug_markers(debug: PlanDebug) -> MarkerArray:
             continue
 
         line = Marker()
-        line.header.frame_id = "odom"
+        line.header.frame_id = "map"
         line.ns = ns
         line.id = idx
         line.type = Marker.LINE_STRIP
@@ -117,7 +121,7 @@ def _build_debug_markers(debug: PlanDebug) -> MarkerArray:
         arr.markers.append(line)
 
         spheres = Marker()
-        spheres.header.frame_id = "odom"
+        spheres.header.frame_id = "map"
         spheres.ns = ns
         spheres.id = idx + 10
         spheres.type = Marker.SPHERE_LIST
@@ -150,7 +154,7 @@ def _pose_stamped(x: float, y: float, yaw: float,
     most ~|κ| metres (typically < 0.5 m), barely visible.
     """
     p = PoseStamped()
-    p.header.frame_id = "odom"
+    p.header.frame_id = "map"
     p.pose.position.x = x
     p.pose.position.y = y
     p.pose.position.z = float(curvature)
@@ -353,10 +357,13 @@ class PathPlanningNode(LifecycleNode):
             self._maybe_log_stats()
             return
 
-        # Pose lookup. cone_graph_slam owns odom→base_link.
+        # Pose lookup in map frame (Phase 2 — #382). The chain
+        # map→odom→base_link resolves to SLAM's absolute pose; map→odom
+        # is owned by slam_node (drift correction), odom→base_link
+        # by sim_supervisor (100 Hz dead-reckoning).
         try:
             tf = self.tf_buffer.lookup_transform(
-                "odom", "base_link", rclpy.time.Time())
+                "map", "base_link", rclpy.time.Time())
         except TransformException as ex:
             self.get_logger().warn(f"TF lookup failed: {ex}")
             self._stats["tf_miss"] += 1
@@ -406,7 +413,7 @@ class PathPlanningNode(LifecycleNode):
             return
 
         out = Path()
-        out.header.frame_id = "odom"
+        out.header.frame_id = "map"
         for p in path_points:
             out.poses.append(_pose_stamped(p.x, p.y, p.yaw, p.curvature))
 

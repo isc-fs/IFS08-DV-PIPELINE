@@ -1,7 +1,7 @@
 """IFSSIM autonomy control node — clean rewrite (feat/34).
 
 Single ROS node that:
-  1. Subscribes to /Path (planner), /cone_slam/state (SLAM Odometry),
+  1. Subscribes to /Path (planner), /slam/pose (SLAM Odometry),
      /Conos_Orange (finish-gate detection)
   2. Builds VehicleState + ReferenceTrajectory each tick
   3. Calls a LateralController + LongitudinalController (selected by params)
@@ -74,15 +74,16 @@ class ControlNode(LifecycleNode):
         self.longitudinal: Optional[LongitudinalController] = None
 
         # Latest input state. Reset on every activate.
-        # /cone_slam/state and /odom are split sources post-#360:
-        #   _latest_pose ← /cone_slam/state, used for absolute pose
-        #     (drift-corrected via SLAM cone associations)
+        # /slam/pose and /odom are split sources post-#360/#382:
+        #   _latest_pose ← /slam/pose (was /slam/pose pre-#382),
+        #     used for absolute pose in map frame, drift-corrected via
+        #     SLAM cone associations
         #   _latest_odom ← /odom, used for body-frame twist (high-rate
         #     dead-reckoning from sim_supervisor's IMU+RPM filter, or
         #     from the uDV on the real car).
-        # Pre-#360 these were the same topic (cone_slam/state) which
-        # coupled velocity estimate quality to SLAM DA stability — a
-        # cone-only-DA cascade would corrupt velocity feeding control.
+        # Pre-#360 these were the same topic which coupled velocity
+        # estimate quality to SLAM DA stability — a cone-only-DA
+        # cascade would corrupt velocity feeding control.
         self._latest_pose: Optional[Odometry] = None
         self._latest_odom: Optional[Odometry] = None
         self._latest_path_xs: list[float] = []
@@ -162,7 +163,11 @@ class ControlNode(LifecycleNode):
         self._kappa_max_pub = self.create_lifecycle_publisher(
             Float32, "/control/kappa_max_per_m", 10)
 
-        # TF listener — cone_graph_slam publishes odom→base_link.
+        # TF listener — post-#382 sim_supervisor publishes
+        # odom→base_link (100 Hz dead-reckoning) and slam_node
+        # publishes map→odom (drift correction). The chain
+        # map→odom→base_link gives the leaf-pose used for waypoint
+        # projection.
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
@@ -204,7 +209,7 @@ class ControlNode(LifecycleNode):
         # Absolute pose — comes from SLAM at LiDAR tick rate (~10 Hz).
         # Used for x/y/yaw and the gate-latch body→world projection.
         self._sub_pose = self.create_subscription(
-            Odometry, "/cone_slam/state", self._on_pose, 10)
+            Odometry, "/slam/pose", self._on_pose, 10)
         # Body-frame twist — comes from sim_supervisor (or uDV on the
         # real car) at ~100 Hz from the IMU+RPM complementary filter.
         # Drifty over time but high-rate, so the controller's velocity
@@ -398,7 +403,7 @@ class ControlNode(LifecycleNode):
 
         The cones come in base_link (vehicle frame), so we transform via
         the latest *absolute* pose — close enough at the moment of latch
-        since the car is still ~10 m from the gate. Uses /cone_slam/state
+        since the car is still ~10 m from the gate. Uses /slam/pose
         rather than /odom because the stop anchor is a long-lived
         world-frame point and dead-reckoning drift would walk it
         across laps."""
@@ -571,7 +576,7 @@ class ControlNode(LifecycleNode):
 
     def _build_state(self) -> Optional[VehicleState]:
         """Compose VehicleState from two sources:
-          • pose (x, y, yaw) from /cone_slam/state — SLAM's drift-
+          • pose (x, y, yaw) from /slam/pose — SLAM's drift-
             corrected absolute pose, ~10 Hz.
           • twist (vx, vy, yaw_rate) from /odom — sim_supervisor's
             (or uDV's) dead-reckoning IMU+RPM filter, ~100 Hz.

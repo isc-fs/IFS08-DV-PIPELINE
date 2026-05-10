@@ -4,13 +4,26 @@ Subscribes:
     /imu               (sensor_msgs/Imu, BEST_EFFORT, ~400 Hz)
     /Conos_raw         (visualization_msgs/MarkerArray, base_link
                        frame, 10 Hz from Cone_Detection)
+    /odom              (nav_msgs/Odometry from sim_supervisor, 100 Hz)
+                       Phase 2 (#382): used to compute map→odom drift
+                       correction. slam_node's pose is absolute (map
+                       frame); supervisor's /odom is dead-reckoning
+                       (odom frame); the difference is the drift to
+                       absorb into the map→odom transform.
 
 Publishes:
-    /tf                (odom -> base_link)
-    /cone_slam/state   (nav_msgs/Odometry — pose+velocity at base_link)
-    /Conos             (visualization_msgs/MarkerArray, world-frame
+    /tf                (map -> odom, dynamic drift correction
+                       computed as slam_pose ⊖ latest /odom; replaces
+                       the pre-#382 odom→base_link broadcast which
+                       supervisor now owns)
+    /slam/pose         (nav_msgs/Odometry — absolute pose+velocity in
+                       map frame; renamed from /cone_slam/state in
+                       #382 so the topic name doesn't lock us into
+                       "cone_slam" when we eventually swap iSAM2
+                       backends)
+    /Conos             (visualization_msgs/MarkerArray, MAP-frame
                        cone map with persistent landmark IDs encoded
-                       as marker.id)
+                       as marker.id; was odom-frame pre-#382)
 
 State machine:
     INIT_WAITING_IMU  → INIT_CALIBRATING (3 s) → SLAM_RUNNING
@@ -52,7 +65,7 @@ from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Float32
-from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
+from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import Marker, MarkerArray
 
 # color_classifier deleted: SLAM is position-only, no per-cone colour
@@ -71,6 +84,11 @@ def _odom_to_pose3(msg: Odometry) -> "gtsam.Pose3":
         gtsam.Rot3.Quaternion(q.w, q.x, q.y, q.z),
         np.array([p.x, p.y, p.z]),
     )
+
+
+# compute_map_to_odom lives in cone_slam.tf_math (pure-Python helper,
+# no rclpy import, unit-testable). Re-imported here for the call site.
+from cone_slam.tf_math import compute_map_to_odom  # noqa: E402, F401
 
 
 CALIBRATION_SECONDS = 3.0
@@ -148,7 +166,11 @@ class ConeGraphSlamNode(LifecycleNode):
         # --- Parameter declarations live in __init__ so they exist
         # before configure (mode_manager will eventually pre-set the
         # mission strategy flag via parameters).
-        # Frames (REP-105):
+        # Frames (REP-105). Post-#382 the SLAM-owned absolute frame
+        # is `map`, not `odom` — the `odom` frame is supervisor's
+        # dead-reckoning, slam computes `map → odom` to absorb the
+        # difference. Backward-compat parameter names preserved.
+        self.declare_parameter("map_frame", "map")
         self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("base_frame", "base_link")
         # Pose-jump sanity check thresholds (#273 follow-up).
@@ -167,6 +189,7 @@ class ConeGraphSlamNode(LifecycleNode):
         self.declare_parameter("pose_jump_max_yaw_rad", 0.3)
 
         # I/O references — populated in on_configure / on_activate.
+        self.map_frame: str = ""
         self.odom_frame: str = ""
         self.base_frame: str = ""
         self._preint: Optional[ImuPreintegrator] = None
@@ -196,9 +219,15 @@ class ConeGraphSlamNode(LifecycleNode):
         self._sub_rpm = None
         self._sub_gt = None
 
+        # Subscription for sim_supervisor's /odom (Phase 2 #382 —
+        # needed to compute map→odom drift correction). Cached
+        # latest sample is consumed in _publish_map_to_odom on each
+        # scan tick.
+        self._sub_supervisor_odom = None
+        self._latest_supervisor_odom: Optional[Odometry] = None
+
         # Publisher / broadcaster handles (created in on_configure)
         self._tf_broadcaster = None
-        self._static_tf_broadcaster = None
         self._state_pub = None
         self._cones_pub = None
         self._gt_aligned_pub = None
@@ -212,6 +241,7 @@ class ConeGraphSlamNode(LifecycleNode):
     ) -> TransitionCallbackReturn:
         self.get_logger().info("on_configure: components + publishers + static TF")
 
+        self.map_frame = self.get_parameter("map_frame").value
         self.odom_frame = self.get_parameter("odom_frame").value
         self.base_frame = self.get_parameter("base_frame").value
 
@@ -245,38 +275,37 @@ class ConeGraphSlamNode(LifecycleNode):
                 self.get_logger().error(f"landmark capture open failed: {ex}")
                 self._lm_capture_fh = None
 
-        # Publishers (lifecycle — silent until on_activate)
+        # Publishers (lifecycle — silent until on_activate).
+        # Phase 2 (#382): /cone_slam/state renamed to /slam/pose so
+        # the topic doesn't bind to "cone_slam" as the algorithm
+        # implementation. Frame_id flipped from odom → map (pose is
+        # SLAM-absolute, drift-corrected; map→odom→base_link chain
+        # resolves to the same value via TF).
         self._state_pub = self.create_lifecycle_publisher(
-            Odometry, "/cone_slam/state", 10)
+            Odometry, "/slam/pose", 10)
         self._cones_pub = self.create_lifecycle_publisher(
             MarkerArray, "/Conos", 10)
         # GT-aligned diagnostic odometry. Same Odometry shape as
-        # /cone_slam/state but containing the ground truth re-expressed
-        # in SLAM's anchored body-frame world. SLAM-vs-GT divergence in
+        # /slam/pose but containing the ground truth re-expressed in
+        # SLAM's anchored body-frame world. SLAM-vs-GT divergence in
         # this frame is the actual SLAM drift; in the raw GT frame it
-        # would be that drift plus the static frame mismatch.
+        # would be that drift plus the static frame mismatch. Topic
+        # name stays under /cone_slam/* — that's the diagnostic-only
+        # namespace, separate from /slam/* which is the production
+        # consumer surface.
         self._gt_aligned_pub = self.create_lifecycle_publisher(
             Odometry, "/cone_slam/gt_aligned", 10)
-        # Scalar position-error magnitude — convenience for the
-        # Lichtblick plot, equal to ||state.position - gt_aligned.position||.
         self._gt_error_pub = self.create_lifecycle_publisher(
             Float32, "/cone_slam/gt_error_m", 10)
 
-        # TF broadcasters are non-lifecycle (tf2 doesn't ship lifecycle
-        # variants). Created here so the static `map -> odom` identity
-        # can land before any subscriber comes up.
+        # TF broadcaster — non-lifecycle (tf2 doesn't ship lifecycle
+        # variants). Used to publish the dynamic `map → odom` drift
+        # correction inside _publish_map_to_odom, called per scan
+        # tick from _on_cones. Pre-#382 slam owned odom→base_link
+        # AND a static map→odom identity; both are retired.
+        # sim_supervisor now owns odom→base_link at 100 Hz; slam owns
+        # map→odom at scan rate (~10 Hz).
         self._tf_broadcaster = TransformBroadcaster(self)
-        self._static_tf_broadcaster = StaticTransformBroadcaster(self)
-        # Anchor `map -> odom` as identity on /tf_static. We don't
-        # have map-based localization (no GPS-aligned global frame),
-        # so the SLAM odom frame IS effectively the map frame for
-        # downstream consumers. Without this static, Lichtblick's 3D
-        # panel has no root and nothing renders — the cone map and
-        # the trajectory both anchor on `odom`, which dangles off
-        # /tf_static at recording time. The transform itself is
-        # identity; the publisher exists purely to give visualizers
-        # a parent frame to walk from.
-        self._publish_map_to_odom_static()
 
         return TransitionCallbackReturn.SUCCESS
 
@@ -285,7 +314,8 @@ class ConeGraphSlamNode(LifecycleNode):
     ) -> TransitionCallbackReturn:
         self.get_logger().info(
             "on_activate: subscriptions + state-machine reset "
-            f"(odom='{self.odom_frame}', base='{self.base_frame}')")
+            f"(map='{self.map_frame}', odom='{self.odom_frame}', "
+            f"base='{self.base_frame}')")
 
         # Reset state machine and runtime state. A deactivate→activate
         # cycle should look like a fresh run, not a resumed one — the
@@ -360,6 +390,21 @@ class ConeGraphSlamNode(LifecycleNode):
         self._sub_gt = self.create_subscription(
             Odometry, "/testing_only/odom", self._on_gt_odom, gt_qos)
 
+        # /odom from sim_supervisor (Phase 2 — #382). Cached and
+        # consumed in _publish_map_to_odom on every scan tick to
+        # compute the drift-correction transform. RELIABLE since
+        # supervisor publishes at 100 Hz and we only need fresh
+        # samples every ~100 ms — dropped samples would cause
+        # transient map→odom inconsistency.
+        odom_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        self._sub_supervisor_odom = self.create_subscription(
+            Odometry, "/odom", self._on_supervisor_odom, odom_qos)
+
         return super().on_activate(state)
 
     def on_deactivate(
@@ -367,13 +412,15 @@ class ConeGraphSlamNode(LifecycleNode):
     ) -> TransitionCallbackReturn:
         self.get_logger().info("on_deactivate: dropping subscriptions")
         for sub in (self._sub_imu, self._sub_cones,
-                    self._sub_rpm, self._sub_gt):
+                    self._sub_rpm, self._sub_gt,
+                    self._sub_supervisor_odom):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_imu = None
         self._sub_cones = None
         self._sub_rpm = None
         self._sub_gt = None
+        self._sub_supervisor_odom = None
         return super().on_deactivate(state)
 
     def on_cleanup(
@@ -381,13 +428,15 @@ class ConeGraphSlamNode(LifecycleNode):
     ) -> TransitionCallbackReturn:
         self.get_logger().info("on_cleanup: destroying publishers + components")
         for sub in (self._sub_imu, self._sub_cones,
-                    self._sub_rpm, self._sub_gt):
+                    self._sub_rpm, self._sub_gt,
+                    self._sub_supervisor_odom):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_imu = None
         self._sub_cones = None
         self._sub_rpm = None
         self._sub_gt = None
+        self._sub_supervisor_odom = None
 
         for pub in (self._state_pub, self._cones_pub,
                     self._gt_aligned_pub, self._gt_error_pub):
@@ -398,9 +447,11 @@ class ConeGraphSlamNode(LifecycleNode):
         self._gt_aligned_pub = None
         self._gt_error_pub = None
 
-        # tf2 broadcasters are not lifecycle-aware; drop the refs.
+        # tf2 broadcasters are not lifecycle-aware; drop the ref.
+        # The static map→odom broadcaster was retired in #382 (map→odom
+        # is now dynamic, computed from slam_pose ⊖ /odom).
         self._tf_broadcaster = None
-        self._static_tf_broadcaster = None
+        self._latest_supervisor_odom = None
 
         # Components
         self._preint = None
@@ -659,7 +710,7 @@ class ConeGraphSlamNode(LifecycleNode):
             self._latest_result = result
             self._preint.update_bias(result.bias)
             self._db.update_from_estimate(self._graph.landmark_position)
-            self._publish_tf(stamp, result)
+            self._publish_map_to_odom(stamp, result)
             self._publish_state(stamp, result)
             self._publish_cone_map(stamp)
             per_scan["skipped"] = 1
@@ -751,7 +802,7 @@ class ConeGraphSlamNode(LifecycleNode):
         # uses iSAM2-corrected positions, not stale initial guesses.
         self._db.update_from_estimate(self._graph.landmark_position)
 
-        self._publish_tf(stamp, result)
+        self._publish_map_to_odom(stamp, result)
         self._publish_state(stamp, result)
         self._publish_cone_map(stamp)
 
@@ -865,47 +916,73 @@ class ConeGraphSlamNode(LifecycleNode):
 
     # ----- output ------------------------------------------------------------
 
-    def _publish_tf(self, stamp, result: ScanResult) -> None:
-        # Internal pose is Pose3 (6-DOF); we emit the TF as-is. The
-        # decision in the design doc was to project to 2D for output,
-        # but TransformStamped is naturally 3D — Foxglove / RViz still
-        # render it correctly. We can flatten z/roll/pitch later if
-        # downstream consumers care.
+    def _on_supervisor_odom(self, msg: Odometry) -> None:
+        """Cache sim_supervisor's latest /odom sample for map→odom math."""
+        self._latest_supervisor_odom = msg
+
+    def _publish_map_to_odom(self, stamp, result: ScanResult) -> None:
+        """Broadcast the dynamic `map → odom` transform (Phase 2 #382).
+
+        We need a SE(2) transform that, composed with the supervisor's
+        latest `odom → base_link`, yields slam's absolute pose in map:
+
+            T_map_base   = T_map_odom · T_odom_base
+            ⇒ T_map_odom = T_map_base · T_odom_base⁻¹
+
+        In 2D this is:
+            Δyaw = slam_yaw - odom_yaw
+            Δpos = slam_pos - R(Δyaw) · odom_pos
+
+        Fallback: until the supervisor's `/odom` is flowing (the
+        first ~3 s after activate, during the filter's stationary
+        calibration window), broadcast map → odom as identity. This
+        keeps Lichtblick's TF tree rooted; the chain map→odom→base_link
+        is fully dynamic post-Phase-2, no /tf_static needed.
+        """
+        slam_pose = result.pose
+        slam_x = slam_pose.x()
+        slam_y = slam_pose.y()
+        slam_yaw = slam_pose.rotation().yaw()
+
+        if self._latest_supervisor_odom is None:
+            # Identity fallback during the supervisor calibration window
+            # ^ if supervisor hasn't started, treat its odom frame as
+            # coincident with map; map→odom = slam_pose itself, so
+            # downstream consumers still see slam's pose at the leaf.
+            dx, dy, dyaw = slam_x, slam_y, slam_yaw
+        else:
+            sup = self._latest_supervisor_odom.pose.pose
+            sup_x = sup.position.x
+            sup_y = sup.position.y
+            # Supervisor's quaternion is axis-z only (2D yaw); the
+            # full-precision recovery is 2·atan2(qz, qw). q.w can be
+            # negative but yaw stays in (-π, π] from atan2.
+            sup_yaw = 2.0 * np.arctan2(sup.orientation.z, sup.orientation.w)
+            dx, dy, dyaw = compute_map_to_odom(
+                slam_x, slam_y, slam_yaw,
+                sup_x, sup_y, sup_yaw,
+            )
+
         t = TransformStamped()
         t.header.stamp = stamp
-        t.header.frame_id = self.odom_frame
-        t.child_frame_id = self.base_frame
-        pose = result.pose
-        t.transform.translation.x = pose.x()
-        t.transform.translation.y = pose.y()
-        t.transform.translation.z = pose.z()
-        q = pose.rotation().toQuaternion()
-        t.transform.rotation.w = q.w()
-        t.transform.rotation.x = q.x()
-        t.transform.rotation.y = q.y()
-        t.transform.rotation.z = q.z()
-        self._tf_broadcaster.sendTransform(t)
-
-    def _publish_map_to_odom_static(self) -> None:
-        """Emit `map -> odom` identity on /tf_static once at startup.
-
-        Lichtblick (and rviz2) need a static root that the dynamic
-        chain can hang off; without one the 3D panel renders nothing.
-        Recording-time consumers see this single message at t=0 and
-        keep it for the rest of the run, so it costs effectively
-        nothing per scan.
-        """
-        t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = "map"
+        t.header.frame_id = self.map_frame
         t.child_frame_id = self.odom_frame
-        t.transform.rotation.w = 1.0
-        self._static_tf_broadcaster.sendTransform(t)
+        t.transform.translation.x = float(dx)
+        t.transform.translation.y = float(dy)
+        t.transform.translation.z = 0.0
+        half = 0.5 * float(dyaw)
+        t.transform.rotation.w = float(np.cos(half))
+        t.transform.rotation.x = 0.0
+        t.transform.rotation.y = 0.0
+        t.transform.rotation.z = float(np.sin(half))
+        self._tf_broadcaster.sendTransform(t)
 
     def _publish_state(self, stamp, result: ScanResult) -> None:
         msg = Odometry()
         msg.header.stamp = stamp
-        msg.header.frame_id = self.odom_frame
+        # Phase 2 (#382): pose is SLAM's absolute estimate — map frame,
+        # not odom. Twist still lives in child_frame_id (base_link).
+        msg.header.frame_id = self.map_frame
         msg.child_frame_id = self.base_frame
         pose = result.pose
         msg.pose.pose.position.x = pose.x()
@@ -957,7 +1034,9 @@ class ConeGraphSlamNode(LifecycleNode):
 
         out = Odometry()
         out.header.stamp = stamp
-        out.header.frame_id = self.odom_frame
+        # GT-aligned diagnostic lives in the same frame as /slam/pose
+        # so Lichtblick can plot them on the same axis post-Phase-2.
+        out.header.frame_id = self.map_frame
         out.child_frame_id = "gt"
         out.pose.pose.position.x = gt_aligned.x()
         out.pose.pose.position.y = gt_aligned.y()
@@ -992,9 +1071,12 @@ class ConeGraphSlamNode(LifecycleNode):
 
         out = MarkerArray()
         # First marker is DELETEALL so visualizers refresh cleanly.
+        # Phase 2 (#382): /Conos now lives in map frame, not odom.
+        # Landmark positions in self._db were always SLAM-absolute;
+        # only the frame label needed updating.
         delete_all = Marker()
         delete_all.header.stamp = stamp
-        delete_all.header.frame_id = self.odom_frame
+        delete_all.header.frame_id = self.map_frame
         delete_all.action = Marker.DELETEALL
         out.markers.append(delete_all)
 
@@ -1008,7 +1090,7 @@ class ConeGraphSlamNode(LifecycleNode):
         for lm in self._db:
             m = Marker()
             m.header.stamp = stamp
-            m.header.frame_id = self.odom_frame
+            m.header.frame_id = self.map_frame
             m.id = lm.id
             m.type = Marker.CYLINDER
             m.action = Marker.ADD
