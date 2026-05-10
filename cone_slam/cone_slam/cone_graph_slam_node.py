@@ -88,20 +88,26 @@ MAX_OBSERVATION_RANGE_M = 25.0
 
 # Motor-RPM → body-frame longitudinal velocity.
 #
-# The doc-derived constant from docs/dv_pipeline_rebuild.md §3.5
-# was 0.00821, computed as (2π × 0.228 / 2.909) / 60 (i.e.
-# WheelRadius=0.228 m, GearRatio=2.909). On 2026-04-28 a full bag
-# diagnostic against trackA_manual_001602's GT odometry showed the
-# documented constant was 8.6 % too low — the actual mean ratio of
-# rpm-derived speed to GT speed across 7000+ motion samples was
-# 0.9144. The simulator's effective wheel circumference / gear-ratio
-# product corresponds to a constant of 0.00821 / 0.9144 ≈ 0.00898
-# (equivalently: an effective wheel radius of ~0.249 m if we trust
-# the gear ratio, or an effective gear ratio of ~2.66 if we trust the
-# wheel radius). Using the doc constant systematically pulled the
-# velocity prior toward an underestimated speed → ~7 m of position
-# underestimate over 80 m of driving. Empirical constant adopted.
-RPM_TO_MS = 0.00898
+# 2026-05-10 re-derivation (issue #380, supersedes the 2026-04-28
+# value of 0.00898): bagged /odom (sim_supervisor's IMU+RPM filter
+# output) and /testing_only/odom over a 41 s motion window on
+# test_submodule.csv, paired samples within ±50 ms, observed
+# mean(|GT.vx|) / mean(|filter.vx|) = 0.9140 — implying the previous
+# 0.00898 produces a +9.4 % vx overestimate. The previous April
+# diagnostic compared raw RPM×const directly to GT; today's compares
+# filter-output to GT, which is the closed-loop quantity consumers
+# (including this node, via the velocity prior) actually see.
+#
+# The new value 0.00898 × 0.9140 = 0.00821 recovers exactly the
+# pure-geometry doc-derived form from docs/dv_pipeline_rebuild.md
+# §3.5:
+#     RPM_TO_MS = (2π × WheelRadius / GearRatio) / 60
+#               = (2π × 0.228 / 2.909) / 60 = 0.00821
+#
+# Keeping the constant in sync with sim_supervisor's OdometryFilter
+# (single source of truth — both consumers depend on the same
+# value).
+RPM_TO_MS = 0.00821
 
 # Drop /motor_rpm samples this old (seconds). Sustained RPM staleness
 # means the bridge stopped publishing; fall back to no velocity prior

@@ -24,10 +24,51 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn, State
 
-from lifecycle_msgs.msg import Transition
-from lifecycle_msgs.srv import ChangeState
+from lifecycle_msgs.msg import State as LifecycleStateMsg, Transition
+from lifecycle_msgs.srv import ChangeState, GetState
 
 from dv_msgs.srv import ActivateMode
+
+
+# Mapping from a lifecycle transition ID → the state ID it lands in.
+# Used by _drive_transition's pre-check: if the node is already in
+# the target state (or past it on the path we're walking), skip the
+# change_state call. Makes activate_mode idempotent — calling
+# activate_mode("trackdrive") twice in a row, or activate_mode("")
+# on an already-unconfigured stack, succeeds without invalid-
+# transition errors.
+_TRANSITION_TARGET_STATE: dict[int, int] = {
+    Transition.TRANSITION_CONFIGURE:  LifecycleStateMsg.PRIMARY_STATE_INACTIVE,
+    Transition.TRANSITION_ACTIVATE:   LifecycleStateMsg.PRIMARY_STATE_ACTIVE,
+    Transition.TRANSITION_DEACTIVATE: LifecycleStateMsg.PRIMARY_STATE_INACTIVE,
+    Transition.TRANSITION_CLEANUP:    LifecycleStateMsg.PRIMARY_STATE_UNCONFIGURED,
+}
+
+# Per bring-up / tear-down direction, the set of states from which a
+# transition is a no-op (we're already at or past the goal).
+#
+# bring_up (CONFIGURE then ACTIVATE):
+#   • CONFIGURE: skip if already in inactive or active
+#   • ACTIVATE:  skip if already in active
+# tear_down (DEACTIVATE then CLEANUP):
+#   • DEACTIVATE: skip if already in inactive or unconfigured
+#   • CLEANUP:    skip if already in unconfigured
+_TRANSITION_SKIP_STATES: dict[int, frozenset[int]] = {
+    Transition.TRANSITION_CONFIGURE: frozenset({
+        LifecycleStateMsg.PRIMARY_STATE_INACTIVE,
+        LifecycleStateMsg.PRIMARY_STATE_ACTIVE,
+    }),
+    Transition.TRANSITION_ACTIVATE: frozenset({
+        LifecycleStateMsg.PRIMARY_STATE_ACTIVE,
+    }),
+    Transition.TRANSITION_DEACTIVATE: frozenset({
+        LifecycleStateMsg.PRIMARY_STATE_INACTIVE,
+        LifecycleStateMsg.PRIMARY_STATE_UNCONFIGURED,
+    }),
+    Transition.TRANSITION_CLEANUP: frozenset({
+        LifecycleStateMsg.PRIMARY_STATE_UNCONFIGURED,
+    }),
+}
 
 
 # Names of the autonomy LifecycleNodes that mode_manager fans out to.
@@ -75,6 +116,11 @@ class ModeManagerNode(LifecycleNode):
         # on the call stack. Without this the default mutually-exclusive
         # group would deadlock.
         self._cb_group = ReentrantCallbackGroup()
+        # get_state clients for the pre-check that makes _fan_out
+        # idempotent (skip transitions whose target state is already
+        # reached). Lazy-created in on_configure alongside the
+        # change_state clients.
+        self._get_state_clients: dict[str, rclpy.client.Client] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle transitions
@@ -87,15 +133,20 @@ class ModeManagerNode(LifecycleNode):
             self._handle_activate_mode,
             callback_group=self._cb_group,
         )
-        # One change_state client per managed autonomy node. ROS will
-        # not error if the server isn't up yet; wait_for_service is
-        # used at call-time inside _drive_transition.
+        # One change_state + one get_state client per managed autonomy
+        # node. ROS will not error if the server isn't up yet;
+        # wait_for_service is used at call-time inside the helpers.
         for name, managed in AUTONOMY_LIFECYCLE_NODES:
             if not managed:
                 continue
             self._change_state_clients[name] = self.create_client(
                 ChangeState,
                 f"/{name}/change_state",
+                callback_group=self._cb_group,
+            )
+            self._get_state_clients[name] = self.create_client(
+                GetState,
+                f"/{name}/get_state",
                 callback_group=self._cb_group,
             )
         return TransitionCallbackReturn.SUCCESS
@@ -116,6 +167,9 @@ class ModeManagerNode(LifecycleNode):
         for cli in self._change_state_clients.values():
             self.destroy_client(cli)
         self._change_state_clients.clear()
+        for cli in self._get_state_clients.values():
+            self.destroy_client(cli)
+        self._get_state_clients.clear()
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state: State) -> TransitionCallbackReturn:
@@ -207,10 +261,39 @@ class ModeManagerNode(LifecycleNode):
         return True, ""
 
     def _drive_transition(self, node_name: str, transition_id: int) -> tuple[bool, str]:
-        """Call /<node_name>/change_state with `transition_id`. Blocks."""
+        """Call /<node_name>/change_state with `transition_id`. Blocks.
+
+        Idempotency pre-check: if the node is already in (or past)
+        the transition's target state, return success without calling
+        change_state. Lets activate_mode("trackdrive") be invoked
+        repeatedly without invalid-transition errors, and lets
+        activate_mode("") succeed on an already-unconfigured stack
+        (the common case at fresh-container startup).
+        """
         cli = self._change_state_clients.get(node_name)
         if cli is None:
             return False, "no change_state client (not in managed set)"
+
+        # State-check: skip if already at/past target. The get_state
+        # call is cheap (~ms) and removes the need for callers to
+        # track autonomy state externally.
+        current = self._get_current_state(node_name)
+        if current is None:
+            # get_state failed — proceed to attempt the transition;
+            # the change_state error will be more informative than
+            # bailing here.
+            self.get_logger().debug(
+                f"  [{node_name}] get_state unavailable; "
+                f"attempting transition {transition_id} blind"
+            )
+        else:
+            skip_states = _TRANSITION_SKIP_STATES.get(transition_id, frozenset())
+            if current in skip_states:
+                self.get_logger().info(
+                    f"  [{node_name}] already at/past target for "
+                    f"transition {transition_id} (state={current}); skipping"
+                )
+                return True, ""
 
         if not cli.wait_for_service(timeout_sec=_CHANGE_STATE_TIMEOUT_S):
             return False, (
@@ -245,6 +328,38 @@ class ModeManagerNode(LifecycleNode):
             f"  [{node_name}] transition {transition_id} ok"
         )
         return True, ""
+
+    def _get_current_state(self, node_name: str) -> int | None:
+        """Query /<node_name>/get_state. Returns the state ID (an int
+        from lifecycle_msgs.msg.State.PRIMARY_STATE_*), or None if the
+        service is unavailable or the call timed out.
+
+        Short timeout: this is a fast intra-container service call,
+        and we use it from inside _drive_transition's hot path. If
+        it doesn't respond in 2 s the node is probably stuck and
+        the change_state call will fail with a more informative
+        error anyway.
+        """
+        cli = self._get_state_clients.get(node_name)
+        if cli is None:
+            return None
+        if not cli.service_is_ready():
+            # No wait — if the service isn't already there, we won't
+            # wait for it. The downstream change_state will gate on
+            # wait_for_service.
+            return None
+
+        future = cli.call_async(GetState.Request())
+        deadline = time.monotonic() + 2.0
+        while not future.done():
+            if time.monotonic() >= deadline:
+                cli.remove_pending_request(future)
+                return None
+            time.sleep(0.02)
+        result = future.result()
+        if result is None:
+            return None
+        return int(result.current_state.id)
 
 
 def main(args=None) -> None:
