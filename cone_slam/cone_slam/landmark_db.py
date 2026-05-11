@@ -19,6 +19,7 @@ the same colour.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict
 
@@ -94,3 +95,21 @@ class LandmarkDb:
         lm = self._landmarks[lid]
         lm.n_observations += 1
         lm.last_seen_step = step
+
+    # ----- proximity query --------------------------------------------------
+
+    def nearest_xy_distance_m(self, xy: np.ndarray) -> float:
+        """Euclidean XY distance from `xy` to the closest existing
+        landmark. Returns +inf when the db is empty. Z is ignored —
+        cone landmarks are 2D for FSD tracks."""
+        if not self._landmarks:
+            return float("inf")
+        x, y = float(xy[0]), float(xy[1])
+        best = float("inf")
+        for lm in self._landmarks.values():
+            dx = x - lm.position[0]
+            dy = y - lm.position[1]
+            d = math.hypot(dx, dy)
+            if d < best:
+                best = d
+        return best

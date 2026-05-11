@@ -114,6 +114,10 @@ def main() -> int:
     ap.add_argument(
         "--quiet", action="store_true",
         help="suppress per-scan progress lines")
+    ap.add_argument(
+        "--veto-m", type=float, default=None,
+        help="override `new_landmark_proximity_veto_m`; pass 0 to "
+             "disable the cascade-guard veto for baseline comparison")
     args = ap.parse_args()
 
     if not Path(args.bag).exists():
@@ -140,6 +144,26 @@ def main() -> int:
         from cone_slam.cone_graph_slam_node import ConeGraphSlamNode
 
         node = ConeGraphSlamNode()
+
+        if args.veto_m is not None:
+            from rclpy.parameter import Parameter
+            node.set_parameters([Parameter(
+                "new_landmark_proximity_veto_m",
+                Parameter.Type.DOUBLE,
+                float(args.veto_m))])
+
+        # Lifecycle: ConeGraphSlamNode is a LifecycleNode; its _preint
+        # / _graph / _db only exist after on_configure(), and the
+        # subscription handlers only run their full logic past
+        # on_activate. The live pipeline issues these transitions via
+        # mode_manager; replay drives them directly. The state objects
+        # are unused by the callbacks, hence the simple stub.
+        from rclpy.lifecycle import State as LifecycleState
+        from lifecycle_msgs.msg import State as StateMsg
+        _stub = LifecycleState(StateMsg.PRIMARY_STATE_UNCONFIGURED,
+                               "unconfigured")
+        node.on_configure(_stub)
+        node.on_activate(_stub)
 
         residuals: list[dict] = []
 

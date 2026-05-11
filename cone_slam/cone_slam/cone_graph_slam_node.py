@@ -188,6 +188,20 @@ class ConeGraphSlamNode(LifecycleNode):
         self.declare_parameter("pose_jump_max_pos_m", 0.8)
         self.declare_parameter("pose_jump_max_yaw_rad", 0.3)
 
+        # Proximity veto for new-landmark *creation* (separate from the
+        # DA match gate). When pose drift creeps to ~DA_GATE_M (1.0 m),
+        # re-observations of existing cones fall just past the gate,
+        # DA flags them as new, and they get spawned as ghost landmarks
+        # anchored at the drifted pose — the cascade trigger documented
+        # in bag lap_attempt_20260511_142317 (5 of 6 "new" obs were
+        # 1.02-1.20 m from an existing landmark; pose had drifted ~1 m
+        # off truth). The veto refuses to create a new landmark whose
+        # world position is closer than this to any existing landmark.
+        # Genuine new cones (track-min spacing ≥ 3 m, gate-min ≥ 1.5 m
+        # in FSD rules) still get spawned; cascade ghosts don't.
+        # Set to 0 to disable the veto.
+        self.declare_parameter("new_landmark_proximity_veto_m", 1.5)
+
         # I/O references — populated in on_configure / on_activate.
         self.map_frame: str = ""
         self.odom_frame: str = ""
@@ -752,13 +766,24 @@ class ConeGraphSlamNode(LifecycleNode):
 
         # For each matched obs → factor between current pose and the
         # known landmark. For unmatched → allocate a new landmark and
-        # add a factor to it.
+        # add a factor to it. Before allocation, apply the proximity
+        # veto: refuse to spawn a landmark within
+        # `new_landmark_proximity_veto_m` of any existing one (cascade
+        # guard — see parameter docstring).
+        veto_m = float(self.get_parameter(
+            "new_landmark_proximity_veto_m").value)
         n_new = 0
         n_assoc = 0
+        n_vetoed = 0
         for o, m in zip(observations, matches):
             if m.landmark_id == -1:
                 world_xyz = self._body_to_world(
                     o.body_x, o.body_y, pred_x, pred_y, pred_yaw)
+                if veto_m > 0.0:
+                    d_near = self._db.nearest_xy_distance_m(world_xyz)
+                    if d_near < veto_m:
+                        n_vetoed += 1
+                        continue
                 lm = self._db.create(world_xyz, self._graph.step)
                 self._graph.stage_new_landmark(lm.id, world_xyz)
                 self._graph.stage_cone_observation(
@@ -793,6 +818,13 @@ class ConeGraphSlamNode(LifecycleNode):
                 n_assoc += 1
         per_scan["new"] = n_new
         per_scan["assoc"] = n_assoc
+        per_scan["vetoed"] = n_vetoed
+        if n_vetoed > 0:
+            self.get_logger().info(
+                f"proximity-veto: dropped {n_vetoed} would-be-new "
+                f"landmark(s) within {veto_m:.2f} m of existing ones "
+                f"(cascade guard; obs={len(observations)} "
+                f"new={n_new} assoc={n_assoc})")
 
         self._accumulate_obs_diag(per_scan)
 
@@ -890,6 +922,7 @@ class ConeGraphSlamNode(LifecycleNode):
             f"obs={_avg('obs_total'):4.1f} "
             f"assoc={_avg('assoc'):4.1f} "
             f"new={_avg('new'):3.1f} "
+            f"vetoed={_avg('vetoed'):.1f} "
             f"skip={_avg('skipped'):.1f}"
         )
         self._obs_diag = {}
