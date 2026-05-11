@@ -5,8 +5,13 @@ Single ROS node that:
      /Conos_Orange (finish-gate detection)
   2. Builds VehicleState + ReferenceTrajectory each tick
   3. Calls a LateralController + LongitudinalController (selected by params)
-  4. Publishes /control_command (fs_msgs/ControlCommand)
-  5. Publishes /signal/ebs (latched) on operator/safety request
+  4. Publishes /ctrl/cmd_internal (fs_msgs/ControlCommand) — the
+     supervisor relays this onto /fsds/control_command via the
+     RuntimeControl action; see #384.
+  5. Publishes /ctrl/emergency (latched std_msgs/Bool) — the
+     supervisor latches /signal/ebs on a rising edge of this. The
+     autonomy never touches /signal/ebs or /signal/ebs_reset
+     directly anymore.
 
 Keeps strategies behind ABCs so swapping Pure Pursuit → LQR or PI → MPC is one
 line in the factory below. The node does no path geometry, no slip math, no
@@ -28,11 +33,11 @@ from rclpy.lifecycle import (
     TransitionCallbackReturn,
     State as LifecycleState,
 )
-from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
 from fs_msgs.msg import ControlCommand
 from nav_msgs.msg import Odometry, Path
-from std_msgs.msg import Empty, Float32
+from std_msgs.msg import Bool, Float32
 from visualization_msgs.msg import MarkerArray
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -113,8 +118,11 @@ class ControlNode(LifecycleNode):
         self._tf_buffer: Optional[Buffer] = None
         self._tf_listener: Optional[TransformListener] = None
         self._cmd_pub = None
-        self._ebs_pub = None
-        self._ebs_reset_pub = None
+        # Post-#384: emergency requests go onto a latched Bool topic
+        # that mission_control_node subscribes to and surfaces via
+        # RuntimeControl Feedback. The supervisor publishes
+        # /signal/ebs on the rising edge from the bridge side.
+        self._emergency_pub = None
         self._v_set_pub = None
         self._kappa_max_pub = None
         self._sub_path = None
@@ -122,8 +130,6 @@ class ControlNode(LifecycleNode):
         self._sub_odom = None
         self._sub_orange = None
         self._tick_timer = None
-        self._ebs_reset_timer = None
-        self._ebs_reset_retries = 0
 
     # ------------------------------------------------------------------
     # Lifecycle transitions
@@ -135,22 +141,26 @@ class ControlNode(LifecycleNode):
         self._build_strategies()
 
         # Publishers — lifecycle-aware so they go silent when deactivated.
+        # Post-#384: command flows through mission_control's
+        # RuntimeControl action, not /fsds/control_command directly.
+        # The supervisor relays each Feedback frame back onto the
+        # bridge topic. Topic-name change makes the new chain
+        # observable in ros2 topic list and prevents the bridge from
+        # mistakenly subscribing to two sources.
         self._cmd_pub = self.create_lifecycle_publisher(
-            ControlCommand, "/control_command", 10)
-        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self._ebs_pub = self.create_lifecycle_publisher(
-            Empty, "/signal/ebs", latched)
-        # /signal/ebs_reset clears the bridge's `ebs_triggered_` gate, which
-        # otherwise drops every /control_command silently after a previous
-        # ActivateEbs (incl. mission_control's RES-activate at event_start
-        # before the autonomy boots). Latched + retry: a single publish can
-        # race the bridge's subscriber readiness, so we re-fire a few times
-        # while the bridge is connecting.
-        # NOTE: per docs/autonomy_pipeline.md the supervisor will eventually
-        # own /signal/ebs_reset; keep it here until the supervisor's
-        # action wiring lands so the bridge gate actually clears.
-        self._ebs_reset_pub = self.create_lifecycle_publisher(
-            Empty, "/signal/ebs_reset", latched)
+            ControlCommand, "/ctrl/cmd_internal", 10)
+        # Emergency channel — latched Bool, mission_control subscribes
+        # and propagates rising edges to the supervisor via the
+        # RuntimeControl Feedback.emergency flag. We always publish a
+        # latched default-false on activate so a late-joining
+        # mission_control sees the initial state.
+        latched = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._emergency_pub = self.create_lifecycle_publisher(
+            Bool, "/ctrl/emergency", latched)
 
         # Diagnostic publishers (#260 follow-up). v_set tracks the
         # longitudinal controller's setpoint each tick; kappa_max
@@ -196,12 +206,14 @@ class ControlNode(LifecycleNode):
         self._last_steering = 0.0
         self._tick_count = 0
 
-        # Clear the bridge's EBS gate now and keep retrying briefly to
-        # win the subscriber-matching race.
-        self._ebs_reset_retries = 4
-        self._ebs_reset_pub.publish(Empty())
-        self._ebs_reset_timer = self.create_timer(
-            0.5, self._republish_ebs_reset)
+        # Post-#384: the bridge's EBS gate is owned by the supervisor;
+        # the supervisor publishes /signal/ebs_reset itself on
+        # Phase 1 ready (mirrors what the uDV firmware does on the
+        # real car). control_node only signals intent via
+        # /ctrl/emergency now — publish the initial default-false
+        # latched value so a late-joining mission_control sees a
+        # defined state immediately.
+        self._emergency_pub.publish(Bool(data=False))
 
         # Subscriptions
         self._sub_path = self.create_subscription(
@@ -237,11 +249,9 @@ class ControlNode(LifecycleNode):
         self._sub_pose = None
         self._sub_odom = None
         self._sub_orange = None
-        for tmr in (self._tick_timer, self._ebs_reset_timer):
-            if tmr is not None:
-                self.destroy_timer(tmr)
+        if self._tick_timer is not None:
+            self.destroy_timer(self._tick_timer)
         self._tick_timer = None
-        self._ebs_reset_timer = None
         return super().on_deactivate(state)
 
     def on_cleanup(
@@ -256,18 +266,15 @@ class ControlNode(LifecycleNode):
         self._sub_pose = None
         self._sub_odom = None
         self._sub_orange = None
-        for tmr in (self._tick_timer, self._ebs_reset_timer):
-            if tmr is not None:
-                self.destroy_timer(tmr)
+        if self._tick_timer is not None:
+            self.destroy_timer(self._tick_timer)
         self._tick_timer = None
-        self._ebs_reset_timer = None
-        for pub in (self._cmd_pub, self._ebs_pub, self._ebs_reset_pub,
+        for pub in (self._cmd_pub, self._emergency_pub,
                     self._v_set_pub, self._kappa_max_pub):
             if pub is not None:
                 self.destroy_publisher(pub)
         self._cmd_pub = None
-        self._ebs_pub = None
-        self._ebs_reset_pub = None
+        self._emergency_pub = None
         self._v_set_pub = None
         self._kappa_max_pub = None
         self._tf_listener = None
@@ -430,15 +437,6 @@ class ControlNode(LifecycleNode):
             f"stop latched at odom=({ax:.2f}, {ay:.2f}) "
             f"from {n} big-orange cones"
         )
-
-    def _republish_ebs_reset(self) -> None:
-        """Re-fire /signal/ebs_reset for a short window after init to win the
-        race against the bridge's subscriber matching. Self-cancels."""
-        if self._ebs_reset_retries <= 0:
-            self._ebs_reset_timer.cancel()
-            return
-        self._ebs_reset_pub.publish(Empty())
-        self._ebs_reset_retries -= 1
 
     def _stop_distance(self, state: VehicleState) -> float:
         """Euclidean distance from car to the latched stop anchor. Returns

@@ -17,7 +17,7 @@ setup(
     zip_safe=True,
     maintainer='jaime',
     maintainer_email='jaimeperezgil21@gmail.com',
-    description='Vehicle controller: pure-pursuit lateral steering + PI longitudinal velocity tracking, with EBS / regen / autonomous-stop logic. Consumes /Path and the SLAM odometry, publishes /control_command.',
+    description='Vehicle controller: pure-pursuit lateral steering + PI longitudinal velocity tracking, with EBS / regen / autonomous-stop logic. Consumes /Path and the SLAM odometry, publishes /ctrl/cmd_internal (relayed via mission_control_node RuntimeControl).',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={

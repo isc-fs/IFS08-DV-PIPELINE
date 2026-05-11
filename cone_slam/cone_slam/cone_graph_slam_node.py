@@ -64,7 +64,7 @@ import gtsam
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
-from std_msgs.msg import Float32
+from std_msgs.msg import Bool, Float32
 from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -232,6 +232,11 @@ class ConeGraphSlamNode(LifecycleNode):
         self._cones_pub = None
         self._gt_aligned_pub = None
         self._gt_error_pub = None
+        # /slam/finished publisher (#384). Always emits default-false
+        # on activate; will go true on real mission-completion detection
+        # in a follow-up. Stays latched so a late mission_control
+        # subscriber inherits the current value.
+        self._finished_pub = None
 
     # ------------------------------------------------------------------
     # Lifecycle transitions
@@ -297,6 +302,25 @@ class ConeGraphSlamNode(LifecycleNode):
             Odometry, "/cone_slam/gt_aligned", 10)
         self._gt_error_pub = self.create_lifecycle_publisher(
             Float32, "/cone_slam/gt_error_m", 10)
+
+        # /slam/finished — mission-completion signal consumed by
+        # mission_control_node (#384). Latched + default-false so a
+        # late-joining mission_control sees an unambiguous starting
+        # state. Pre-#384 slam had no way to signal mission-end
+        # directly (control_node's stop-latch handled it via braking
+        # to zero); post-#384 mission_control needs an explicit
+        # rising-edge signal to close the RuntimeControl action with
+        # outcome="finished". Currently a stub — slam still uses its
+        # internal stop-anchor logic in control_node for braking;
+        # this publisher just emits the default false until a future
+        # PR wires the lap-min-distance + big-orange detector to it.
+        finished_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._finished_pub = self.create_lifecycle_publisher(
+            Bool, "/slam/finished", finished_qos)
 
         # TF broadcaster — non-lifecycle (tf2 doesn't ship lifecycle
         # variants). Used to publish the dynamic `map → odom` drift
@@ -405,6 +429,13 @@ class ConeGraphSlamNode(LifecycleNode):
         self._sub_supervisor_odom = self.create_subscription(
             Odometry, "/odom", self._on_supervisor_odom, odom_qos)
 
+        # Latch /slam/finished=false on activate (#384 stub). The
+        # publisher exists from on_configure; this fires the default
+        # value so a subscriber that joins between configure and
+        # activate sees a defined latched state.
+        if self._finished_pub is not None:
+            self._finished_pub.publish(Bool(data=False))
+
         return super().on_activate(state)
 
     def on_deactivate(
@@ -439,13 +470,15 @@ class ConeGraphSlamNode(LifecycleNode):
         self._sub_supervisor_odom = None
 
         for pub in (self._state_pub, self._cones_pub,
-                    self._gt_aligned_pub, self._gt_error_pub):
+                    self._gt_aligned_pub, self._gt_error_pub,
+                    self._finished_pub):
             if pub is not None:
                 self.destroy_publisher(pub)
         self._state_pub = None
         self._cones_pub = None
         self._gt_aligned_pub = None
         self._gt_error_pub = None
+        self._finished_pub = None
 
         # tf2 broadcasters are not lifecycle-aware; drop the ref.
         # The static map→odom broadcaster was retired in #382 (map→odom
