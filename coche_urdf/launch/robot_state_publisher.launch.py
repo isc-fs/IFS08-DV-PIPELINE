@@ -43,11 +43,19 @@ def generate_launch_description() -> LaunchDescription:
             output="screen",
             parameters=[{
                 "robot_description": robot_description,
-                # 200 Hz TF — diagram contract. RSP will publish at the
-                # rate /joint_states arrives, so this only matters for
-                # the static identity transforms; joint_state_publisher
-                # below is what drives the dynamic ones.
-                "publish_frequency": 200.0,
+                # URDF TF publish rate. Was 200 Hz which corresponds
+                # to the diagram-contract value for actuated joints
+                # streaming at high rate. In practice the URDF here
+                # is static — joint_state_publisher feeds zero
+                # positions — so the visual TF tree doesn't actually
+                # change tick-to-tick. 30 Hz is plenty for any
+                # Lichtblick / Foxglove visualisation (60 FPS panels
+                # interpolate freely) and gets RSP off the
+                # measured-13 % CPU it was holding at 200 Hz.
+                # When real joint actuation lands and joint_state_publisher
+                # is replaced by a node fed from the autonomy state,
+                # bump this back up to match that node's publish rate.
+                "publish_frequency": 30.0,
             }],
         ),
         Node(
@@ -57,8 +65,11 @@ def generate_launch_description() -> LaunchDescription:
             output="screen",
             parameters=[{
                 # Default-state publisher — zero rad on all joints.
-                # rate sets /joint_states publish frequency.
-                "rate": 200,
+                # rate sets /joint_states publish frequency. Matches
+                # RSP at 30 Hz (was 200) — see the CPU rationale
+                # above. Any change to actuated-joint streaming has
+                # to bump both rates together.
+                "rate": 30,
                 "use_gui": False,
             }],
         ),
