@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>odometry_filter_node</name>
+  <version>0.1.0</version>
+  <description>
+    Lifecycle-managed ROS 2 node that drives the OdometryFilter
+    (provided by the odometry_filter package). Subscribes to /imu,
+    /motor_rpm, /steering_angle, /brake_pressure; publishes /odom
+    plus /odom_diag/* diagnostics; broadcasts odom→base_link TF.
+
+    Pre-#431 this work lived inside sim_supervisor_node.py as a
+    Python callback path. That path was at ~93 % CPU on a single
+    core because rclpy dispatches the BMI088 400 Hz IMU callback
+    400 times per second with Python overhead. Same algorithm in
+    rclcpp drops the overhead by ~25-50x per call. Phase 1 (#431)
+    shipped the pure-math library + tests; this package is the
+    Phase 2 ROS wrapper. Phase 3 strips the Python OdometryFilter
+    from sim_supervisor_node and flips this node on by default.
+
+    Lifecycle-managed because the rest of the DV pipeline already
+    is — the diagram contract treats /odom availability as a
+    lifecycle-gated capability, not always-on.
+  </description>
+  <maintainer email="moranguerra18@gmail.com">Raúl Morán</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>eigen3_cmake_module</buildtool_depend>
+
+  <depend>odometry_filter</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>eigen</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
