@@ -81,12 +81,17 @@ class GTPoseRelay(Node):
         self._aligned_vy_body: float = 0.0
         self._latest_gt_stamp = None
 
-        # Previous-tick state for finite-difference velocity. The bridge
-        # publishes /testing_only/odom with twist=0 (Cesium/UE5 doesn't
-        # fill the twist field), so we have to derive body-frame velocity
-        # ourselves from successive pose deltas. Without this, Control
-        # reads v=0 and floors the throttle while the car is already
-        # moving — observed once already as "the car went crazy".
+        # Previous-tick state for finite-difference velocity. Historically
+        # the bridge published /testing_only/odom with twist=0 (Cesium/UE5
+        # didn't fill the twist field), so this relay derived body-frame
+        # velocity ourselves from successive pose deltas. PR #315 closed
+        # that gap for twist.linear; the angular-twist follow-up populates
+        # twist.angular from RootComponent->GetPhysicsAngularVelocityInRadians()
+        # so /testing_only/odom is now fully GT (pose + linear + angular).
+        # The finite-difference is kept as a self-contained fallback /
+        # sanity check — if the bridge ever regresses on twist again, the
+        # controller still reads a non-zero velocity here and doesn't
+        # floor the throttle the way it did the one time before #315.
         self._prev_aligned_x: Optional[float] = None
         self._prev_aligned_y: Optional[float] = None
         self._prev_stamp_ns: Optional[int] = None
