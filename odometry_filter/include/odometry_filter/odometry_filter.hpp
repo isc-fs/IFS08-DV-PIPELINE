@@ -79,10 +79,16 @@ constexpr double kAlphaVx = 0.10;
 // Wheelbase used in the kinematic-bicycle yaw prediction:
 //     ω_pred = (v_x / wheelbase) · tan(δ)
 // Compared against IMU gyro_z to publish a yaw residual diagnostic +
-// detect lateral-slip events. 1.55 m matches the IFS-08 URDF
-// (pipeline/coche_urdf/urdf/ifs_08.urdf rear-axle-midpoint origin to
-// front-axle midpoint via the steer-link positions).
-constexpr double kWheelbaseM = 1.55;
+// detect lateral-slip events. 1.570 m is the authoritative IFS-08
+// spec — confirmed in docs/MODEL_IFS_08/DYNAMIC_MOD/Cooling/
+// BR_regenerativeBR.m (`L = 1.570`) and the MONO sheet of
+// docs/MODEL_IFS_08/ISC_IFS_08.xlsx (BQ64 `L = 1570 mm`). The previous
+// value (1.55) was sourced from the URDF, which itself was approximate
+// — see issue #462. inputs_vehicle_dynamics.m lists 1.627 (4% disagreement
+// between authors); 1.570 is what the BR/Sandra and master MONO sheet
+// agree on and what we treat as authoritative until the spec owners
+// converge.
+constexpr double kWheelbaseM = 1.570;
 
 // Brake-pressure threshold above which RPM is considered unreliable
 // (drive wheels potentially locked). When exceeded the complementary
