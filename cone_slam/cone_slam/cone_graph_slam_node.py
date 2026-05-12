@@ -104,6 +104,51 @@ CALIBRATION_SECONDS = 3.0
 MAX_OBSERVATION_RANGE_M = 25.0
 
 
+def cascade_spike_triggered(
+    n_new: int,
+    total: int,
+    step: int,
+    *,
+    pct_min_obs: int = 5,
+    pct_threshold: float = 0.60,
+    count_threshold: int = 3,
+    discovery_step_floor: int = 30,
+) -> tuple[bool, list[str]]:
+    """Pure-function expression of the two DA-failure spike gates.
+
+    Returns (triggered, reasons). Both gates require the graph to be
+    past the early-discovery phase (``step > discovery_step_floor``)
+    so the local cone map is mature and almost every observation
+    *should* be a re-association of a known landmark.
+
+      * **Percentage gate**: ``n_new / total > pct_threshold`` once
+        ``total >= pct_min_obs``. Catches "everything looks new" bursts
+        — the historical cascade signature, see #441.
+      * **Count gate**: ``n_new >= count_threshold`` AND
+        ``n_associated == 0`` (i.e. ``total == n_new``). The zero-
+        association requirement is what discriminates a true cascade
+        (pose has drifted off the map → nothing matches) from
+        legitimate cornering discovery (new cones swing into the LiDAR
+        FoV but several previously-mapped ones still associate). The
+        2026-05-12 live test of the initial assoc-agnostic count gate
+        showed it firing on `obs=12 new=7 assoc=5` during the first
+        turn and starving SLAM into IMU-only drift → off-track. Set
+        ``count_threshold = 0`` to disable.
+
+    Both gates are AND'd with the discovery-step floor.
+    Extracted from cone_graph_slam_node._on_cones for unit-testability
+    (test_cascade_spike_detector.py).
+    """
+    if step <= discovery_step_floor:
+        return False, []
+    reasons: list[str] = []
+    if total >= pct_min_obs and n_new > int(pct_threshold * total):
+        reasons.append(f"pct>{int(pct_threshold * 100)}%")
+    if count_threshold > 0 and n_new >= count_threshold and n_new == total:
+        reasons.append(f"n_new≥{count_threshold}&assoc=0")
+    return bool(reasons), reasons
+
+
 # Motor-RPM → body-frame longitudinal velocity.
 #
 # 2026-05-10 re-derivation (issue #380, supersedes the 2026-04-28
@@ -201,6 +246,20 @@ class ConeGraphSlamNode(LifecycleNode):
         # in FSD rules) still get spawned; cascade ghosts don't.
         # Set to 0 to disable the veto.
         self.declare_parameter("new_landmark_proximity_veto_m", 1.5)
+
+        # Count-based DA-spike threshold (issue #447, post-Phase-2 finding).
+        # The original spike detector compared n_new_pre against
+        # 60 % of total observations — but a 5-of-14 burst (36 %)
+        # slipped through it in lap_postveto_20260511_183638 and
+        # lap_ekf_inloop_20260511_235510, spawning the ghosts that
+        # detonated the cascade in both runs. Three or more new
+        # landmark candidates from a single mature-phase scan is
+        # *always* anomalous in FSD: legitimate new-cone arrivals
+        # come at vehicle-speed × scan-period spacing (typically 1
+        # cone every 3–4 scans), never bursting. Setting this to 0
+        # disables the count-based gate; the percentage gate stays
+        # active either way.
+        self.declare_parameter("cascade_spike_new_count_threshold", 3)
 
         # I/O references — populated in on_configure / on_activate.
         self.map_frame: str = ""
@@ -742,11 +801,34 @@ class ConeGraphSlamNode(LifecycleNode):
         # the same window of pose-freeze.
         n_new_pre  = sum(1 for m in matches if m.landmark_id == -1)
         total_pre  = len(matches)
-        if (total_pre >= 5
-                and self._graph.step > 30
-                and n_new_pre > int(0.60 * total_pre)):
+        # Two complementary triggers, both gated on step > 30
+        # (post-discovery — the local cone map is mature, every
+        # observation should be re-association of a known landmark
+        # with high probability):
+        #
+        #   A. **Percentage trigger** (legacy): >60 % of the scan's
+        #      observations flagged new. Catches "everything looks new"
+        #      cascades — observed pre-#441 on bags with extreme drift.
+        #      Requires ≥5 obs to be statistically meaningful.
+        #
+        #   B. **Count trigger** (post-#441 finding from in-loop runs):
+        #      ≥ N new in a single scan, where N is small. Catches the
+        #      5-of-14 (36 %) and 8-of-13 (62 %) bursts that slipped
+        #      through the percentage gate in lap_postveto_20260511_142317
+        #      and lap_ekf_inloop_20260511_235510. FSD cone spacing
+        #      means legitimate new arrivals come at most 1 per ~3
+        #      scans at typical speeds — anything ≥ N=3 in one scan
+        #      is anomalous. Default 3, tunable via parameter, 0
+        #      disables.
+        n_count_thresh = int(self.get_parameter(
+            "cascade_spike_new_count_threshold").value)
+        triggered, reasons = cascade_spike_triggered(
+            n_new_pre, total_pre, self._graph.step,
+            count_threshold=n_count_thresh)
+        if triggered:
             self.get_logger().warn(
                 f"skip cone factors: DA-failure spike "
+                f"[{', '.join(reasons)}] "
                 f"(obs={total_pre} new={n_new_pre} "
                 f"assoc={total_pre - n_new_pre}) — IMU-only update")
             # Commit the staged IMU factor + bias-RW factor (the only
