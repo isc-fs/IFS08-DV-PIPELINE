@@ -5,7 +5,7 @@
   <version>2.0.0</version>
   <description>Custom messages for the IFS Formula Student Driverless Simulator</description>
   <maintainer email="team@isc-fs.org">ISC Formula Student</maintainer>
-  <license>GPLv2</license>
+  <license>GPL-3.0-or-later</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>rosidl_default_generators</buildtool_depend>

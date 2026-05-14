@@ -5,7 +5,7 @@
   <version>0.0.0</version>
   <description>Vehicle controller: pure-pursuit lateral steering + PI longitudinal velocity tracking, with EBS / regen / autonomous-stop logic. Consumes /Path and the SLAM odometry, publishes /control_command. 40 Hz timer, slew-limited, lifecycle-managed.</description>
   <maintainer email="jaimeperezgil21@gmail.com">jaime</maintainer>
-  <license>Apache-2.0</license>
+  <license>GPL-3.0-or-later</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 

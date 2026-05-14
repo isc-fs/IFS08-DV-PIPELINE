@@ -15,7 +15,7 @@
     means sim and car run literally the same C++ from day one.
   </description>
   <maintainer email="moranguerra18@gmail.com">Raúl Morán</maintainer>
-  <license>Apache-2.0</license>
+  <license>GPL-3.0-or-later</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>eigen3_cmake_module</buildtool_depend>
