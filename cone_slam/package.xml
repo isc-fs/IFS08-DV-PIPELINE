@@ -11,7 +11,7 @@
     See docs/cone_graph_slam_design.md for the full design.
   </description>
   <maintainer email="raul@isc-fs.com">Raul Moran</maintainer>
-  <license>MIT</license>
+  <license>GPL-3.0-or-later</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 

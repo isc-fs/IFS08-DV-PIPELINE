@@ -12,7 +12,7 @@
     side.
   </description>
   <maintainer email="raul@isc-fs.com">Raul Moran</maintainer>
-  <license>MIT</license>
+  <license>GPL-3.0-or-later</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>rosidl_default_generators</buildtool_depend>

@@ -5,7 +5,7 @@
   <version>0.0.0</version>
   <description>LiDAR cone detection: ground removal (RANSAC), DBSCAN clustering, and per-cluster cone fitting that publishes raw cone observations on /Conos_raw for downstream factor-graph SLAM in cone_slam. Lifecycle-managed: configure runs Numba JIT warmup, activate enables the LiDAR subscription.</description>
   <maintainer email="jaimeperezgil21@gmail.com">jaime</maintainer>
-  <license>Apache-2.0</license>
+  <license>GPL-3.0-or-later</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 

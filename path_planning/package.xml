@@ -5,7 +5,7 @@
   <version>0.0.0</version>
   <description>Centerline path planner: subscribes to the SLAM cone map (/Conos), runs the FaSTTUBe per-side cone-sort + cross-side matching algorithm, and publishes a smooth nav_msgs/Path on /Path for the controller. Lifecycle-managed.</description>
   <maintainer email="jaimeperezgil21@gmail.com">jaime</maintainer>
-  <license>Apache-2.0</license>
+  <license>GPL-3.0-or-later</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 
