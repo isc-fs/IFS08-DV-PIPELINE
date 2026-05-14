@@ -10,6 +10,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/StartMission.action"
   "action/RuntimeControl.action"
   "srv/ActivateMode.srv"
+  "srv/StartBag.srv"
+  "srv/StopBag.srv"
   DEPENDENCIES std_msgs builtin_interfaces
 )
 

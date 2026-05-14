@@ -1,0 +1,32 @@
+# StopBag — Mission Control backend → bag_recorder_node (#465).
+#
+# Asks the bag_recorder_node to SIGINT the running `ros2 bag record`
+# process (so mcap writes its chunk index cleanly), wait for the
+# recorder to exit, then `shutil.move` the staged bag from
+# /tmp/ifssim_bag_active/<name>/ to the bind-mounted /bags/<name>/
+# where the host operator will find it.
+#
+# Idempotent: calling StopBag when no recording is active is not an
+# error — returns ok=true with state="none".
+
+# ---------------- Request ----------------
+# (empty — there's only one active recording at a time, no
+# disambiguation needed)
+
+---
+# ---------------- Response ----------------
+# True if the recorder exited cleanly AND the staging→final move
+# succeeded. False if either step failed (see `error`).
+bool ok
+
+# Terminal state:
+#   "stopped" — bag finalised + on host
+#   "failed"  — see `error`
+#   "none"    — no recording was active, nothing done
+string state
+
+# Final absolute host-side path. Empty when state="none".
+string bag_path
+
+# Diagnostic on failure. Empty on success.
+string error

@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>bag_recorder_node</name>
+  <version>0.0.1</version>
+  <description>
+    bag_recorder_node — hosts /bag_recorder/start + /bag_recorder/stop
+    services so Mission Control's web backend can trigger ros2 bag
+    recordings INSIDE dv_pipeline_stack, where the recorder shares
+    the SHM-tuned Fast DDS context with the publishers.
+
+    Why not record from mc_backend directly: mc_backend is forced to
+    FASTDDS_BUILTIN_TRANSPORTS=UDPv4 so its StartMission action client
+    works cross-container. UDP fragmentation reassembly drops most of
+    the 1.4 MB /lidar/Lidar1 scans (96% loss measured in #465). Running
+    the recorder in dv_pipeline_stack avoids that entirely.
+
+    Always-on (started from pipeline.launch.py alongside ifssim_bridge
+    + foxglove_bridge), single-recording-at-a-time, writes to the
+    container's /tmp during recording and moves to the bind-mounted
+    /bags on stop so the streaming hot path stays off macOS virtiofs.
+
+    See docs/autonomy_pipeline.md and tools/mission_control/backend/
+    bag_recorder.py (the service client side).
+  </description>
+  <maintainer email="raul@isc-fs.com">Raul Moran</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>dv_msgs</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
