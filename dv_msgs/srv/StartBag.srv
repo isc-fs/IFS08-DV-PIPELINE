@@ -1,0 +1,42 @@
+# StartBag — Mission Control backend → bag_recorder_node (#465).
+#
+# Asks the bag_recorder_node (running inside dv_pipeline_stack) to
+# spawn `ros2 bag record -s mcap -a -o /tmp/ifssim_bag_active/<name>`
+# and start capturing all currently-advertised topics. Writing happens
+# inside the dv_pipeline_stack container, so the recorder shares the
+# SHM-tuned Fast DDS context with the publishers — full-fidelity
+# 10 Hz LiDAR, full camera streams, no UDP-fragmentation drops.
+#
+# A successful StartBag returns immediately after the recorder has
+# settled (proc.poll() shows it's still running ~500 ms post-spawn).
+# The bag is finalised + moved to the bind-mounted /bags/<name>/ on
+# StopBag.
+#
+# Only ONE recording can be active at a time. Calling StartBag while
+# one is already running returns ok=false with state="already_running".
+
+# ---------------- Request ----------------
+# Directory name for the bag. The recorder writes
+# /tmp/ifssim_bag_active/<bag_name>/<bag_name>_0.mcap and moves the
+# whole dir to /bags/<bag_name>/ on StopBag.
+#
+# Caller is responsible for sanitisation (mc_backend's
+# bag_recorder.compose_bag_name does this). Empty rejected.
+string bag_name
+
+---
+# ---------------- Response ----------------
+# True if the recorder is alive ~500 ms after spawn.
+bool ok
+
+# "recording" on success, "failed" on disk-full / spawn-failure /
+# already-running. Never "stopped" (that's StopBag's response).
+string state
+
+# Absolute host-side path where the bag WILL land after StopBag.
+# Populated even on partial start so the operator UI can show what
+# would-have-been recorded.
+string bag_path
+
+# Diagnostic on failure. Empty on success.
+string error
