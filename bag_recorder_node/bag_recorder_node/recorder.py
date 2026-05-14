@@ -31,9 +31,17 @@ seam for unit testing without a live DDS graph.
 Streaming small rosbag2 writes through the macOS virtiofs bind mount
 caps at ~1 MB/s sustained on Docker Desktop, well below our active
 2 MB/s topic mix. Writing to `/tmp/ifssim_bag_active/...` (real ext4
-inside the container overlay) keeps the writer fast; a single bulk
-`shutil.move` to `/bags/...` on stop crosses virtiofs sequentially,
-which is its best-case workload. Same pattern as `tools/record_bag.sh`.
+inside the container overlay) keeps the writer fast.
+
+Originally the move target was a HOST-bind-mounted `/bags/` so the
+operator found the bag on the host automatically. But on Windows
+WSL2 9p (~50 MB/s) and macOS virtiofs (~30 MB/s sustained) the
+cross-fs move for a multi-GB bag took 20-40 s and visibly stalled
+the StopBag service. #465 v3 made `/bags/` a docker named volume
+(single-fs writes, ~1 s for the same move) and added explicit
+extraction helpers — `tools/pull-bag.sh <name>` + `tools/list-bags.sh`.
+The operator pays one explicit `docker cp` step instead of paying
+the cross-fs cost on every session-stop click.
 """
 from __future__ import annotations
 
