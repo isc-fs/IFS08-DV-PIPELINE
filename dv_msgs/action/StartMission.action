@@ -28,14 +28,32 @@ string message
 
 ---
 # ---------------- Feedback ----------------
-# Heartbeat. mission_control_node emits one of these periodically so a
-# crashed startup is detectable from the supervisor side without
-# polling every lifecycle node directly.
+# Heartbeat. mission_control_node emits these as `activate_mode` makes
+# progress so a crashed startup is detectable from the supervisor side
+# without polling every lifecycle node directly.
 #
-# Stage values:
-#   "configuring"  — mode_manager is calling change_state to configure
-#   "activating"   — mode_manager is calling change_state to activate
-#   "warming_up"   — autonomy nodes active; e.g. Numba JIT compile
-#   "ready"        — all done, result imminent
+# Stage values, in roughly the order they appear during a successful
+# bring-up:
+#   "configuring"                        — initial beat at goal accept
+#   "configuring cone_detection_node"    — per-node, per-transition (#387);
+#   "cone_detection_node configured"        derived from /mode_manager/progress
+#   "activating cone_detection_node"        events in mission_control_node.
+#   "cone_detection_node activated"         Verb forms: configuring /
+#   "configuring slam_node"                 configured, activating /
+#   "slam_node configured"                  activated, deactivating /
+#   …                                       deactivated, cleaning_up /
+#                                           cleaned_up.
+#   "warming_up"                         — fallback beat during quiet
+#                                          gaps (e.g. Numba JIT not
+#                                          yielding).
+#   "ready"                              — all done, result imminent
+#   "failed"                             — terminal; result follows
+#   "<node> <transition> failed: <msg>"  — terminal w/ diagnostic
+#   "<node> <transition> timeout: <msg>" — same
+#
+# Consumers (sim_supervisor's relay, Mission Control web's spinner)
+# should treat unknown stage strings as informational rather than
+# hard-keying on the list above — the per-node variants are open-ended
+# in node names and may grow as new autonomy nodes get lifecycle-managed.
 string stage
 builtin_interfaces/Time stamp

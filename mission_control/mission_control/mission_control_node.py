@@ -37,10 +37,74 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
 from builtin_interfaces.msg import Time as TimeMsg
 from fs_msgs.msg import ControlCommand
+from lifecycle_msgs.msg import Transition
 from std_msgs.msg import Bool
 
 from dv_msgs.action import StartMission, RuntimeControl
+from dv_msgs.msg import LifecycleProgress
 from dv_msgs.srv import ActivateMode
+
+
+# #387 — verbs for the StartMission feedback `stage` string. Indexed
+# by lifecycle_msgs/Transition ID. Anything outside this map falls
+# back to a generic `transitioning(<id>)`.
+_TRANSITION_VERB: dict[int, str] = {
+    Transition.TRANSITION_CONFIGURE:  "configuring",
+    Transition.TRANSITION_ACTIVATE:   "activating",
+    Transition.TRANSITION_DEACTIVATE: "deactivating",
+    Transition.TRANSITION_CLEANUP:    "cleaning_up",
+}
+
+
+# Past-tense + bare forms for each transition verb. Tiny morphology
+# table — English-only, fine for a diagnostic string. Don't try to
+# derive these from `_TRANSITION_VERB` algorithmically; "configuring"
+# stripped of -ing is "configur", not "configure".
+_TRANSITION_PAST: dict[str, str] = {
+    "configuring":  "configured",
+    "activating":   "activated",
+    "deactivating": "deactivated",
+    "cleaning_up":  "cleaned_up",
+}
+_TRANSITION_BARE: dict[str, str] = {
+    "configuring":  "configure",
+    "activating":   "activate",
+    "deactivating": "deactivate",
+    "cleaning_up":  "cleanup",
+}
+
+
+def _stage_from_progress(progress) -> str:
+    """Render a LifecycleProgress event as a StartMission feedback stage.
+
+    Examples:
+        configuring cone_detection_node
+        activating slam_node
+        cone_detection_node configured
+        cone_detection_node activate failed: change_state returned …
+        slam_node configure skipped
+
+    The verb-first form for `starting` matches "user is waiting for
+    THIS step to finish"; the noun-first past-tense form for terminal
+    phases matches "THIS step is now in the past". Reads naturally in
+    a session-spinner subtitle.
+    """
+    node = progress.node_name or "?"
+    verb = _TRANSITION_VERB.get(
+        progress.transition_id, f"transitioning({progress.transition_id})"
+    )
+    phase = progress.phase
+    if phase == "starting":
+        return f"{verb} {node}"
+    if phase == "ok":
+        return f"{node} {_TRANSITION_PAST.get(verb, verb)}"
+    if phase == "skipped":
+        return f"{node} {_TRANSITION_BARE.get(verb, verb)} skipped"
+    if phase in ("failed", "timeout"):
+        bare = _TRANSITION_BARE.get(verb, verb)
+        suffix = f": {progress.error}" if progress.error else ""
+        return f"{node} {bare} {phase}{suffix}"
+    return f"{node} {verb} {phase}"
 
 
 # Cap how long we'll wait for mode_manager.activate_mode to respond
@@ -103,6 +167,21 @@ class MissionControlNode(LifecycleNode):
         self._latest_ctrl_cmd: ControlCommand = ControlCommand()
         self._latest_emergency: bool = False
         self._latest_finished: bool = False
+
+        # #387 — last LifecycleProgress event observed on
+        # /mode_manager/progress. Updated by _on_mode_manager_progress
+        # from whatever executor thread happens to dispatch the
+        # callback; read by the _execute_start_mission wait loop on
+        # the action-server thread. Single-attribute assignment is
+        # atomic under the GIL, so we don't need a lock here — but we
+        # do need a sentinel so the wait loop can tell "no new event
+        # since last heartbeat" from "no event ever". The
+        # `_progress_seq` counter increments on every event; the wait
+        # loop snapshots it and skips its own heartbeat publish when
+        # it matches the previous snapshot.
+        self._latest_progress: LifecycleProgress | None = None
+        self._progress_seq: int = 0
+        self._sub_mode_manager_progress: rclpy.subscription.Subscription | None = None
 
         # Active RuntimeControl goal — set when _execute_runtime_control
         # begins, cleared on terminate. The /ctrl/cmd_internal
@@ -179,7 +258,37 @@ class MissionControlNode(LifecycleNode):
             callback_group=self._cb_group,
         )
 
+        # #387 — granular lifecycle progress. mode_manager publishes one
+        # LifecycleProgress per change_state call ("starting" before,
+        # then "ok"/"skipped"/"failed"/"timeout" after).
+        # _execute_start_mission reads the latest event each heartbeat
+        # tick and emits a per-node feedback stage instead of the
+        # generic "warming_up". Depth 20 ≈ two full activate_mode runs;
+        # we'd rather drop than back-pressure mode_manager.
+        self._sub_mode_manager_progress = self.create_subscription(
+            LifecycleProgress, "/mode_manager/progress",
+            self._on_mode_manager_progress, 20,
+            callback_group=self._cb_group,
+        )
+
         return TransitionCallbackReturn.SUCCESS
+
+    # ------------------------------------------------------------------
+    # #387 — mode_manager progress callback
+    # ------------------------------------------------------------------
+    def _on_mode_manager_progress(self, msg: LifecycleProgress) -> None:
+        """Cache the latest per-node lifecycle progress event.
+
+        Runs on whatever executor thread dispatches the subscription.
+        Both writes (the instance assignments) are individually atomic
+        in CPython under the GIL, so the only ordering risk is the
+        reader seeing the new event with the old seq counter — we
+        sidestep that by writing the message FIRST, then bumping seq.
+        The reader checks seq, then reads the message; if it observes
+        a fresh seq it's guaranteed to see the matching message.
+        """
+        self._latest_progress = msg
+        self._progress_seq += 1
 
     # ------------------------------------------------------------------
     # RuntimeControl input topic callbacks
@@ -293,6 +402,11 @@ class MissionControlNode(LifecycleNode):
 
         deadline = time.monotonic() + _ACTIVATE_MODE_TIMEOUT_S
         next_heartbeat = time.monotonic() + _HEARTBEAT_PERIOD_S
+        # #387 — track the last progress-event seq we've reported so
+        # each event publishes exactly one feedback frame regardless
+        # of the heartbeat cadence. Snapshot at the goal opens so we
+        # don't replay events left over from a previous goal.
+        last_progress_seq_emitted = self._progress_seq
 
         # Wait loop. We can't block on `rclpy.spin_until_future_complete`
         # because we're already inside a callback dispatched by the
@@ -313,12 +427,29 @@ class MissionControlNode(LifecycleNode):
                 goal_handle.abort()
                 return result
 
-            if now >= next_heartbeat:
-                # While in flight we don't have visibility into which
-                # transition mode_manager is currently driving — for
-                # now report a generic "warming_up" stage. Once
-                # mode_manager publishes per-node lifecycle progress
-                # (follow-up), we can switch on that here.
+            # #387 — when mode_manager publishes a new per-node event,
+            # surface it as a feedback frame immediately (don't wait for
+            # the next heartbeat tick). The seq counter ensures every
+            # event goes out exactly once.
+            cur_seq = self._progress_seq
+            if cur_seq != last_progress_seq_emitted:
+                prog = self._latest_progress
+                if prog is not None:
+                    self._publish_feedback(
+                        goal_handle, _stage_from_progress(prog),
+                    )
+                last_progress_seq_emitted = cur_seq
+                next_heartbeat = now + _HEARTBEAT_PERIOD_S
+
+            elif now >= next_heartbeat:
+                # No progress event since the last frame — fall back
+                # to the generic "warming_up" beat so the supervisor
+                # still sees liveness. Most of these are squeezed out
+                # by the per-event path above in practice; this only
+                # fires during quiet gaps (e.g. between the activate
+                # transition return and the next node's configure
+                # starting, or while mode_manager's Numba JIT inside
+                # on_configure hasn't yielded yet).
                 self._publish_feedback(goal_handle, "warming_up")
                 next_heartbeat = now + _HEARTBEAT_PERIOD_S
 
