@@ -27,6 +27,7 @@ from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn, State
 from lifecycle_msgs.msg import State as LifecycleStateMsg, Transition
 from lifecycle_msgs.srv import ChangeState, GetState
 
+from dv_msgs.msg import LifecycleProgress
 from dv_msgs.srv import ActivateMode
 
 
@@ -110,6 +111,14 @@ class ModeManagerNode(LifecycleNode):
         # on_configure so the autonomy nodes have time to register
         # their lifecycle services before we try to bind to them.
         self._change_state_clients: dict[str, rclpy.client.Client] = {}
+        # #387 — per-node-per-transition progress publisher. One event
+        # per change_state call ("starting" before, "ok"/"failed"/
+        # "skipped"/"timeout" after) so mission_control_node can echo
+        # the current step into StartMission feedback. Created in
+        # on_configure alongside the lifecycle clients; published
+        # to / unconditionally (cheap event-driven topic, no
+        # subscribers → no-op).
+        self._progress_pub = None
         # Reentrant group so the inner spin_until_future_complete inside
         # _drive_transition can dispatch the change_state response while
         # the activate_mode service callback that triggered it is still
@@ -132,6 +141,15 @@ class ModeManagerNode(LifecycleNode):
             "activate_mode",
             self._handle_activate_mode,
             callback_group=self._cb_group,
+        )
+        # #387 — progress topic. Depth=10 KEEP_LAST: bursty during the
+        # ~4-6 transitions of a single activate_mode call, idle the
+        # rest of the time. A late-joining subscriber misses the most
+        # recent burst but that's fine — mission_control_node's
+        # heartbeat fills the gap. Default RELIABLE is correct (small
+        # payload, drops would defeat the point).
+        self._progress_pub = self.create_publisher(
+            LifecycleProgress, "/mode_manager/progress", 10,
         )
         # One change_state + one get_state client per managed autonomy
         # node. ROS will not error if the server isn't up yet;
@@ -164,6 +182,9 @@ class ModeManagerNode(LifecycleNode):
         if self._activate_mode_srv is not None:
             self.destroy_service(self._activate_mode_srv)
         self._activate_mode_srv = None
+        if self._progress_pub is not None:
+            self.destroy_publisher(self._progress_pub)
+            self._progress_pub = None
         for cli in self._change_state_clients.values():
             self.destroy_client(cli)
         self._change_state_clients.clear()
@@ -269,9 +290,15 @@ class ModeManagerNode(LifecycleNode):
         repeatedly without invalid-transition errors, and lets
         activate_mode("") succeed on an already-unconfigured stack
         (the common case at fresh-container startup).
+
+        Publishes /mode_manager/progress events ("starting", then one
+        of "ok"/"failed"/"timeout"/"skipped") so mission_control_node
+        can echo per-node progress into StartMission feedback (#387).
         """
         cli = self._change_state_clients.get(node_name)
         if cli is None:
+            self._publish_progress(node_name, transition_id, "failed",
+                                   "no change_state client (not in managed set)")
             return False, "no change_state client (not in managed set)"
 
         # State-check: skip if already at/past target. The get_state
@@ -293,13 +320,21 @@ class ModeManagerNode(LifecycleNode):
                     f"  [{node_name}] already at/past target for "
                     f"transition {transition_id} (state={current}); skipping"
                 )
+                self._publish_progress(node_name, transition_id, "skipped", "")
                 return True, ""
 
+        # Announce we're about to start. Subscribers can latch this and
+        # surface "configuring <node>" before the (potentially long)
+        # change_state call returns — that's the whole point of #387.
+        self._publish_progress(node_name, transition_id, "starting", "")
+
         if not cli.wait_for_service(timeout_sec=_CHANGE_STATE_TIMEOUT_S):
-            return False, (
+            err = (
                 f"/{node_name}/change_state did not appear within "
                 f"{_CHANGE_STATE_TIMEOUT_S}s"
             )
+            self._publish_progress(node_name, transition_id, "timeout", err)
+            return False, err
 
         req = ChangeState.Request()
         req.transition.id = transition_id
@@ -317,17 +352,52 @@ class ModeManagerNode(LifecycleNode):
         while not future.done():
             if time.monotonic() >= deadline:
                 cli.remove_pending_request(future)
-                return False, f"timeout waiting for transition {transition_id}"
+                err = f"timeout waiting for transition {transition_id}"
+                self._publish_progress(node_name, transition_id, "timeout", err)
+                return False, err
             time.sleep(0.05)
         result = future.result()
         if result is None:
-            return False, "change_state returned None (rclpy error)"
+            err = "change_state returned None (rclpy error)"
+            self._publish_progress(node_name, transition_id, "failed", err)
+            return False, err
         if not result.success:
-            return False, f"transition {transition_id} returned success=False"
+            err = f"transition {transition_id} returned success=False"
+            self._publish_progress(node_name, transition_id, "failed", err)
+            return False, err
         self.get_logger().info(
             f"  [{node_name}] transition {transition_id} ok"
         )
+        self._publish_progress(node_name, transition_id, "ok", "")
         return True, ""
+
+    def _publish_progress(
+        self,
+        node_name: str,
+        transition_id: int,
+        phase: str,
+        error: str,
+    ) -> None:
+        """Emit one LifecycleProgress event. Best-effort — publish
+        failures are logged at debug and never bubble up; the lifecycle
+        fan-out itself is the source of truth, the progress topic is
+        diagnostic-grade only.
+        """
+        if self._progress_pub is None:
+            return
+        msg = LifecycleProgress()
+        msg.node_name = node_name
+        msg.transition_id = int(transition_id)
+        msg.phase = phase
+        msg.error = error
+        msg.stamp = self.get_clock().now().to_msg()
+        try:
+            self._progress_pub.publish(msg)
+        except Exception as ex:
+            self.get_logger().debug(
+                f"_publish_progress: publish failed for "
+                f"{node_name}/{transition_id}/{phase}: {ex}"
+            )
 
     def _get_current_state(self, node_name: str) -> int | None:
         """Query /<node_name>/get_state. Returns the state ID (an int
