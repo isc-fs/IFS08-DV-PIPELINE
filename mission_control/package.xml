@@ -5,7 +5,7 @@
   <version>0.0.1</version>
   <description>
     mission_control_node — lifecycle orchestrator for the DV pipeline's
-    autonomy stack. Receives StartMission from sim_supervisor (or, on
+    autonomy stack. Receives SetMission from sim_supervisor (or, on
     the real car, from the physical uDV's microROS endpoint), drives
     mode_manager_node to bring up the autonomy lifecycle nodes with
     the correct mission strategy flag, and forwards control commands
@@ -28,6 +28,11 @@
   <depend>std_msgs</depend>
   <depend>fs_msgs</depend>
   <depend>dv_msgs</depend>
+  <!-- Imports mode_manager.mode_registry (the MODE_REGISTRY + mission
+       id maps that mission_control uses to resolve incoming mission
+       strings) and mode_manager.mode_manager_node.TRANSITION_SETUP
+       (sentinel transition ID rendered in SetMission feedback). -->
+  <depend>mode_manager</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

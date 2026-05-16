@@ -5,7 +5,7 @@
   <version>0.0.1</version>
   <description>
     Driverless-pipeline interface package: action definitions exchanged
-    between sim_supervisor_node and mission_control_node (StartMission,
+    between sim_supervisor_node and mission_control_node (SetMission,
     RuntimeControl). Kept in its own package so producers and consumers
     can depend on the interfaces without pulling each other's Python
     code in. Mirrors the fs_msgs / ifssim_bridge split on the bridge

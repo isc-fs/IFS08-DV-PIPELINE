@@ -4,12 +4,12 @@ mission_control_node — DV pipeline lifecycle orchestrator.
 Sits between the supervisor (sim) / uDV (real car) and the autonomy
 lifecycle nodes. Two responsibilities:
 
-  1. **Lifecycle orchestration.** Receives StartMission from the
-     supervisor, calls mode_manager_node's `activate_mode` service
-     with the chosen mission flag, mode_manager fans out
-     `change_state` calls to each autonomy LifecycleNode (perception,
-     slam, path_planning, control). Heartbeats back to the supervisor
-     while transitions are in flight; reports ready/failed at the end.
+  1. **Lifecycle orchestration.** Receives SetMission from the
+     supervisor and calls mode_manager `activate_mode` with
+     activate=false (prepare: ~/setup + configure only, including
+     Numba JIT while nodes are inactive). RuntimeControl open calls
+     activate_mode with activate=true. Heartbeats relay per-node
+     progress from /mode_manager/progress.
 
   2. **Control-command aggregation + RuntimeControl server.** Post-#384
      (this PR), aggregates control_node's `/ctrl/cmd_internal` topic
@@ -40,19 +40,30 @@ from fs_msgs.msg import ControlCommand
 from lifecycle_msgs.msg import Transition
 from std_msgs.msg import Bool
 
-from dv_msgs.action import StartMission, RuntimeControl
+from dv_msgs.action import SetMission, RuntimeControl
 from dv_msgs.msg import LifecycleProgress
 from dv_msgs.srv import ActivateMode
 
+from mode_manager.mode_registry import (
+    MISSION_ID_TO_NAME,
+    MISSION_NAME_TO_ID,
+    MODE_REGISTRY,
+)
+from mode_manager.mode_manager_node import TRANSITION_SETUP
 
-# #387 — verbs for the StartMission feedback `stage` string. Indexed
+
+# #387 — verbs for the SetMission feedback `stage` string. Indexed
 # by lifecycle_msgs/Transition ID. Anything outside this map falls
 # back to a generic `transitioning(<id>)`.
+#
+# TRANSITION_SETUP (=255) is mode_manager's sentinel for the pre-configure
+# ~/setup call on each BaseLifecycleNode.
 _TRANSITION_VERB: dict[int, str] = {
     Transition.TRANSITION_CONFIGURE:  "configuring",
     Transition.TRANSITION_ACTIVATE:   "activating",
     Transition.TRANSITION_DEACTIVATE: "deactivating",
     Transition.TRANSITION_CLEANUP:    "cleaning_up",
+    TRANSITION_SETUP:                 "setting up",
 }
 
 
@@ -61,21 +72,23 @@ _TRANSITION_VERB: dict[int, str] = {
 # derive these from `_TRANSITION_VERB` algorithmically; "configuring"
 # stripped of -ing is "configur", not "configure".
 _TRANSITION_PAST: dict[str, str] = {
-    "configuring":  "configured",
-    "activating":   "activated",
-    "deactivating": "deactivated",
-    "cleaning_up":  "cleaned_up",
+    "configuring":         "configured",
+    "activating":          "activated",
+    "deactivating":        "deactivated",
+    "cleaning_up":         "cleaned_up",
+    "setting up": "set up",
 }
 _TRANSITION_BARE: dict[str, str] = {
     "configuring":  "configure",
     "activating":   "activate",
     "deactivating": "deactivate",
     "cleaning_up":  "cleanup",
+    "setting up":   "setup",
 }
 
 
 def _stage_from_progress(progress) -> str:
-    """Render a LifecycleProgress event as a StartMission feedback stage.
+    """Render a LifecycleProgress event as a SetMission feedback stage.
 
     Examples:
         configuring cone_detection_node
@@ -110,9 +123,13 @@ def _stage_from_progress(progress) -> str:
 # Cap how long we'll wait for mode_manager.activate_mode to respond
 # before reporting failure. activate_mode itself caps at 30 s per
 # autonomy-node transition (Numba JIT for cone_detection_node is the
-# hot path). With four nodes × 2 transitions each at 30 s worst-case,
+# hot path). With five pipeline nodes × 2 transitions each at 30 s worst-case,
 # 240 s gives generous headroom; in practice it returns in 15-25 s.
 _ACTIVATE_MODE_TIMEOUT_S = 240.0
+
+# Cold start: mode_manager (and downstream ~/setup) can take tens of seconds
+# before /activate_mode is discoverable; 5 s was too tight.
+_ACTIVATE_MODE_SRV_WAIT_S = 60.0
 
 # Heartbeat cadence while we're blocked waiting on activate_mode. The
 # supervisor relays each feedback frame to its own caller (the web
@@ -139,11 +156,24 @@ class MissionControlNode(LifecycleNode):
     def __init__(self) -> None:
         super().__init__(self.NODE_NAME)
 
-        self._start_mission_server: ActionServer | None = None
+        # Mission-id ↔ mission-name maps built from MODE_REGISTRY.
+        # Kept as instance attrs (not module-level constants) so a
+        # future test fixture can swap the registry on a per-instance
+        # basis without monkeypatching the module. The maps are
+        # SetMission carries mission_id on the wire; ActivateMode still
+        # uses the string mode name derived from the registry.
+        self._mission_id_to_name: dict[int, str] = dict(MISSION_ID_TO_NAME)
+        self._mission_name_to_id: dict[str, int] = dict(MISSION_NAME_TO_ID)
+        self.get_logger().info(
+            f"mission registry: "
+            f"{[(m.mission_id, m.mode_name) for m in MODE_REGISTRY.values()]}"
+        )
+
+        self._set_mission_server: ActionServer | None = None
         self._runtime_control_server: ActionServer | None = None
         self._activate_mode_client = None  # mode_manager activate_mode srv
 
-        # Reentrant group: the StartMission action handler blocks on the
+        # Reentrant group: the SetMission action handler blocks on the
         # activate_mode service future, which means another callback —
         # the service response itself — needs to dispatch on the same
         # executor. Default mutually-exclusive groups would deadlock.
@@ -171,7 +201,7 @@ class MissionControlNode(LifecycleNode):
         # #387 — last LifecycleProgress event observed on
         # /mode_manager/progress. Updated by _on_mode_manager_progress
         # from whatever executor thread happens to dispatch the
-        # callback; read by the _execute_start_mission wait loop on
+        # callback; read by the _execute_set_mission wait loop on
         # the action-server thread. Single-attribute assignment is
         # atomic under the GIL, so we don't need a lock here — but we
         # do need a sentinel so the wait loop can tell "no new event
@@ -182,6 +212,9 @@ class MissionControlNode(LifecycleNode):
         self._latest_progress: LifecycleProgress | None = None
         self._progress_seq: int = 0
         self._sub_mode_manager_progress: rclpy.subscription.Subscription | None = None
+
+        # Mode name prepared by the last successful SetMission (inactive).
+        self._prepared_mission: str | None = None
 
         # Active RuntimeControl goal — set when _execute_runtime_control
         # begins, cleared on terminate. The /ctrl/cmd_internal
@@ -200,7 +233,7 @@ class MissionControlNode(LifecycleNode):
 
         # mode_manager hosts /activate_mode (per its on_configure).
         # Created here so the service is bound by the time a
-        # StartMission goal arrives — re-binding inside the action
+        # SetMission goal arrives — re-binding inside the action
         # handler would race with the goal acceptance.
         self._activate_mode_client = self.create_client(
             ActivateMode,
@@ -210,11 +243,11 @@ class MissionControlNode(LifecycleNode):
 
         # Phase 1 server. Goal name matches what sim_supervisor's client
         # opens.
-        self._start_mission_server = ActionServer(
+        self._set_mission_server = ActionServer(
             self,
-            StartMission,
-            "start_mission_orchestration",
-            execute_callback=self._execute_start_mission,
+            SetMission,
+            "~/set_mission",
+            execute_callback=self._execute_set_mission,
             callback_group=self._cb_group,
         )
 
@@ -227,7 +260,7 @@ class MissionControlNode(LifecycleNode):
         self._runtime_control_server = ActionServer(
             self,
             RuntimeControl,
-            "runtime_control",
+            "~/runtime_control",
             execute_callback=self._execute_runtime_control,
             cancel_callback=lambda _gh: CancelResponse.ACCEPT,
             callback_group=self._cb_group,
@@ -261,7 +294,7 @@ class MissionControlNode(LifecycleNode):
         # #387 — granular lifecycle progress. mode_manager publishes one
         # LifecycleProgress per change_state call ("starting" before,
         # then "ok"/"skipped"/"failed"/"timeout" after).
-        # _execute_start_mission reads the latest event each heartbeat
+        # _execute_set_mission reads the latest event each heartbeat
         # tick and emits a per-node feedback stage instead of the
         # generic "warming_up". Depth 20 ≈ two full activate_mode runs;
         # we'd rather drop than back-pressure mode_manager.
@@ -340,10 +373,10 @@ class MissionControlNode(LifecycleNode):
 
     def on_cleanup(self, state: State) -> TransitionCallbackReturn:
         self.get_logger().info("on_cleanup")
-        for srv in (self._start_mission_server, self._runtime_control_server):
+        for srv in (self._set_mission_server, self._runtime_control_server):
             if srv is not None:
                 srv.destroy()
-        self._start_mission_server = None
+        self._set_mission_server = None
         self._runtime_control_server = None
         self._activate_mode_client = None
         return TransitionCallbackReturn.SUCCESS
@@ -353,33 +386,35 @@ class MissionControlNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     # ------------------------------------------------------------------
-    # Action handlers (skeletons)
+    # Action handlers
     # ------------------------------------------------------------------
-    def _execute_start_mission(self, goal_handle):
-        """
-        Phase 1 — drive mode_manager through configure/activate of the
-        autonomy lifecycle nodes for the requested mission.
+    def _execute_set_mission(self, goal_handle):
+        """Phase 1 — prepare autonomy for mission_id (0 = tear down)."""
+        mission_id = int(goal_handle.request.mission_id)
+        if mission_id == 0:
+            mission = ""
+        else:
+            mission = self._mission_id_to_name.get(mission_id)
+            if mission is None:
+                result = SetMission.Result()
+                result.success = False
+                result.message = (
+                    f"unknown mission_id {mission_id}; valid ids: "
+                    f"{sorted(self._mission_id_to_name.keys())} or 0 to tear down"
+                )
+                self.get_logger().error(result.message)
+                goal_handle.abort()
+                return result
 
-        Calls /activate_mode (hosted by mode_manager_node), emits
-        periodic feedback heartbeats while the call is in flight, and
-        translates the service response into the StartMission action
-        result. The mode_manager service itself drives change_state
-        on each autonomy LifecycleNode in the AUTONOMY_LIFECYCLE_NODES
-        order — this layer is just the action↔service bridge plus
-        heartbeat surfacing.
-        """
-        mission = goal_handle.request.mission
+        mode_log = repr(mission) if mission else "<tear down>"
         self.get_logger().info(
-            f"start_mission_orchestration received: mission={mission!r}"
+            f"set_mission received: mission_id={mission_id} mode={mode_log}"
         )
 
-        result = StartMission.Result()
+        result = SetMission.Result()
 
-        # Wait for /activate_mode to come up. mode_manager is
-        # auto-activated at launch, so this should be ~immediate; cap
-        # at 5 s to fail fast if the service genuinely isn't there.
-        if not self._activate_mode_client.wait_for_service(timeout_sec=5.0):
-            result.ready = False
+        if not self._activate_mode_client.wait_for_service(timeout_sec=_ACTIVATE_MODE_SRV_WAIT_S):
+            result.success = False
             result.message = (
                 "/activate_mode unavailable; is mode_manager_node active?"
             )
@@ -387,38 +422,22 @@ class MissionControlNode(LifecycleNode):
             goal_handle.abort()
             return result
 
-        # Initial heartbeat — gives the supervisor (and the web
-        # backend behind it) a "we received the goal" signal before
-        # the slow activate_mode call begins.
         self._publish_feedback(goal_handle, "configuring")
 
-        # Fire the service. activate_mode internally drives every
-        # autonomy LifecycleNode through configure→activate, which
-        # includes the cone_detection_node Numba JIT (~10–20 s on
-        # Apple Silicon Docker).
         req = ActivateMode.Request()
         req.mission = mission
+        req.activate = False
         future = self._activate_mode_client.call_async(req)
 
         deadline = time.monotonic() + _ACTIVATE_MODE_TIMEOUT_S
         next_heartbeat = time.monotonic() + _HEARTBEAT_PERIOD_S
-        # #387 — track the last progress-event seq we've reported so
-        # each event publishes exactly one feedback frame regardless
-        # of the heartbeat cadence. Snapshot at the goal opens so we
-        # don't replay events left over from a previous goal.
         last_progress_seq_emitted = self._progress_seq
 
-        # Wait loop. We can't block on `rclpy.spin_until_future_complete`
-        # because we're already inside a callback dispatched by the
-        # executor; the standard spin would deadlock. Instead we yield
-        # short slices of wall time while the executor (running on
-        # other threads of the MultiThreadedExecutor) drains the
-        # service response.
         while not future.done():
             now = time.monotonic()
             if now >= deadline:
                 self._activate_mode_client.remove_pending_request(future)
-                result.ready = False
+                result.success = False
                 result.message = (
                     f"/activate_mode timed out after "
                     f"{_ACTIVATE_MODE_TIMEOUT_S:.0f} s"
@@ -427,10 +446,6 @@ class MissionControlNode(LifecycleNode):
                 goal_handle.abort()
                 return result
 
-            # #387 — when mode_manager publishes a new per-node event,
-            # surface it as a feedback frame immediately (don't wait for
-            # the next heartbeat tick). The seq counter ensures every
-            # event goes out exactly once.
             cur_seq = self._progress_seq
             if cur_seq != last_progress_seq_emitted:
                 prog = self._latest_progress
@@ -442,14 +457,6 @@ class MissionControlNode(LifecycleNode):
                 next_heartbeat = now + _HEARTBEAT_PERIOD_S
 
             elif now >= next_heartbeat:
-                # No progress event since the last frame — fall back
-                # to the generic "warming_up" beat so the supervisor
-                # still sees liveness. Most of these are squeezed out
-                # by the per-event path above in practice; this only
-                # fires during quiet gaps (e.g. between the activate
-                # transition return and the next node's configure
-                # starting, or while mode_manager's Numba JIT inside
-                # on_configure hasn't yielded yet).
                 self._publish_feedback(goal_handle, "warming_up")
                 next_heartbeat = now + _HEARTBEAT_PERIOD_S
 
@@ -457,34 +464,38 @@ class MissionControlNode(LifecycleNode):
 
         srv_resp: ActivateMode.Response = future.result()
         if srv_resp is None:
-            result.ready = False
+            result.success = False
             result.message = "/activate_mode returned None (rclpy error)"
             self.get_logger().error(result.message)
             goal_handle.abort()
             return result
 
-        result.ready = bool(srv_resp.ok)
+        result.success = bool(srv_resp.ok)
         result.message = (
             srv_resp.message if srv_resp.message else
-            (f"mission {mission!r} brought up" if srv_resp.ok
-             else f"activate_mode rejected mission {mission!r}")
+            (f"mission_id {mission_id} prepared" if srv_resp.ok
+             else f"activate_mode rejected mission_id {mission_id}")
         )
         self._publish_feedback(goal_handle, "ready" if srv_resp.ok else "failed")
 
         if srv_resp.ok:
+            if mission:
+                self._prepared_mission = mission
+            else:
+                self._prepared_mission = None
             goal_handle.succeed()
             self.get_logger().info(
-                f"start_mission_orchestration: mission {mission!r} ready")
+                f"set_mission: mission_id={mission_id} prepared")
         else:
             goal_handle.abort()
             self.get_logger().error(
-                f"start_mission_orchestration: mission {mission!r} failed: "
+                f"set_mission: mission_id={mission_id} failed: "
                 f"{result.message}")
         return result
 
     def _publish_feedback(self, goal_handle, stage: str) -> None:
-        """Emit one StartMission feedback frame with the given stage."""
-        fb = StartMission.Feedback()
+        """Emit one SetMission feedback frame with the given stage."""
+        fb = SetMission.Feedback()
         fb.stage = stage
         fb.stamp = self.get_clock().now().to_msg()
         try:
@@ -527,7 +538,51 @@ class MissionControlNode(LifecycleNode):
         between control_node's publish and the supervisor's receive,
         which was destabilising Pure Pursuit in tight corners.
         """
-        self.get_logger().info("runtime_control opened")
+        if self._prepared_mission is None:
+            result = RuntimeControl.Result()
+            result.outcome = "error"
+            result.message = (
+                "No prepared mission — call SetMission before RuntimeControl"
+            )
+            self.get_logger().error(result.message)
+            goal_handle.abort()
+            return result
+
+        if not self._activate_mode_client.wait_for_service(timeout_sec=_ACTIVATE_MODE_SRV_WAIT_S):
+            result = RuntimeControl.Result()
+            result.outcome = "error"
+            result.message = "/activate_mode unavailable"
+            goal_handle.abort()
+            return result
+
+        act_req = ActivateMode.Request()
+        act_req.mission = self._prepared_mission
+        act_req.activate = True
+        act_future = self._activate_mode_client.call_async(act_req)
+        act_deadline = time.monotonic() + _ACTIVATE_MODE_TIMEOUT_S
+        while not act_future.done():
+            if time.monotonic() >= act_deadline:
+                self._activate_mode_client.remove_pending_request(act_future)
+                result = RuntimeControl.Result()
+                result.outcome = "error"
+                result.message = "activate_mode timed out during RuntimeControl open"
+                goal_handle.abort()
+                return result
+            time.sleep(0.05)
+
+        act_resp = act_future.result()
+        if act_resp is None or not act_resp.ok:
+            result = RuntimeControl.Result()
+            result.outcome = "error"
+            result.message = (
+                act_resp.message if act_resp and act_resp.message
+                else "activate_mode failed"
+            )
+            goal_handle.abort()
+            return result
+
+        self.get_logger().info(
+            f"runtime_control opened (activated {self._prepared_mission!r})")
         # Publish the seed frame with whatever's in cache so the
         # supervisor doesn't have to wait for the first /ctrl/cmd_internal
         # tick to receive anything. Same fail-safe ControlCommand the

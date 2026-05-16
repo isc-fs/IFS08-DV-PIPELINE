@@ -1,8 +1,9 @@
 # RuntimeControl — Phase 2 of the runtime action protocol.
 #
-# Sent: sim_supervisor_node → mission_control_node
+# Sent: backend / CLI → mission_control_node (after SetMission + EBS release).
+# sim_supervisor_node passively relays feedback to /fsds/control_command.
 #
-# Opened once Phase 1 (StartMission) reports ready=true. Carries the
+# Opened once Phase 1 (SetMission) reports success=true. Carries the
 # control-loop traffic for the duration of the mission: control_node's
 # throttle/steering proposals flow back from mission_control_node as
 # feedback, and `emergency` / `finished` flags from slam_node terminate

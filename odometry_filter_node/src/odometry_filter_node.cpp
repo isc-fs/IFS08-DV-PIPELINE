@@ -40,8 +40,9 @@
 
 #include "odometry_filter/odometry_filter.hpp"
 
+#include <node_base_cpp/base_lifecycle_node.hpp>
+
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <rclcpp_lifecycle/lifecycle_publisher.hpp>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -52,16 +53,15 @@
 
 #include <tf2_ros/transform_broadcaster.h>
 
-using rclcpp_lifecycle::LifecycleNode;
 using rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface;
 using CallbackReturn = LifecycleNodeInterface::CallbackReturn;
 
 namespace odometry_filter_node {
 
-class OdometryFilterNode : public LifecycleNode {
+class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
  public:
   explicit OdometryFilterNode(const rclcpp::NodeOptions & options)
-  : LifecycleNode("odometry_filter_node", options) {
+  : node_base_cpp::BaseLifecycleNode("odometry_filter_node", options) {
     declare_parameter<double>("publish_hz", 100.0);
     declare_parameter<std::string>("odom_frame", "odom");
     declare_parameter<std::string>("base_frame", "base_link");
@@ -70,7 +70,7 @@ class OdometryFilterNode : public LifecycleNode {
   // ------------------------------------------------------------------
   // Lifecycle transitions
   // ------------------------------------------------------------------
-  CallbackReturn on_configure(const rclcpp_lifecycle::State &) override {
+  CallbackReturn on_configure_impl(const rclcpp_lifecycle::State &) override {
     RCLCPP_INFO(get_logger(),
       "on_configure: lifecycle pubs + TF broadcaster + filter");
 
@@ -131,7 +131,7 @@ class OdometryFilterNode : public LifecycleNode {
       std::chrono::duration_cast<std::chrono::nanoseconds>(period),
       std::bind(&OdometryFilterNode::publish_odom, this));
 
-    return LifecycleNode::on_activate(state);
+    return BaseLifecycleNode::on_activate(state);
   }
 
   CallbackReturn on_deactivate(const rclcpp_lifecycle::State & state) override {
@@ -141,10 +141,10 @@ class OdometryFilterNode : public LifecycleNode {
     sub_rpm_.reset();
     sub_steering_.reset();
     sub_brake_.reset();
-    return LifecycleNode::on_deactivate(state);
+    return BaseLifecycleNode::on_deactivate(state);
   }
 
-  CallbackReturn on_cleanup(const rclcpp_lifecycle::State &) override {
+  CallbackReturn on_cleanup_impl(const rclcpp_lifecycle::State &) override {
     RCLCPP_INFO(get_logger(), "on_cleanup: dropping pubs + filter");
     publish_timer_.reset();
     sub_imu_.reset();

@@ -48,11 +48,8 @@ from typing import Optional
 import numpy as np
 
 import rclpy
-from rclpy.lifecycle import (
-    LifecycleNode,
-    TransitionCallbackReturn,
-    State as LifecycleState,
-)
+from node_base.base_lifecycle_node import BaseLifecycleNode
+from rclpy.lifecycle import TransitionCallbackReturn, State as LifecycleState
 from rclpy.qos import (
     QoSDurabilityPolicy,
     QoSHistoryPolicy,
@@ -184,7 +181,7 @@ class State(Enum):
     SLAM_RUNNING = 3
 
 
-class ConeGraphSlamNode(LifecycleNode):
+class ConeGraphSlamNode(BaseLifecycleNode):
     """Cone-graph SLAM as a managed LifecycleNode.
 
     Lifecycle layout:
@@ -317,6 +314,9 @@ class ConeGraphSlamNode(LifecycleNode):
     def on_configure(
         self, state: LifecycleState
     ) -> TransitionCallbackReturn:
+        ret = super().on_configure(state)
+        if ret != TransitionCallbackReturn.SUCCESS:
+            return ret
         self.get_logger().info("on_configure: components + publishers + static TF")
 
         self.map_frame = self.get_parameter("map_frame").value
@@ -572,7 +572,7 @@ class ConeGraphSlamNode(LifecycleNode):
                 pass
             self._lm_capture_fh = None
 
-        return TransitionCallbackReturn.SUCCESS
+        return super().on_cleanup(state)
 
     def on_shutdown(
         self, state: LifecycleState

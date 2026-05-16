@@ -1,27 +1,44 @@
-"""Strategy contracts for lateral and longitudinal controllers.
+"""Strategy contracts for vehicle control.
 
-Every controller (Pure Pursuit, Stanley, LQR, MPC, ...) implements one of these
-ABCs. The ROS node picks one of each via parameters and never knows what's
-inside — `compute()` is the entire interface.
+Decoupled lateral / longitudinal (Pure Pursuit + PI) implement
+:class:`LateralController` and :class:`LongitudinalController`, composed by
+:class:`control.controllers.composite_drive.CompositeDriveController`.
 
-Inputs are the immutable per-tick `VehicleState` and the `ReferenceTrajectory`
-shared across both controllers. Outputs are normalized actuator demands in the
-ranges the bridge sends as-is to setVehicleCommand.
+A *joint* controller (LQR, nonlinear MPC, …) should instead subclass
+:class:`DriveController` and return a full :class:`~control.controllers.actuation.ActuationCommand`
+in one :meth:`DriveController.compute` call.
 
-Adding a new algorithm:
-  1. New file under controllers/ implementing the ABC
-  2. Register in control_node._make_lateral / _make_longitudinal
-  3. Set the ROS param at launch time
+The ROS node wires exactly one :class:`DriveController` per run (``drive_controller``
+param, default ``composite``).
 
-LQR/MPC will fit by holding internal state (linearization point, prediction
-horizon, solver) but exposing the same compute() signature.
+Adding a decoupled algorithm:
+  1. New file under ``controllers/`` implementing the lateral or longitudinal ABC
+  2. Register in ``control_node._build_strategies``
+  3. Set the ROS param or mode_manager behavior at launch
+
+Adding a joint algorithm:
+  1. Subclass :class:`DriveController`, implement :meth:`compute` → :class:`ActuationCommand`
+  2. Register a new ``drive_controller`` value in ``control_node._build_strategies``
 """
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Tuple
 
+from control.controllers.actuation import ActuationCommand
 from control.state import VehicleState
 from control.reference import ReferenceTrajectory
+
+
+class DriveController(ABC):
+    """Single strategy object for all motion axes (steer, throttle, regen)."""
+
+    @abstractmethod
+    def compute(self, state: VehicleState, ref: ReferenceTrajectory) -> ActuationCommand:
+        """Full actuation for this tick."""
+
+    def reset(self) -> None:
+        """Clear integrators / warm-start cache when a run starts or resets."""
+        pass
 
 
 class LateralController(ABC):

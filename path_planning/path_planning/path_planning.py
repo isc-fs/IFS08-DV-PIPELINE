@@ -58,11 +58,8 @@ import os
 from typing import List, Optional
 
 import rclpy
-from rclpy.lifecycle import (
-    LifecycleNode,
-    TransitionCallbackReturn,
-    State as LifecycleState,
-)
+from node_base.base_lifecycle_node import BaseLifecycleNode
+from rclpy.lifecycle import TransitionCallbackReturn, State as LifecycleState
 
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -76,6 +73,10 @@ from transforms3d.euler import quat2euler, euler2quat
 
 from path_planning.core_types import Cone, Pose2D
 from path_planning.fasttube_adapter import FasttubeAdapter, PlanDebug
+from path_planning.planner_strategies import (
+    PATH_PLANNING_STRATEGY_MAP,
+    PathPlannerStrategy,
+)
 
 
 def _build_debug_markers(debug: PlanDebug) -> MarkerArray:
@@ -166,7 +167,7 @@ def _pose_stamped(x: float, y: float, yaw: float,
     return p
 
 
-class PathPlanningNode(LifecycleNode):
+class PathPlanningNode(BaseLifecycleNode):
     """Lifecycle-managed FaSTTUBe planner adapter.
 
     See module docstring for I/O and the lifecycle split.
@@ -211,7 +212,22 @@ class PathPlanningNode(LifecycleNode):
     def on_configure(
         self, state: LifecycleState
     ) -> TransitionCallbackReturn:
+        if self._behavior not in PATH_PLANNING_STRATEGY_MAP:
+            self.get_logger().error(f"Unknown planner behavior {self._behavior!r}")
+            return TransitionCallbackReturn.FAILURE
+
+        ret = super().on_configure(state)
+        if ret != TransitionCallbackReturn.SUCCESS:
+            return ret
+
         self.get_logger().info("on_configure: publishers + TF + adapter + capture")
+
+        strategy = PATH_PLANNING_STRATEGY_MAP[self._behavior]()
+        if not isinstance(strategy, PathPlannerStrategy):
+            self.get_logger().error("Strategy is not a PathPlannerStrategy")
+            return TransitionCallbackReturn.FAILURE
+        self._strategy = strategy
+        mission_type = strategy.get_mission_type()
 
         self.publisher_path = self.create_lifecycle_publisher(
             Path, "Path", 10)
@@ -226,10 +242,11 @@ class PathPlanningNode(LifecycleNode):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # FaSTTUBe planner instance. Reused across cone callbacks; the
-        # library is stateless for trackdrive (the only mission this
-        # node currently supports — issue #243 covers skidpad/accel).
-        self._adapter = FasttubeAdapter()
+        self._adapter = FasttubeAdapter(mission_type)
+        self.get_logger().info(
+            f"PathPlanner for behavior={self._behavior!r} "
+            f"mission_type={mission_type.name}"
+        )
 
         # Optional capture file
         self._capture_path = os.environ.get("DV_PLANNER_CAPTURE", "")
@@ -285,7 +302,7 @@ class PathPlanningNode(LifecycleNode):
                 pass
             self._capture_fh = None
         self._reset_stats()
-        return TransitionCallbackReturn.SUCCESS
+        return super().on_cleanup(state)
 
     def on_shutdown(
         self, state: LifecycleState

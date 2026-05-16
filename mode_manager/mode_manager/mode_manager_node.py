@@ -2,9 +2,9 @@
 mode_manager_node — lifecycle fan-out for the autonomy stack.
 
 Hosts one service: `activate_mode` (dv_msgs/ActivateMode). On request
-it drives `change_state` for each autonomy LifecycleNode (perception,
-slam, path_planning, control), propagating the mission flag so each
-node activates with the correct strategy.
+it calls ~/setup then drives `change_state` for each autonomy
+LifecycleNode (odometry_filter, perception, slam, path_planning,
+control) so each node activates with the correct strategy.
 
 Lifecycle of mode_manager itself is trivial — it stays `active` for
 the whole container lifetime; it's the autonomy nodes underneath that
@@ -16,7 +16,8 @@ any change_state services. Real wiring lands in step 5.
 
 from __future__ import annotations
 
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable
 
 import rclpy
@@ -28,7 +29,13 @@ from lifecycle_msgs.msg import State as LifecycleStateMsg, Transition
 from lifecycle_msgs.srv import ChangeState, GetState
 
 from dv_msgs.msg import LifecycleProgress
-from dv_msgs.srv import ActivateMode
+from dv_msgs.srv import ActivateMode, Setup
+
+from mode_manager.mode_registry import (
+    AUTONOMY_NODE_ORDER,
+    MODE_REGISTRY,
+    node_config_for,
+)
 
 
 # Mapping from a lifecycle transition ID → the state ID it lands in.
@@ -73,30 +80,37 @@ _TRANSITION_SKIP_STATES: dict[int, frozenset[int]] = {
 
 
 # Names of the autonomy LifecycleNodes that mode_manager fans out to.
-# Order matters when bringing up: perception before slam before
-# planning before control. Reverse order on tear-down.
+# Order matters when bringing up: odometry before perception before
+# slam before planning before control. Reverse order on tear-down.
 #
-# `lifecycle_managed` flags which entries are real LifecycleNodes today
-# vs. legacy plain Nodes that ignore change_state calls. Entries with
-# `lifecycle_managed=False` get logged but skipped — once a node is
-# converted, flip the flag and mode_manager starts driving its
-# transitions.
-AUTONOMY_LIFECYCLE_NODES: tuple[tuple[str, bool], ...] = (
-    ("cone_detection_node", True),
-    ("slam_node",            True),
-    ("path_planning_node",   True),
-    ("control_node",         True),
+# Sourced from the registry's AUTONOMY_NODE_ORDER (single source of
+# truth). The tuple shape `(name, lifecycle_managed)` is preserved so
+# downstream code can still distinguish real LifecycleNodes from
+# legacy plain Nodes via the second field. Today every node is
+# lifecycle-managed; a node temporarily reverting to a plain Node
+# can be flagged `False` here without touching the registry itself.
+AUTONOMY_LIFECYCLE_NODES: tuple[tuple[str, bool], ...] = tuple(
+    (name, True) for name in AUTONOMY_NODE_ORDER
 )
 
 # Per-service-call timeout when waiting for a change_state response.
 # The expensive transition is on_configure for cone_detection_node
-# (Numba JIT, ~10-20 s); 30 s gives generous headroom on Apple
-# Silicon Docker hosts where JIT is slower than bare Linux.
-_CHANGE_STATE_TIMEOUT_S: float = 30.0
+# (Numba JIT, ~10-60 s on Docker hosts). 120 s matches alt_pipeline
+# prepare-phase budget so SetMission does not abort mid-JIT.
+_CHANGE_STATE_TIMEOUT_S: float = 120.0
 
-VALID_MISSIONS: frozenset[str] = frozenset(
-    {"trackdrive", "autocross", "accel", "skidpad"}
-)
+# Timeout for the pre-configure ~/setup call: waiting for the service to
+# appear *and* for the Setup response. cone_detection_node loads sklearn +
+# the cone_detection pipeline before BaseLifecycleNode registers ~/setup;
+# on cold Docker/WSL imports alone often exceed 5 s.
+_SETUP_TIMEOUT_S: float = 60.0
+
+# Sentinel transition ID for the setup step on /mode_manager/progress.
+TRANSITION_SETUP: int = 255
+
+# Mission strings accepted by activate_mode. Built from the registry
+# so adding a new mode is a single edit in mode_registry.py.
+VALID_MISSIONS: frozenset[str] = frozenset(MODE_REGISTRY.keys())
 
 
 class ModeManagerNode(LifecycleNode):
@@ -106,29 +120,30 @@ class ModeManagerNode(LifecycleNode):
 
     def __init__(self) -> None:
         super().__init__(self.NODE_NAME)
+        self._prepared_mode: str | None = None
+        self._active_mode: str | None = None
         self._activate_mode_srv = None
-        # change_state clients keyed by node name. Lazy-created in
-        # on_configure so the autonomy nodes have time to register
-        # their lifecycle services before we try to bind to them.
-        self._change_state_clients: dict[str, rclpy.client.Client] = {}
         # #387 — per-node-per-transition progress publisher. One event
-        # per change_state call ("starting" before, "ok"/"failed"/
-        # "skipped"/"timeout" after) so mission_control_node can echo
-        # the current step into StartMission feedback. Created in
-        # on_configure alongside the lifecycle clients; published
-        # to / unconditionally (cheap event-driven topic, no
-        # subscribers → no-op).
+        # per change_state call. Created in on_configure.
         self._progress_pub = None
-        # Reentrant group so the inner spin_until_future_complete inside
-        # _drive_transition can dispatch the change_state response while
-        # the activate_mode service callback that triggered it is still
-        # on the call stack. Without this the default mutually-exclusive
-        # group would deadlock.
+        # Reentrant group so the activate_mode service callback can
+        # call out to lifecycle clients and wait on their futures
+        # while the same node's executor dispatches the responses.
         self._cb_group = ReentrantCallbackGroup()
-        # get_state clients for the pre-check that makes _fan_out
-        # idempotent (skip transitions whose target state is already
-        # reached). Lazy-created in on_configure alongside the
-        # change_state clients.
+        # change_state / get_state clients are *cached lazily* —
+        # created on first use inside _drive_transition /
+        # _get_current_state and reused. We never created them
+        # up-front in on_configure because doing so before the
+        # autonomy nodes are up costs a DDS discovery race: clients
+        # made too early can miss the server's late-joining endpoint
+        # announcement and stay stale for the lifetime of the node.
+        # Lazy creation guarantees the client is built only after
+        # the activate_mode call lands, by which time the autonomy
+        # nodes have been alive for the full container-startup
+        # window and discovery is settled. Setup clients (~/setup)
+        # are created *fresh per call* inside _call_setup — they
+        # are one-shot per mission, so caching buys nothing.
+        self._change_state_clients: dict[str, rclpy.client.Client] = {}
         self._get_state_clients: dict[str, rclpy.client.Client] = {}
 
     # ------------------------------------------------------------------
@@ -151,23 +166,34 @@ class ModeManagerNode(LifecycleNode):
         self._progress_pub = self.create_publisher(
             LifecycleProgress, "/mode_manager/progress", 10,
         )
-        # One change_state + one get_state client per managed autonomy
-        # node. ROS will not error if the server isn't up yet;
-        # wait_for_service is used at call-time inside the helpers.
-        for name, managed in AUTONOMY_LIFECYCLE_NODES:
-            if not managed:
-                continue
-            self._change_state_clients[name] = self.create_client(
-                ChangeState,
-                f"/{name}/change_state",
-                callback_group=self._cb_group,
-            )
-            self._get_state_clients[name] = self.create_client(
-                GetState,
-                f"/{name}/get_state",
-                callback_group=self._cb_group,
-            )
+        # Lifecycle clients are created lazily — see __init__ comment
+        # for the discovery-race rationale.
         return TransitionCallbackReturn.SUCCESS
+
+    # ------------------------------------------------------------------
+    # Lazy client accessors
+    # ------------------------------------------------------------------
+    def _get_change_state_client(self, node_name: str) -> "rclpy.client.Client":
+        cli = self._change_state_clients.get(node_name)
+        if cli is None:
+            cli = self.create_client(
+                ChangeState,
+                f"/{node_name}/change_state",
+                callback_group=self._cb_group,
+            )
+            self._change_state_clients[node_name] = cli
+        return cli
+
+    def _get_get_state_client(self, node_name: str) -> "rclpy.client.Client":
+        cli = self._get_state_clients.get(node_name)
+        if cli is None:
+            cli = self.create_client(
+                GetState,
+                f"/{node_name}/get_state",
+                callback_group=self._cb_group,
+            )
+            self._get_state_clients[node_name] = cli
+        return cli
 
     def on_activate(self, state: State) -> TransitionCallbackReturn:
         self.get_logger().info("on_activate")
@@ -206,22 +232,14 @@ class ModeManagerNode(LifecycleNode):
         response: ActivateMode.Response,
     ) -> ActivateMode.Response:
         """
-        Drive change_state across every managed autonomy node.
+        Prepare (setup+configure) or activate prepared nodes, or tear down.
 
-        Bring-up order: forward through AUTONOMY_LIFECYCLE_NODES with
-        CONFIGURE then ACTIVATE.
-        Tear-down order: reverse, with DEACTIVATE then CLEANUP.
-
-        Nodes flagged `lifecycle_managed=False` are logged-and-skipped
-        (the legacy plain-Node ones still under conversion). Once they
-        flip to True, mode_manager picks them up automatically.
-
-        Mission flag propagation (parameter pre-set on each node) is
-        not yet wired — first iteration only validates the lifecycle
-        mechanism. Mission-strategy parameter push lands once the
-        autonomy nodes start consuming it.
+        activate=false → SetMission prepare path (nodes stay inactive).
+        activate=true  → RuntimeControl open (activate prepared stack).
+        mission=""     → full tear-down regardless of activate flag.
         """
         mission = request.mission
+        do_activate = bool(request.activate)
 
         if mission == "":
             self.get_logger().info("activate_mode: tearing down autonomy")
@@ -229,9 +247,13 @@ class ModeManagerNode(LifecycleNode):
                 reversed(AUTONOMY_LIFECYCLE_NODES),
                 (Transition.TRANSITION_DEACTIVATE, Transition.TRANSITION_CLEANUP),
                 "tear_down",
+                mission=None,
             )
+            if ok:
+                self._prepared_mode = None
+                self._active_mode = None
             response.ok = ok
-            response.message = msg
+            response.message = msg if not ok else "autonomy torn down"
             return response
 
         if mission not in VALID_MISSIONS:
@@ -243,42 +265,282 @@ class ModeManagerNode(LifecycleNode):
             self.get_logger().warning(response.message)
             return response
 
-        self.get_logger().info(
-            f"activate_mode: bringing up autonomy for mission={mission!r}"
-        )
+        if not do_activate:
+            return self._prepare_mode(mission, response)
+
+        return self._activate_prepared_mode(mission, response)
+
+    def _prepare_mode(
+        self, mission: str, response: ActivateMode.Response,
+    ) -> ActivateMode.Response:
+        """Setup + configure without activating (SetMission / prepare)."""
+        self.get_logger().info(f"activate_mode: preparing mission={mission!r}")
+
+        if self._active_mode == mission:
+            response.ok = True
+            response.message = f"Mode {mission!r} already active"
+            return response
+
+        if self._prepared_mode == mission and self._active_mode is None:
+            response.ok = True
+            response.message = f"Mode {mission!r} already prepared"
+            return response
+
+        if self._active_mode and self._active_mode != mission:
+            self.get_logger().info(
+                f"Deactivating previous active mode: {self._active_mode}"
+            )
+            ok, msg = self._fan_out(
+                reversed(AUTONOMY_LIFECYCLE_NODES),
+                (Transition.TRANSITION_DEACTIVATE, Transition.TRANSITION_CLEANUP),
+                "tear_down",
+                mission=None,
+            )
+            if not ok:
+                response.ok = False
+                response.message = msg
+                return response
+            self._active_mode = None
+            self._prepared_mode = None
+
+        if self._prepared_mode and self._prepared_mode != mission:
+            self.get_logger().info(
+                f"Cleaning up previous prepared mode: {self._prepared_mode}"
+            )
+            ok, msg = self._fan_out(
+                reversed(AUTONOMY_LIFECYCLE_NODES),
+                (Transition.TRANSITION_CLEANUP,),
+                "cleanup_prepared",
+                mission=None,
+            )
+            if not ok:
+                response.ok = False
+                response.message = msg
+                return response
+            self._prepared_mode = None
+
         ok, msg = self._fan_out(
             AUTONOMY_LIFECYCLE_NODES,
-            (Transition.TRANSITION_CONFIGURE, Transition.TRANSITION_ACTIVATE),
-            "bring_up",
+            (Transition.TRANSITION_CONFIGURE,),
+            "prepare",
+            mission=mission,
         )
-        response.ok = ok
-        response.message = msg if not ok else f"brought up for {mission!r}"
+        if not ok:
+            response.ok = False
+            response.message = msg
+            return response
+
+        self._prepared_mode = mission
+        response.ok = True
+        response.message = f"prepared {mission!r}"
+        return response
+
+    def _activate_prepared_mode(
+        self, mission: str, response: ActivateMode.Response,
+    ) -> ActivateMode.Response:
+        """Activate nodes configured during prepare (RuntimeControl open)."""
+        self.get_logger().info(f"activate_mode: activating mission={mission!r}")
+
+        if self._active_mode == mission:
+            response.ok = True
+            response.message = f"Mode {mission!r} already active"
+            return response
+
+        if self._prepared_mode != mission:
+            response.ok = False
+            response.message = (
+                f"Mode {mission!r} has not been prepared "
+                f"(prepared: {self._prepared_mode!r}). "
+                "Complete SetMission before RuntimeControl."
+            )
+            self.get_logger().error(response.message)
+            return response
+
+        ok, msg = self._fan_out(
+            AUTONOMY_LIFECYCLE_NODES,
+            (Transition.TRANSITION_ACTIVATE,),
+            "activate",
+            mission=None,
+        )
+        if not ok:
+            response.ok = False
+            response.message = msg
+            return response
+
+        self._active_mode = mission
+        response.ok = True
+        response.message = f"activated {mission!r}"
         return response
 
     # ------------------------------------------------------------------
-    # Lifecycle fan-out
+    # Lifecycle fan-out (parallel)
     # ------------------------------------------------------------------
     def _fan_out(
         self,
         nodes: Iterable[tuple[str, bool]],
         transitions: tuple[int, ...],
         phase: str,
+        mission: str | None,
     ) -> tuple[bool, str]:
         """
-        Drive each managed node through `transitions` in order. Stops
-        on the first failure and returns (False, diagnostic). Skipped
-        unmanaged nodes are noted in the log but don't fail the call.
+        Run each managed node's (optional setup + transitions) work
+        concurrently. Bring-up time is bounded by the slowest node
+        (Numba JIT in cone_detection_node), not the sum.
+
+        All worker threads run on a ThreadPoolExecutor while the
+        activate_mode callback that launched _fan_out blocks here.
+        The outer ReentrantCallbackGroup + MultiThreadedExecutor lets
+        the rclpy executor dispatch service responses to the worker
+        threads' futures in parallel. Each node owns its own client
+        objects, so the per-node clients are never touched from more
+        than one worker.
+
+        Returns (True, "") iff every managed node finished its full
+        transition chain. On any failure, blocks until every other
+        in-flight worker finishes (so the system isn't left half-
+        transitioned), then returns (False, "; "-joined diagnostics).
+
+        When `mission` is set (bring-up direction), calls ~/setup on
+        each node before its first transition. Tear-down skips setup.
+        Skipped unmanaged nodes are noted in the log but don't fail
+        the call.
         """
+        call_setup = (
+            mission is not None
+            and Transition.TRANSITION_CONFIGURE in transitions
+        )
+
+        managed_nodes: list[str] = []
         for name, managed in nodes:
             if not managed:
                 self.get_logger().info(
                     f"  [{phase}] {name}: not lifecycle-managed yet, skipping"
                 )
                 continue
-            for t in transitions:
-                ok, err = self._drive_transition(name, t)
+            managed_nodes.append(name)
+
+        if not managed_nodes:
+            return True, ""
+
+        def _process_node(node_name: str) -> tuple[str, bool, str]:
+            if call_setup:
+                cfg = node_config_for(mission, node_name)
+                ok, err = self._call_setup(node_name, mission, cfg.behavior)
                 if not ok:
-                    return False, f"{name}: {err}"
+                    return node_name, False, err
+            for t in transitions:
+                ok, err = self._drive_transition(node_name, t)
+                if not ok:
+                    return node_name, False, err
+            return node_name, True, ""
+
+        failures: list[str] = []
+        with ThreadPoolExecutor(
+            max_workers=len(managed_nodes),
+            thread_name_prefix=f"mode_manager-{phase}",
+        ) as pool:
+            futures = [pool.submit(_process_node, n) for n in managed_nodes]
+            for fut in as_completed(futures):
+                try:
+                    name, ok, err = fut.result()
+                except Exception as ex:  # noqa: BLE001 — defensive
+                    failures.append(f"<worker>: {ex!r}")
+                    continue
+                if not ok:
+                    failures.append(f"{name}: {err}")
+
+        if failures:
+            return False, "; ".join(failures)
+        return True, ""
+
+    # ------------------------------------------------------------------
+    # Future waiting
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _wait_for_future(future, timeout_sec: float) -> bool:
+        """Block until `future` is done or `timeout_sec` elapses.
+
+        Uses `add_done_callback` + threading.Event so the calling
+        thread doesn't busy-poll while another executor thread
+        dispatches the response. Required when many futures are
+        in flight from parallel _fan_out workers — a sleep-poll
+        loop per worker would burn CPU and add latency.
+
+        Returns True iff the future completed within the deadline.
+        """
+        done = threading.Event()
+        future.add_done_callback(lambda _f: done.set())
+        return done.wait(timeout=timeout_sec) and future.done()
+
+    # ------------------------------------------------------------------
+    # Setup (pre-configure step)
+    # ------------------------------------------------------------------
+    def _call_setup(
+        self, node_name: str, mode_name: str, behavior: str,
+    ) -> tuple[bool, str]:
+        """Call /<node_name>/setup with mode + behavior. Blocks.
+
+        Fresh client per call (no caching): setup is one-shot per
+        mission, and creating it on demand sidesteps the
+        startup-time DDS discovery race that bit clients built in
+        on_configure before the autonomy nodes were up.
+        """
+        self._publish_progress(node_name, TRANSITION_SETUP, "starting", "")
+
+        cli = self.create_client(
+            Setup,
+            f"/{node_name}/setup",
+            callback_group=self._cb_group,
+        )
+        try:
+            return self._call_setup_with_client(
+                cli, node_name, mode_name, behavior,
+            )
+        finally:
+            self.destroy_client(cli)
+
+    def _call_setup_with_client(
+        self,
+        cli: "rclpy.client.Client",
+        node_name: str,
+        mode_name: str,
+        behavior: str,
+    ) -> tuple[bool, str]:
+        if not cli.wait_for_service(timeout_sec=_SETUP_TIMEOUT_S):
+            err = (
+                f"/{node_name}/setup did not appear within "
+                f"{_SETUP_TIMEOUT_S}s"
+            )
+            self._publish_progress(node_name, TRANSITION_SETUP, "timeout", err)
+            return False, err
+
+        req = Setup.Request()
+        req.mode_name = mode_name
+        req.behavior = behavior
+        future = cli.call_async(req)
+        if not self._wait_for_future(future, _SETUP_TIMEOUT_S):
+            try:
+                cli.remove_pending_request(future)
+            except Exception:
+                pass
+            err = "timeout waiting for setup response"
+            self._publish_progress(node_name, TRANSITION_SETUP, "timeout", err)
+            return False, err
+
+        result = future.result()
+        if result is None:
+            err = "setup returned None (rclpy error)"
+            self._publish_progress(node_name, TRANSITION_SETUP, "failed", err)
+            return False, err
+        if not result.success:
+            err = result.message or "setup failed"
+            self._publish_progress(node_name, TRANSITION_SETUP, "failed", err)
+            return False, err
+
+        self.get_logger().info(
+            f"  [{node_name}] setup ok: mode={mode_name!r} behavior={behavior!r}"
+        )
+        self._publish_progress(node_name, TRANSITION_SETUP, "ok", "")
         return True, ""
 
     def _drive_transition(self, node_name: str, transition_id: int) -> tuple[bool, str]:
@@ -295,11 +557,7 @@ class ModeManagerNode(LifecycleNode):
         of "ok"/"failed"/"timeout"/"skipped") so mission_control_node
         can echo per-node progress into StartMission feedback (#387).
         """
-        cli = self._change_state_clients.get(node_name)
-        if cli is None:
-            self._publish_progress(node_name, transition_id, "failed",
-                                   "no change_state client (not in managed set)")
-            return False, "no change_state client (not in managed set)"
+        cli = self._get_change_state_client(node_name)
 
         # State-check: skip if already at/past target. The get_state
         # call is cheap (~ms) and removes the need for callers to
@@ -339,23 +597,20 @@ class ModeManagerNode(LifecycleNode):
         req = ChangeState.Request()
         req.transition.id = transition_id
         future = cli.call_async(req)
-        # Sleep-poll until the future resolves. We can't use
-        # rclpy.spin_until_future_complete here because we're already
-        # inside a callback dispatched by this node's outer
-        # MultiThreadedExecutor; a nested spin would create a second
-        # executor and try to re-attach the same node, which deadlocks
-        # under default settings. The ReentrantCallbackGroup that owns
-        # this client lets the outer MTE dispatch the response while
-        # we yield wall time below — same pattern as
-        # mission_control_node._execute_start_mission.
-        deadline = time.monotonic() + _CHANGE_STATE_TIMEOUT_S
-        while not future.done():
-            if time.monotonic() >= deadline:
+        # The outer MultiThreadedExecutor dispatches the response into
+        # the future via the ReentrantCallbackGroup that owns this
+        # client; this worker thread just blocks on the future's done
+        # event. Critical for parallel _fan_out: with many futures in
+        # flight, sleep-polling each one would burn CPU and bound the
+        # bring-up time below by the polling cadence.
+        if not self._wait_for_future(future, _CHANGE_STATE_TIMEOUT_S):
+            try:
                 cli.remove_pending_request(future)
-                err = f"timeout waiting for transition {transition_id}"
-                self._publish_progress(node_name, transition_id, "timeout", err)
-                return False, err
-            time.sleep(0.05)
+            except Exception:
+                pass
+            err = f"timeout waiting for transition {transition_id}"
+            self._publish_progress(node_name, transition_id, "timeout", err)
+            return False, err
         result = future.result()
         if result is None:
             err = "change_state returned None (rclpy error)"
@@ -410,9 +665,7 @@ class ModeManagerNode(LifecycleNode):
         the change_state call will fail with a more informative
         error anyway.
         """
-        cli = self._get_state_clients.get(node_name)
-        if cli is None:
-            return None
+        cli = self._get_get_state_client(node_name)
         if not cli.service_is_ready():
             # No wait — if the service isn't already there, we won't
             # wait for it. The downstream change_state will gate on
@@ -420,12 +673,12 @@ class ModeManagerNode(LifecycleNode):
             return None
 
         future = cli.call_async(GetState.Request())
-        deadline = time.monotonic() + 2.0
-        while not future.done():
-            if time.monotonic() >= deadline:
+        if not self._wait_for_future(future, 2.0):
+            try:
                 cli.remove_pending_request(future)
-                return None
-            time.sleep(0.02)
+            except Exception:
+                pass
+            return None
         result = future.result()
         if result is None:
             return None

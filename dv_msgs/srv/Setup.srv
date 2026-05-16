@@ -1,0 +1,14 @@
+# Setup — mode_manager_node → autonomy LifecycleNode.
+#
+# Called once per node before the configure transition. Stores the
+# active mode name and a per-node behavior string (mission name for
+# perception/SLAM/planning; controller name for control_node).
+
+# ---------------- Request ----------------
+string mode_name
+string behavior
+
+---
+# ---------------- Response ----------------
+bool success
+string message

@@ -4,7 +4,8 @@ Single ROS node that:
   1. Subscribes to /Path (planner), /slam/pose (SLAM Odometry),
      /Conos_Orange (finish-gate detection)
   2. Builds VehicleState + ReferenceTrajectory each tick
-  3. Calls a LateralController + LongitudinalController (selected by params)
+  3. Calls a DriveController (default: CompositeDriveController wrapping
+     lateral + longitudinal strategies selected by params / mode_manager)
   4. Publishes /ctrl/cmd_internal (fs_msgs/ControlCommand) — the
      supervisor relays this onto /fsds/control_command via the
      RuntimeControl action; see #384.
@@ -13,9 +14,10 @@ Single ROS node that:
      autonomy never touches /signal/ebs or /signal/ebs_reset
      directly anymore.
 
-Keeps strategies behind ABCs so swapping Pure Pursuit → LQR or PI → MPC is one
-line in the factory below. The node does no path geometry, no slip math, no
-PID — those live in the strategy implementations.
+Keeps strategies behind ABCs. Decoupled stacks use ``drive_controller=composite``;
+a future LQR/MPC registers as its own :class:`DriveController` and returns a
+single :class:`ActuationCommand` per tick. The node does no path geometry, no
+slip math, no PID — those live in the strategy implementations.
 
 Wire format note: the bridge translates ControlCommand{throttle, steering,
 brake} → setVehicleCommand{throttle, steering, regen} (feat/33). We emit
@@ -28,11 +30,8 @@ import math
 from typing import Optional
 
 import rclpy
-from rclpy.lifecycle import (
-    LifecycleNode,
-    TransitionCallbackReturn,
-    State as LifecycleState,
-)
+from node_base.base_lifecycle_node import BaseLifecycleNode
+from rclpy.lifecycle import TransitionCallbackReturn, State as LifecycleState
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
 from fs_msgs.msg import ControlCommand
@@ -45,12 +44,15 @@ from transforms3d.euler import quat2euler
 
 from control.state import VehicleState
 from control.reference import ReferenceTrajectory
-from control.controllers.base import LateralController, LongitudinalController
+from control.controllers.base import DriveController, LateralController, LongitudinalController
+from control.controllers.composite_drive import CompositeDriveController
 from control.controllers.pure_pursuit import PurePursuit
+from control.controllers.stanley import Stanley
 from control.controllers.pi_velocity import PIVelocity
+from control.models.bicycle import KinematicBicycle
 
 
-class ControlNode(LifecycleNode):
+class ControlNode(BaseLifecycleNode):
     """Lifecycle-managed vehicle controller.
 
     Lifecycle layout:
@@ -74,9 +76,8 @@ class ControlNode(LifecycleNode):
         super().__init__(self.NODE_NAME)
         self._declare_params()
 
-        # Strategy refs — built in on_configure once params are visible.
-        self.lateral: Optional[LateralController] = None
-        self.longitudinal: Optional[LongitudinalController] = None
+        # Built in on_configure once params / mode_manager behavior are visible.
+        self._drive: Optional[DriveController] = None
 
         # Latest input state. Reset on every activate.
         # /slam/pose and /odom are split sources post-#360/#382:
@@ -137,6 +138,9 @@ class ControlNode(LifecycleNode):
     def on_configure(
         self, state: LifecycleState
     ) -> TransitionCallbackReturn:
+        ret = super().on_configure(state)
+        if ret != TransitionCallbackReturn.SUCCESS:
+            return ret
         self.get_logger().info("on_configure: strategies + publishers + TF")
         self._build_strategies()
 
@@ -188,8 +192,7 @@ class ControlNode(LifecycleNode):
     ) -> TransitionCallbackReturn:
         self.get_logger().info(
             f"on_activate: subs + 40 Hz timer "
-            f"(lateral={type(self.lateral).__name__}, "
-            f"longitudinal={type(self.longitudinal).__name__})")
+            f"(drive={type(self._drive).__name__})")
 
         # Reset all per-run state so deactivate→activate is a fresh run.
         self._latest_pose = None
@@ -279,19 +282,19 @@ class ControlNode(LifecycleNode):
         self._kappa_max_pub = None
         self._tf_listener = None
         self._tf_buffer = None
-        self.lateral = None
-        self.longitudinal = None
-        return TransitionCallbackReturn.SUCCESS
+        self._drive = None
+        return super().on_cleanup(state)
 
     def on_shutdown(
         self, state: LifecycleState
     ) -> TransitionCallbackReturn:
         self.get_logger().info("on_shutdown")
-        return TransitionCallbackReturn.SUCCESS
+        return super().on_shutdown(state)
 
     # ------------------------------------------------------------------ params
 
     def _declare_params(self) -> None:
+        self.declare_parameter("drive_controller", "composite")
         self.declare_parameter("lateral_controller", "pure_pursuit")
         self.declare_parameter("longitudinal_controller", "pi_velocity")
         # Tunables — passed to the strategy constructors. Keep flat: each
@@ -315,6 +318,26 @@ class ControlNode(LifecycleNode):
         # the apex (test_submodule first hairpin, #260 follow-up).
         self.declare_parameter("lookahead_min", 1.0)
         self.declare_parameter("lookahead_k", 0.5)
+        # Stanley lateral controller parameters. Defaults match the
+        # alt_pipeline reference port. mode_manager pushes these
+        # per-mode via SetParameters before the configure transition;
+        # see pipeline/mode_manager/mode_manager/mode_registry.py.
+        #   stanley_k:           cross-track gain (1/s scaling on cte)
+        #   stanley_k_soft:      softening term (m/s) keeping the
+        #                        cte denominator stable at v→0
+        #   stanley_k_yaw_rate:  optional yaw-rate damping coefficient
+        #                        (rad / (rad/s)); 0.0 disables
+        #   stanley_k_damp_steer: optional single-tick damping against
+        #                         the previous command; 0.0 disables
+        self.declare_parameter("stanley_k", 4.0)
+        self.declare_parameter("stanley_k_soft", 6.0)
+        self.declare_parameter("stanley_k_yaw_rate", 0.0)
+        self.declare_parameter("stanley_k_damp_steer", 0.0)
+        # Kinematic-bicycle geometry. Used by every lateral controller
+        # via the shared KinematicBicycle model. Default matches the
+        # IFS-08 chassis (also the default inside bicycle.py).
+        self.declare_parameter("wheelbase", 1.627)
+        self.declare_parameter("max_steer_deg", 28.0)
         self.declare_parameter("kp_v", 0.5)
         self.declare_parameter("ki_v", 0.05)
         self.declare_parameter("deadband_v", 0.2)
@@ -345,23 +368,48 @@ class ControlNode(LifecycleNode):
     # ------------------------------------------------------------------ factory
 
     def _build_strategies(self) -> None:
-        """Pick controller implementations from params. Adding LQR/MPC later
-        is one new file under controllers/ + one branch in this factory."""
-        lat_name = self._p("lateral_controller")
+        """Pick controllers from mode_manager behavior (stanley / pure_pursuit)."""
+        dc = str(self._p("drive_controller"))
+        if dc != "composite":
+            raise ValueError(
+                f"unknown drive_controller={dc!r}; supported: 'composite'. "
+                "Add a joint DriveController (e.g. LQR, MPC) here when ready."
+            )
+
+        lat_name = self._behavior
+        if lat_name not in ("stanley", "pure_pursuit"):
+            lat_name = self._p("lateral_controller")
         lon_name = self._p("longitudinal_controller")
 
-        self.lateral: LateralController
+        # Shared kinematic-bicycle model. Built from params so
+        # mode_manager can override wheelbase / max_steer per mode
+        # without touching the controller files themselves.
+        bicycle = KinematicBicycle(
+            wheelbase=float(self._p("wheelbase")),
+            max_steer_rad=math.radians(float(self._p("max_steer_deg"))),
+        )
+
+        lateral: LateralController
         if lat_name == "pure_pursuit":
-            self.lateral = PurePursuit(
+            lateral = PurePursuit(
                 lookahead_min=self._p("lookahead_min"),
                 lookahead_k=self._p("lookahead_k"),
+                model=bicycle,
+            )
+        elif lat_name == "stanley":
+            lateral = Stanley(
+                k=self._p("stanley_k"),
+                k_soft=self._p("stanley_k_soft"),
+                k_yaw_rate=self._p("stanley_k_yaw_rate"),
+                k_damp_steer=self._p("stanley_k_damp_steer"),
+                model=bicycle,
             )
         else:
             raise ValueError(f"unknown lateral_controller={lat_name!r}")
 
-        self.longitudinal: LongitudinalController
+        longitudinal: LongitudinalController
         if lon_name == "pi_velocity":
-            self.longitudinal = PIVelocity(
+            longitudinal = PIVelocity(
                 v_max=self._p("v_max"),
                 a_lat_max=self._p("a_lat_max"),
                 a_dec_max=self._p("a_dec_max"),
@@ -372,6 +420,8 @@ class ControlNode(LifecycleNode):
             )
         else:
             raise ValueError(f"unknown longitudinal_controller={lon_name!r}")
+
+        self._drive = CompositeDriveController(lateral, longitudinal)
 
     # ----------------------------------------------------------- subscriptions
 
@@ -486,12 +536,16 @@ class ControlNode(LifecycleNode):
         ref.stop_latched = self._stop_latched
 
         # Strategies own all algorithm logic. Per-tick state is immutable;
-        # any internal accumulator (PI integral) lives on the strategy.
-        steering_norm = self.lateral.compute(state, ref)
-        throttle, regen = self.longitudinal.compute(state, ref)
+        # any internal accumulator (PI integral) lives on the drive controller.
+        if self._drive is None:
+            self._cmd_pub.publish(cmd)
+            return
 
-        cmd.throttle = float(max(0.0, min(1.0, throttle)))
-        cmd.brake = float(max(0.0, min(1.0, regen)))
+        act = self._drive.compute(state, ref)
+
+        cmd.throttle = float(max(0.0, min(1.0, act.throttle)))
+        cmd.brake = float(max(0.0, min(1.0, act.regen)))
+        steering_norm = act.steering_normalized
         # Sign convention boundary. The strategy contract declares positive
         # steering = LEFT (math convention, matches Pure Pursuit's curvature
         # κ = 2·sin(α)/Ld where α is atan2(body_y, body_x) with body_y =
@@ -554,10 +608,10 @@ class ControlNode(LifecycleNode):
         # the per-tick log line — having them as topics lets Lichtblick
         # plot them against time alongside the SLAM speed trace.
         v_set_msg = Float32()
-        v_set_msg.data = float(getattr(self.longitudinal, "last_v_set", 0.0))
+        v_set_msg.data = float(getattr(self._drive, "last_v_set", 0.0))
         self._v_set_pub.publish(v_set_msg)
         kappa_msg = Float32()
-        kappa_msg.data = float(getattr(self.longitudinal, "last_kappa_max", 0.0))
+        kappa_msg.data = float(getattr(self._drive, "last_kappa_max", 0.0))
         self._kappa_max_pub.publish(kappa_msg)
 
         # Heartbeat — every ~0.5 s. Tells us at a glance whether each

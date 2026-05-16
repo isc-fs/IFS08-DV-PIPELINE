@@ -20,6 +20,8 @@ find_package(Eigen3 REQUIRED)
 find_package(odometry_filter REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
+find_package(node_base_cpp REQUIRED)
+find_package(dv_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -32,10 +34,14 @@ add_executable(odometry_filter_node
 target_link_libraries(odometry_filter_node
   Eigen3::Eigen
 )
+target_link_libraries(odometry_filter_node
+  node_base_cpp::node_base_cpp
+)
 ament_target_dependencies(odometry_filter_node
   odometry_filter
   rclcpp
   rclcpp_lifecycle
+  dv_msgs
   nav_msgs
   sensor_msgs
   std_msgs

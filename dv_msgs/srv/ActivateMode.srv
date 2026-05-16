@@ -1,30 +1,26 @@
 # ActivateMode — mission_control_node → mode_manager_node.
 #
-# Asks mode_manager to drive every autonomy LifecycleNode through
-# `configure` then `activate`, propagating the mission flag so each
-# node selects the correct strategy (trackdrive / autocross / accel /
-# skidpad).
+# Two-phase bring-up (mirrors alt_pipeline prepare / activate split):
 #
-# This is a one-shot service, not an action: mission_control awaits
-# the response. Heartbeats during configure/activate are emitted by
-# mission_control_node back to the supervisor on the StartMission
-# action — this layer is fast enough that internal heartbeats are
-# not needed.
+#   activate=false  →  ~/setup + configure each node (SetMission /
+#                      prepare). Nodes stay inactive; Numba JIT runs here.
+#
+#   activate=true   →  activate nodes prepared by the last prepare call
+#                      (RuntimeControl open). Mission must match prepared.
+#
+# Empty mission deactivates+cleans up every autonomy node regardless of
+# activate (tear down / mission_id=0).
 #
 # Mission values:
-#   "trackdrive" | "autocross" | "accel" | "skidpad"
+#   "trackdrive" | "autocross" | "accel" | "skidpad" | "scruti"
 #
-# Empty string deactivates+cleans up every autonomy node (used when
-# the supervisor cancels Phase 1 to switch missions).
+# Response field is `ok` (not `success`).
 
 # ---------------- Request ----------------
 string mission
+bool activate
 
 ---
 # ---------------- Response ----------------
-# True if every autonomy LifecycleNode reached `active` (or, for
-# empty mission, returned to `unconfigured`).
 bool ok
-
-# Per-node diagnostic when ok=false. Empty on success.
 string message

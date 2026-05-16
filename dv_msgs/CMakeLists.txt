@@ -7,10 +7,11 @@ find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "action/StartMission.action"
+  "action/SetMission.action"
   "action/RuntimeControl.action"
   "msg/LifecycleProgress.msg"
   "srv/ActivateMode.srv"
+  "srv/Setup.srv"
   "srv/StartBag.srv"
   "srv/StopBag.srv"
   DEPENDENCIES std_msgs builtin_interfaces

@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>cone_detection</name>
+  <name>node_base</name>
   <version>0.0.0</version>
-  <description>LiDAR cone detection: RANSAC ground removal, DBSCAN clustering, template-dispatch cone fitting, and /Conos_raw + /Conos_Orange markers for cone_slam. Strategy-based (behavior=base); lifecycle configure runs Numba warmup.</description>
+  <description>Shared BaseLifecycleNode for Python autonomy nodes</description>
   <maintainer email="jaimeperezgil21@gmail.com">jaime</maintainer>
   <license>GPL-3.0-or-later</license>
 
@@ -11,11 +11,7 @@
 
   <depend>rclpy</depend>
   <depend>lifecycle_msgs</depend>
-  <depend>node_base</depend>
   <depend>dv_msgs</depend>
-  <depend>sensor_msgs</depend>
-  <depend>geometry_msgs</depend>
-  <depend>visualization_msgs</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

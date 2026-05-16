@@ -1,0 +1,33 @@
+# SetMission — Phase 1 of the runtime action protocol.
+#
+# Sent: sim_supervisor_node → mission_control_node
+#
+# Selects a mission by registry mission_id. mission_control_node calls
+# mode_manager activate_mode with the corresponding mode name; mode_manager
+# runs ~/setup then configure/activate on each BaseLifecycleNode.
+#
+# mission_id values (from mode_registry.MODE_REGISTRY):
+#   1 = trackdrive
+#   2 = autocross
+#   3 = accel
+#   4 = skidpad
+#   5 = scruti
+#   0 = tear down (same as activate_mode with empty mission)
+#
+# Prepares autonomy only (configure, not activate). Once success=true,
+# the supervisor opens RuntimeControl for Phase 2 (activate + run).
+
+# ---------------- Goal ----------------
+int32 mission_id
+
+---
+# ---------------- Result ----------------
+bool success
+string message
+
+---
+# ---------------- Feedback ----------------
+# Progress while configure/activate is in flight (per-node stages from
+# /mode_manager/progress relayed by mission_control_node).
+string stage
+builtin_interfaces/Time stamp

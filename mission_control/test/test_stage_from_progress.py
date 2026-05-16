@@ -1,9 +1,9 @@
-"""Unit tests for the StartMission `stage` formatter (#387).
+"""Unit tests for the SetMission `stage` formatter (#387).
 
 `_stage_from_progress` renders a LifecycleProgress event as the
 human-readable string Mission Control's UI shows in its session
 spinner. The shape is part of the action's wire contract (documented
-in StartMission.action's Feedback section), so this test pins it.
+in SetMission.action's Feedback section), so this test pins it.
 
 Pure function — no rclpy / no DDS, runs in plain pytest.
 """

@@ -29,6 +29,8 @@
   <buildtool_depend>eigen3_cmake_module</buildtool_depend>
 
   <depend>odometry_filter</depend>
+  <depend>node_base_cpp</depend>
+  <depend>dv_msgs</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
   <depend>nav_msgs</depend>

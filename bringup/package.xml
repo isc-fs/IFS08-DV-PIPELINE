@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>bringup</name>
+  <version>0.0.1</version>
+  <description>
+    Top-level launch files for the IFSSIM autonomy pipeline.
+
+    Hosts three composed launch files plus the shared launch helpers
+    they all use:
+
+      full_pipeline.launch.py — UE5 bridge + foxglove + bag recorder +
+        management trio (mode_manager / mission_control /
+        sim_supervisor) + autonomy lifecycle nodes (odometry through
+        control). This is what docker/dv_pipeline_stack runs at
+        container startup.
+
+      sim_pipeline.launch.py — management trio + autonomy lifecycle
+        nodes. No UE5 bridge, no foxglove, no bag recorder; for
+        developers running the autonomy locally against an
+        externally-launched simulator or bag replay.
+
+      car_pipeline.launch.py — mode_manager + mission_control +
+        autonomy. No sim_supervisor (the on-vehicle uDV replaces it),
+        no bridge.
+
+    The shared lifecycle-launch helpers (`_auto_active`,
+    `_autonomy_lifecycle`) and the IFSSIM /fsds/* topic remap
+    constants live in bringup/launch_common.py so the three launch
+    files compose the same node-graph fragments without duplicating
+    boilerplate.
+  </description>
+  <maintainer email="raul@isc-fs.com">Raul Moran</maintainer>
+  <license>GPL-3.0-or-later</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>lifecycle_msgs</exec_depend>
+
+  <!-- Pipeline node packages we launch -->
+  <exec_depend>mode_manager</exec_depend>
+  <exec_depend>mission_control</exec_depend>
+  <exec_depend>sim_supervisor</exec_depend>
+  <exec_depend>cone_detection</exec_depend>
+  <exec_depend>cone_slam</exec_depend>
+  <exec_depend>path_planning</exec_depend>
+  <exec_depend>control</exec_depend>
+  <exec_depend>odometry_filter_node</exec_depend>
+  <exec_depend>bag_recorder_node</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
