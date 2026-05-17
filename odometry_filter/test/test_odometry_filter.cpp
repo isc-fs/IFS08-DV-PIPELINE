@@ -272,13 +272,18 @@ TEST(SteeringCorrection, ResidualNearZeroWhenStraight) {
 
 TEST(SteeringCorrection, FlagsSlipUnderHighResidual) {
   auto f = make_stationary_filter();
-  // δ = 0.4 rad, vx ≈ 1.64 m/s (RPM 200), L=1.570 → ω_pred ≈ 0.44 rad/s.
-  // IMU gyro_z = 0 → residual ≈ 0.44 > 0.30 threshold → slip_flag true,
-  // EKF update rejected. The EKF's ω state should follow the gyro
-  // (≈ 0), NOT the kinematic prediction.
+  // δ = 0.4 rad, vx ≈ 4.1 m/s (RPM 500, above low-vx gate), L=1.570
+  // → ω_pred ≈ 1.05 rad/s. IMU gyro_z = 0 → residual ≈ 1.05 > 0.30
+  // threshold → slip_flag true, EKF update rejected. The EKF's ω state
+  // should follow the gyro (≈ 0), NOT the kinematic prediction.
+  //
+  // Note: previous version used RPM 200 (vx ≈ 1.64 m/s). After adding
+  // `min_vx_for_steering_correct = 3.0 m/s`, the steering correction
+  // doesn't fire at all that low — making slip_flag a non-event. Bump
+  // to RPM 500 so the test still exercises the slip-rejection path.
   f.push_steering(0.0, 0.4);
   for (int i = 0; i < 200; ++i) {
-    f.push_rpm(i * 0.0125, 200.0);
+    f.push_rpm(i * 0.0125, 500.0);
   }
   const Eigen::Vector3d accel(0.0, 0.0, kG);
   const Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
@@ -287,8 +292,32 @@ TEST(SteeringCorrection, FlagsSlipUnderHighResidual) {
     f.push_imu(t0 + i * kImuDt, accel, gyro);
   }
   EXPECT_TRUE(f.diagnostics().slip_flag);
+  EXPECT_FALSE(f.diagnostics().low_vx_gate_on);
   // ω should track the gyro (≈ 0), not the rejected kinematic prediction.
   EXPECT_NEAR(f.state().yaw_rate, 0.0, 0.05);
+}
+
+TEST(SteeringCorrection, LowVxGateOverridesEverything) {
+  // Same scenario as FlagsSlipUnderHighResidual but with vx kept below
+  // the low-vx gate (RPM 100 → vx ≈ 0.82 m/s). The steering correction
+  // must return early WITHOUT touching the EKF state and without
+  // flagging slip. The gate diag flag should be raised.
+  auto f = make_stationary_filter();
+  f.push_steering(0.0, 0.4);
+  for (int i = 0; i < 200; ++i) {
+    f.push_rpm(i * 0.0125, 100.0);   // vx ≈ 0.82 m/s — below 3.0 m/s gate
+  }
+  const Eigen::Vector3d accel(0.0, 0.0, kG);
+  const Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
+  const double t0 = 1500 * kImuDt;
+  for (int i = 0; i < 100; ++i) {
+    f.push_imu(t0 + i * kImuDt, accel, gyro);
+  }
+  EXPECT_TRUE(f.diagnostics().low_vx_gate_on);
+  EXPECT_FALSE(f.diagnostics().slip_flag);
+  EXPECT_NEAR(f.state().yaw_rate, 0.0, 0.01);
+  // The EKF's θ must not have drifted from the rejected steering update.
+  EXPECT_NEAR(f.state().yaw, 0.0, 0.01);
 }
 
 
@@ -332,7 +361,10 @@ TEST(NHC, NotAppliedWhenSlipFlagRaised) {
   auto f = make_stationary_filter();
   f.push_steering(0.0, 0.4);  // δ ≠ 0
   for (int i = 0; i < 200; ++i) {
-    f.push_rpm(i * 0.0125, 200.0);  // vx ≈ 1.6 m/s → ω_pred ≈ 0.44 > threshold
+    // RPM 500 → vx ≈ 4.1 m/s, above low-vx gate so the steering update
+    // actually fires and produces a slip_flag=true. (Previously used
+    // RPM 200 = 1.6 m/s before the low-vx gate was added.)
+    f.push_rpm(i * 0.0125, 500.0);
   }
   const Eigen::Vector3d accel(0.0, 0.5, kG);   // 0.5 m/s² lateral
   const Eigen::Vector3d gyro = Eigen::Vector3d::Zero();

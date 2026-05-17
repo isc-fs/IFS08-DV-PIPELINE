@@ -273,6 +273,22 @@ void OdometryFilter::correct_steering() {
   if (L <= 1.0e-3) {
     return;
   }
+
+  // Low-vx gate: the kinematic-bicycle model assumes steady-state
+  // tire slip equilibrium. During launch (vx < ~3 m/s) the front
+  // wheels turn but the chassis hasn't built up the lateral force
+  // to actually rotate yet, so omega_pred over-predicts. Folding
+  // that in pulls the EKF's ω state away from the (correct) gyro
+  // reading and bakes spurious yaw into θ for the lifetime of the
+  // run. Below the threshold, lean on the gyro alone — bg_z is
+  // already calibrated by this point and the BMI088 zero-rate
+  // accuracy is well under any drift we care about.
+  diag_.low_vx_gate_on = false;
+  if (vx < params_.min_vx_for_steering_correct) {
+    diag_.low_vx_gate_on = true;
+    return;
+  }
+
   const double tan_d = std::tan(latest_steering_rad_);
   const double omega_pred = (vx / L) * tan_d;
 

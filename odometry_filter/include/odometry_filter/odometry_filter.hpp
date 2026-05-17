@@ -101,6 +101,21 @@ constexpr double kWheelbaseM = 1.570;
 // folding it in would corrupt yaw).
 constexpr double kSlipYawResidualThreshold = 0.3;
 
+// vx threshold below which `correct_steering` is gated off entirely.
+// The kinematic bicycle model assumes steady-state slip equilibrium
+// (ω = (vx/L)·tan(δ)). During launch + low-speed transients this is
+// wrong: the front wheels are turning but the chassis hasn't built up
+// the slip angle / lateral force to actually rotate yet. Applying the
+// correction in that window pulls the EKF's ω state away from the
+// correct gyro reading and bakes in spurious yaw. Empirical: at
+// vx ≈ 1.8 m/s with δ=5° the model predicts +5.7°/s while truth is
+// ~0°/s — that 5.7°/s gain stays below the slip threshold and the
+// EKF integrates it for ≥1 s before slip_flag finally fires. 3 m/s
+// puts the gate above the launch transient on FS-DV. (Bag analysis
+// from autocross_track_20260404_013721_20260517_230727 post-#518
+// /odom-handshake fix; see commit message for the trace.)
+constexpr double kMinVxForSteeringCorrect = 3.0;
+
 // Gravity magnitude (sim's BMI088 model uses standard gravity).
 constexpr double kG = 9.81;
 
@@ -150,6 +165,13 @@ struct FilterDiagnostics {
   // When true, the steering kinematic measurement is REJECTED (not
   // folded into the EKF update).
   bool slip_flag{false};
+
+  // True iff the steering correction was gated off this tick by the
+  // low-vx guard (vx < min_vx_for_steering_correct). At launch the
+  // kinematic-bicycle prediction is wrong because slip equilibrium
+  // hasn't built up; this flag tells the operator when the EKF is
+  // relying on the gyro alone for ω.
+  bool low_vx_gate_on{false};
 };
 
 
@@ -194,6 +216,10 @@ struct EkfParams {
 
   // Steering gating
   double slip_yaw_residual_threshold = kSlipYawResidualThreshold;
+  // Below this vx (m/s), `correct_steering` returns early without
+  // folding the kinematic-bicycle prediction in. See
+  // kMinVxForSteeringCorrect for the rationale.
+  double min_vx_for_steering_correct = kMinVxForSteeringCorrect;
 
   // dt clamps (s). dt outside [dt_min, dt_max] → predict step skipped.
   double dt_min = 1.0e-5;
