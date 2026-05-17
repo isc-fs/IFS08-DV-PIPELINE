@@ -2,25 +2,17 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>odometry_filter_node</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>
-    Lifecycle-managed ROS 2 node that drives the OdometryFilter
+    Lifecycle-managed ROS 2 node that drives the OdometryFilter EKF
     (provided by the odometry_filter package). Subscribes to /imu,
-    /motor_rpm, /steering_angle, /brake_pressure; publishes /odom
-    plus /odom_diag/* diagnostics; broadcasts odom→base_link TF.
+    /motor_rpm, /steering_angle; publishes /odom (with covariance) +
+    /odom_diag/{yaw_residual_rad_s, slip_flag}; broadcasts
+    odom→base_link TF at 100 Hz. Inherits node_base_cpp's
+    BaseLifecycleNode for the standard ~/setup plumbing.
 
-    Pre-#431 this work lived inside sim_supervisor_node.py as a
-    Python callback path. That path was at ~93 % CPU on a single
-    core because rclpy dispatches the BMI088 400 Hz IMU callback
-    400 times per second with Python overhead. Same algorithm in
-    rclcpp drops the overhead by ~25-50x per call. Phase 1 (#431)
-    shipped the pure-math library + tests; this package is the
-    Phase 2 ROS wrapper. Phase 3 strips the Python OdometryFilter
-    from sim_supervisor_node and flips this node on by default.
-
-    Lifecycle-managed because the rest of the DV pipeline already
-    is — the diagram contract treats /odom availability as a
-    lifecycle-gated capability, not always-on.
+    Driven by mode_manager via the two-phase SetMission protocol —
+    the same managed bring-up the rest of the autonomy pipeline uses.
   </description>
   <maintainer email="moranguerra18@gmail.com">Raúl Morán</maintainer>
   <license>GPL-3.0-or-later</license>

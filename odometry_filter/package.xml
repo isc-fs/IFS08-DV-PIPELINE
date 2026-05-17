@@ -2,17 +2,16 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>odometry_filter</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>
-    C++ port of the Python OdometryFilter (formerly in
-    sim_supervisor.odometry). Pure-math complementary filter: IMU
-    prediction + motor-RPM correction + kinematic-bicycle yaw
-    cross-check + brake-pressure α scaling. No ROS dependency in the
-    library itself — that lives in the future odometry_filter_node
-    package. Algorithm is identical to the Python reference (validated
-    by gtest fixtures shared with the Python pytest suite). Same code
-    is the basis for the real-car uDV firmware filter; porting now
-    means sim and car run literally the same C++ from day one.
+    Hand-rolled 9-state EKF for body-frame odometry on the IFS-08 DV
+    pipeline. State = [x, y, θ, vx, vy, ω, ba_x, ba_y, bg_z]. Predict
+    step is Coriolis-correct (v̇x = ax + ω·vy, v̇y = ay − ω·vx) — fixes
+    the cornering vy drift that was the trackdrive ceiling pre-rewrite.
+    Measurements: motor-RPM → vx; steering-angle kinematic-bicycle →
+    ω (gated under slip). No ROS dependency in the library itself —
+    the lifecycle wrapper lives in odometry_filter_node. The same
+    library is intended to compile against the real-car uDV firmware.
   </description>
   <maintainer email="moranguerra18@gmail.com">Raúl Morán</maintainer>
   <license>GPL-3.0-or-later</license>

@@ -1,10 +1,19 @@
 // Copyright 2026 IFSSIM contributors.
 //
-// gtest port of the 21 pytest scenarios in
-// pipeline/sim_supervisor/test/test_odometry.py. Same fixtures, same
-// numeric assertions. The two implementations have to agree to 1e-9
-// absolute tolerance on every fixture so any sim/real-car divergence
-// shows up here, not in a lap test.
+// gtest coverage for the 9-state EKF in odometry_filter.
+//
+// Three classes of tests:
+//   1. Carryovers from the complementary-filter era: calibration,
+//      RPM correction, yaw integration, position integration, reset.
+//      Same intent, adapted to the new EKF (looser tolerances where
+//      EKF settling depends on noise tuning rather than a fixed α).
+//   2. New EKF-specific tests: bias estimation, steering gating,
+//      covariance grows-when-no-corrections / shrinks-on-corrections,
+//      analytical-vs-numerical Jacobian check.
+//   3. The Coriolis cornering regression — synthesises a 60 s
+//      constant-radius turn with body-y reading exactly ω·vx
+//      (centripetal). The pre-rewrite complementary filter blows past
+//      4 m/s lateral drift here; the new EKF must keep |vy| < 0.10 m/s.
 //
 // Run inside the container:
 //   colcon build --packages-select odometry_filter
@@ -18,26 +27,40 @@
 #include "odometry_filter/odometry_filter.hpp"
 
 using odometry_filter::OdometryFilter;
-using odometry_filter::Params;
+using odometry_filter::EkfParams;
+using odometry_filter::OdometryState;
 using odometry_filter::kG;
-using odometry_filter::kAlphaVx;
-using odometry_filter::kAlphaVxBrake;
 using odometry_filter::kRpmToMs;
+using odometry_filter::kStateDim;
+using odometry_filter::X;
+using odometry_filter::Y;
+using odometry_filter::THETA;
+using odometry_filter::VX;
+using odometry_filter::VY;
+using odometry_filter::OMEGA;
+using odometry_filter::BA_X;
+using odometry_filter::BA_Y;
+using odometry_filter::BG_Z;
 
 namespace {
 
-constexpr double kImuDt = 0.0025;  // 400 Hz
+constexpr double kImuDt = 0.0025;       // 400 Hz
 constexpr int kCalibrationSamples = 1500;
 
-// stationary_filter fixture — mirrors pytest's fixture of the same name.
-// Feeds 1500 samples at 400 Hz of clean stationary IMU (accel = (0, 0, g),
-// gyro = 0), leaving the filter post-calibration with biases ~0.
+// Feeds stationary IMU (accel = (0, 0, g), gyro = 0) at 400 Hz until
+// the filter completes its calibration window. Stops there — running
+// extra "still" predict ticks afterwards inflates P off-diagonals and
+// confuses subsequent corrections (we'd accumulate position uncertainty
+// the test doesn't intend to model).
 OdometryFilter make_stationary_filter() {
   OdometryFilter f;
   const Eigen::Vector3d accel_stationary(0.0, 0.0, kG);
   const Eigen::Vector3d gyro_stationary(0.0, 0.0, 0.0);
   for (int i = 0; i < kCalibrationSamples; ++i) {
     f.push_imu(static_cast<double>(i) * kImuDt, accel_stationary, gyro_stationary);
+    if (f.is_calibrated()) {
+      break;
+    }
   }
   EXPECT_TRUE(f.is_calibrated()) << "fixture should leave filter calibrated";
   return f;
@@ -47,7 +70,7 @@ OdometryFilter make_stationary_filter() {
 
 
 // ============================================================================
-// Calibration behaviour
+// Calibration
 // ============================================================================
 
 TEST(OdometryFilterCalibration, StartsUncalibrated) {
@@ -80,44 +103,76 @@ TEST(OdometryFilterCalibration, EstimatesAccelBias) {
   EXPECT_NEAR(f.state().vx, 0.0, 1e-12);
 }
 
-TEST(OdometryFilterCalibration, UncalibratedFilterPublishesZeroState) {
+TEST(OdometryFilterCalibration, PostCalibrationStateIsZeroExceptBiases) {
   auto f = make_stationary_filter();
-  EXPECT_TRUE(f.is_calibrated());
-  const auto & s = f.state();
-  EXPECT_EQ(s.x, 0.0);
-  EXPECT_EQ(s.y, 0.0);
-  EXPECT_EQ(s.vx, 0.0);
-  EXPECT_EQ(s.vy, 0.0);
+  ASSERT_TRUE(f.is_calibrated());
+  EXPECT_EQ(f.state().x, 0.0);
+  EXPECT_EQ(f.state().y, 0.0);
+  EXPECT_EQ(f.state().vx, 0.0);
+  EXPECT_EQ(f.state().vy, 0.0);
 }
 
 
 // ============================================================================
-// Velocity tracking — RPM correction
+// Bias estimation — the EKF should subtract the learned bias on every
+// post-calibration predict step.
 // ============================================================================
 
-TEST(OdometryFilterRpm, PullsVxTowardTarget) {
+TEST(BiasEstimation, RecoversNonZeroAccelBias) {
+  OdometryFilter f;
+  const double bx = 0.15, by = -0.10;
+  const Eigen::Vector3d accel(bx, by, kG + 0.02);
+  const Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
+  for (int i = 0; i < 1500; ++i) {
+    f.push_imu(i * kImuDt, accel, gyro);
+  }
+  ASSERT_TRUE(f.is_calibrated());
+  EXPECT_NEAR(f.accel_bias_for_tests()(0), bx, 1e-3);
+  EXPECT_NEAR(f.accel_bias_for_tests()(1), by, 1e-3);
+
+  // Now feed 1 s of post-calibration IMU at the SAME biased values.
+  // The EKF should subtract the bias and keep vx, vy ≈ 0.
+  const double t0 = 1500 * kImuDt;
+  for (int i = 0; i < 400; ++i) {
+    f.push_imu(t0 + i * kImuDt, accel, gyro);
+  }
+  EXPECT_NEAR(f.state().vx, 0.0, 1e-2);
+  EXPECT_NEAR(f.state().vy, 0.0, 1e-2);
+}
+
+TEST(BiasEstimation, RecoversGyroBias) {
+  OdometryFilter f;
+  const Eigen::Vector3d accel(0.0, 0.0, kG);
+  const Eigen::Vector3d gyro(0.0, 0.0, 0.02);  // 0.02 rad/s bias
+  for (int i = 0; i < 1500; ++i) {
+    f.push_imu(i * kImuDt, accel, gyro);
+  }
+  ASSERT_TRUE(f.is_calibrated());
+  EXPECT_NEAR(f.gyro_bias_for_tests()(2), 0.02, 1e-4);
+
+  // Post-calibration, same biased gyro → yaw should stay near zero.
+  const double t0 = 1500 * kImuDt;
+  for (int i = 0; i < 400; ++i) {
+    f.push_imu(t0 + i * kImuDt, accel, gyro);
+  }
+  EXPECT_NEAR(f.state().yaw, 0.0, 5e-3);
+}
+
+
+// ============================================================================
+// RPM correction
+// ============================================================================
+
+TEST(RpmCorrection, ConvergesToTarget) {
   auto f = make_stationary_filter();
   const double target_rpm = 100.0;
   const double target_vx = target_rpm * kRpmToMs;
-  // α=0.10 default → each push closes ~10 % of residual.
-  // 200 pushes → gap is target × (1-α)^200 ≪ 1e-4.
   for (int i = 0; i < 200; ++i) {
     f.push_rpm(i * 0.0125, target_rpm);
   }
-  EXPECT_NEAR(f.state().vx, target_vx, 1e-4);
-}
-
-TEST(OdometryFilterRpm, CorrectionIsMonotone) {
-  auto f = make_stationary_filter();
-  const double target_rpm = 50.0;
-  const double target_vx = target_rpm * kRpmToMs;
-  double prev_vx = f.state().vx;
-  for (int i = 0; i < 20; ++i) {
-    f.push_rpm(i * 0.0125, target_rpm);
-    EXPECT_GE(f.state().vx, prev_vx - 1e-9) << "vx should be non-decreasing";
-    EXPECT_LE(f.state().vx, target_vx + 1e-9) << "no overshoot";
-    prev_vx = f.state().vx;
-  }
+  // EKF converges to target weighted by R_rpm vs accumulated P[VX,VX];
+  // tolerance reflects that.
+  EXPECT_NEAR(f.state().vx, target_vx, 0.05);
 }
 
 
@@ -125,27 +180,22 @@ TEST(OdometryFilterRpm, CorrectionIsMonotone) {
 // Yaw integration
 // ============================================================================
 
-TEST(OdometryFilterYaw, IntegratesConstantGyro) {
+TEST(YawIntegration, IntegratesConstantGyro) {
   auto f = make_stationary_filter();
-  const Eigen::Vector3d gyro(0.0, 0.0, 0.5);  // 0.5 rad/s
+  const Eigen::Vector3d gyro(0.0, 0.0, 0.5);
   const Eigen::Vector3d accel(0.0, 0.0, kG);
   const double t0 = 1500 * kImuDt;
   for (int i = 0; i < 400; ++i) {
     f.push_imu(t0 + i * kImuDt, accel, gyro);
   }
-  // 1 s of integration at 0.5 rad/s → yaw ≈ 0.5 rad. Tolerance for
-  // the first-tick skip (initial t_imu_last_ assignment).
-  EXPECT_NEAR(f.state().yaw, 0.5, 0.01);
+  // 1 s @ 0.5 rad/s → yaw ≈ 0.5 rad. Tolerance covers the first-tick
+  // skip + EKF settling on bg_z.
+  EXPECT_NEAR(f.state().yaw, 0.5, 0.02);
 }
 
-TEST(OdometryFilterYaw, WrapsToNegative) {
-  OdometryFilter f;
+TEST(YawIntegration, WrapsToNegative) {
+  auto f = make_stationary_filter();
   const Eigen::Vector3d accel(0.0, 0.0, kG);
-  const Eigen::Vector3d gyro_zero = Eigen::Vector3d::Zero();
-  for (int i = 0; i < 1500; ++i) {
-    f.push_imu(i * kImuDt, accel, gyro_zero);
-  }
-  ASSERT_TRUE(f.is_calibrated());
   const Eigen::Vector3d gyro_spin(0.0, 0.0, 5.0);  // 5 rad/s
   const double t0 = 1500 * kImuDt;
   for (int i = 0; i < 320; ++i) {  // 0.8 s → ~4 rad raw → wraps
@@ -157,19 +207,19 @@ TEST(OdometryFilterYaw, WrapsToNegative) {
 
 
 // ============================================================================
-// Integration end-to-end
+// End-to-end position integration
 // ============================================================================
 
-TEST(OdometryFilterIntegration, ConstantRpmDrivesPosition) {
+TEST(Integration, ConstantRpmDrivesPosition) {
   auto f = make_stationary_filter();
   const double target_rpm = 100.0;
   const double target_vx = target_rpm * kRpmToMs;
   for (int i = 0; i < 200; ++i) {
     f.push_rpm(i * 0.0125, target_rpm);
   }
-  EXPECT_NEAR(f.state().vx, target_vx, 1e-4);
+  EXPECT_NEAR(f.state().vx, target_vx, 0.05);
 
-  // 1 s @ 400 Hz, zero accel, RPM re-pinned every 5 IMU samples.
+  // 1 s @ 400 Hz, zero accel input, RPM re-pinned every 5 IMU samples.
   const Eigen::Vector3d accel(0.0, 0.0, kG);
   const Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
   const double t0 = 1500 * kImuDt;
@@ -179,8 +229,8 @@ TEST(OdometryFilterIntegration, ConstantRpmDrivesPosition) {
     }
     f.push_imu(t0 + i * kImuDt, accel, gyro);
   }
-  // After 1 s at vx ≈ 0.898 m/s, expect x ≈ 0.898 m.
-  EXPECT_NEAR(f.state().x, target_vx, 0.05);
+  // After 1 s at vx ≈ 0.821 m/s, expect x ≈ 0.821 m.
+  EXPECT_NEAR(f.state().x, target_vx, 0.1);
 }
 
 
@@ -188,9 +238,8 @@ TEST(OdometryFilterIntegration, ConstantRpmDrivesPosition) {
 // reset()
 // ============================================================================
 
-TEST(OdometryFilterReset, ClearsState) {
+TEST(Reset, ClearsState) {
   auto f = make_stationary_filter();
-  // Mutate state.
   f.push_rpm(0.0, 200.0);
   EXPECT_GT(f.state().vx, 0.0);
   f.reset();
@@ -198,16 +247,17 @@ TEST(OdometryFilterReset, ClearsState) {
   EXPECT_EQ(f.state().x, 0.0);
   EXPECT_EQ(f.state().vx, 0.0);
   EXPECT_EQ(f.state().yaw, 0.0);
+  EXPECT_FALSE(f.diagnostics().slip_flag);
+  EXPECT_EQ(f.diagnostics().yaw_residual_rad_s, 0.0);
 }
 
 
 // ============================================================================
-// Phase 3 — yaw-rate cross-check + slip flag
+// Steering kinematic cross-check (with gating)
 // ============================================================================
 
-TEST(OdometryFilterPhase3, YawResidualZeroWhenKinematicsMatch) {
+TEST(SteeringCorrection, ResidualNearZeroWhenStraight) {
   auto f = make_stationary_filter();
-  // vx>0, steering=0, no slip → yaw_residual ≈ 0.
   f.push_steering(0.0, 0.0);
   f.push_rpm(0.0, 200.0);
   const Eigen::Vector3d accel(0.0, 0.0, kG);
@@ -216,90 +266,289 @@ TEST(OdometryFilterPhase3, YawResidualZeroWhenKinematicsMatch) {
   for (int i = 0; i < 50; ++i) {
     f.push_imu(t0 + i * kImuDt, accel, gyro);
   }
-  EXPECT_NEAR(f.diagnostics().yaw_residual_rad_s, 0.0, 1e-9);
+  EXPECT_NEAR(f.diagnostics().yaw_residual_rad_s, 0.0, 5e-3);
   EXPECT_FALSE(f.diagnostics().slip_flag);
 }
 
-TEST(OdometryFilterPhase3, YawResidualNonzeroUnderSteering) {
+TEST(SteeringCorrection, FlagsSlipUnderHighResidual) {
   auto f = make_stationary_filter();
-  // Steering ≠ 0 + non-trivial vx + IMU gyro_z = 0 → ω_pred = (vx/L)tan(δ)
-  // gives a non-zero residual. With vx ≈ 1.6 (from RPM 200), L=1.55,
-  // δ=0.4: ω_pred ≈ 1.6/1.55 · tan(0.4) ≈ 0.44 rad/s > 0.3 threshold.
+  // δ = 0.4 rad, vx ≈ 1.64 m/s (RPM 200), L=1.570 → ω_pred ≈ 0.44 rad/s.
+  // IMU gyro_z = 0 → residual ≈ 0.44 > 0.30 threshold → slip_flag true,
+  // EKF update rejected. The EKF's ω state should follow the gyro
+  // (≈ 0), NOT the kinematic prediction.
   f.push_steering(0.0, 0.4);
-  // Re-pin RPM continuously so the α=0.10 blended vx actually settles
-  // near the target before we measure the residual.
-  const double target_rpm = 200.0;
-  for (int i = 0; i < 100; ++i) {
-    f.push_rpm(i * 0.0125, target_rpm);
+  for (int i = 0; i < 200; ++i) {
+    f.push_rpm(i * 0.0125, 200.0);
   }
   const Eigen::Vector3d accel(0.0, 0.0, kG);
   const Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
   const double t0 = 1500 * kImuDt;
-  for (int i = 0; i < 50; ++i) {
+  for (int i = 0; i < 100; ++i) {
     f.push_imu(t0 + i * kImuDt, accel, gyro);
   }
-  EXPECT_GT(std::abs(f.diagnostics().yaw_residual_rad_s), 0.1);
+  EXPECT_TRUE(f.diagnostics().slip_flag);
+  // ω should track the gyro (≈ 0), not the rejected kinematic prediction.
+  EXPECT_NEAR(f.state().yaw_rate, 0.0, 0.05);
 }
 
 
 // ============================================================================
-// Brake-pressure α scaling (#383)
+// Non-holonomic constraint (NHC) — the only direct observation of vy
+//
+// Without it, bias-noise integration drives vy unbounded. Live-sim
+// regression: stationary car after calibration drifted to vy ≈ 0.96
+// m/s within ~10 s, sent PurePursuit off-track before the first turn.
 // ============================================================================
 
-TEST(OdometryFilterBrake, CollapsesAlphaVx) {
+TEST(NHC, StationaryAfterCalibrationDoesNotDriftVy) {
+  // Simulates the regression directly: 30 s of "stationary" IMU
+  // (post-calibration) with a tiny accel-y bias error (the EKF can't
+  // know its bias estimate is imperfect — real-world calibration
+  // leaves some residual). Without NHC, vy integrates this bias
+  // unbounded. With NHC gated on slip_flag (which stays false here),
+  // vy must stay bounded.
   auto f = make_stationary_filter();
-  f.push_brake(0.0, 0.5);  // > 0.30 threshold
-  f.push_rpm(0.0, 100.0);
-  EXPECT_DOUBLE_EQ(f.diagnostics().effective_alpha_vx, kAlphaVxBrake);
+  // Feed a small post-calibration ay bias (~5 mm/s² — 100× tighter
+  // than the BMI088 spec, so this is a benign noise floor).
+  const Eigen::Vector3d accel_biased(0.0, 0.005, kG);
+  const Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
+  const double t0 = 1500 * kImuDt;
+  // 30 s @ 400 Hz. Old EKF (no NHC) would have vy ≈ 30·0.005 = 0.15 m/s.
+  for (int i = 0; i < 12000; ++i) {
+    f.push_imu(t0 + i * kImuDt, accel_biased, gyro);
+  }
+  EXPECT_LT(std::abs(f.state().vy), 0.05)
+    << "vy drifted to " << f.state().vy << " without NHC;"
+    << " regression: stationary car at +0.96 m/s in live sim";
 }
 
-TEST(OdometryFilterBrake, ReleaseRestoresAlphaVx) {
+TEST(NHC, NotAppliedWhenSlipFlagRaised) {
+  // When the kinematic-bicycle disagrees with the gyro by more than
+  // the threshold, slip_flag goes true and NHC must NOT fire — real
+  // lateral motion (tire sideslip) is allowed to develop. Use the
+  // same setup as SteeringCorrection.FlagsSlipUnderHighResidual but
+  // then artificially inject a non-zero ay so vy WOULD pull away from
+  // zero. Without NHC, vy follows ay·dt; if NHC fired it would clamp.
   auto f = make_stationary_filter();
-  f.push_brake(0.0, 0.5);  // under brake
-  f.push_rpm(0.0, 100.0);
-  ASSERT_DOUBLE_EQ(f.diagnostics().effective_alpha_vx, kAlphaVxBrake);
-  // Release.
-  f.push_brake(0.1, 0.0);
-  f.push_rpm(0.1, 100.0);
-  EXPECT_DOUBLE_EQ(f.diagnostics().effective_alpha_vx, kAlphaVx);
+  f.push_steering(0.0, 0.4);  // δ ≠ 0
+  for (int i = 0; i < 200; ++i) {
+    f.push_rpm(i * 0.0125, 200.0);  // vx ≈ 1.6 m/s → ω_pred ≈ 0.44 > threshold
+  }
+  const Eigen::Vector3d accel(0.0, 0.5, kG);   // 0.5 m/s² lateral
+  const Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
+  const double t0 = 1500 * kImuDt;
+  for (int i = 0; i < 100; ++i) {
+    f.push_imu(t0 + i * kImuDt, accel, gyro);
+  }
+  ASSERT_TRUE(f.diagnostics().slip_flag);
+  // ≈ 100 ticks · 0.0025 s · 0.5 m/s² = 0.125 m/s of accumulated vy.
+  // If NHC were applied, vy would be near zero; assert it isn't.
+  EXPECT_GT(std::abs(f.state().vy), 0.05);
 }
 
-TEST(OdometryFilterBrake, BelowThresholdUsesNormalAlpha) {
+
+// ============================================================================
+// Covariance behaviour
+// ============================================================================
+
+TEST(Covariance, PositionGrowsWithoutCorrection) {
   auto f = make_stationary_filter();
-  f.push_brake(0.0, 0.20);  // < 0.30
-  f.push_rpm(0.0, 100.0);
-  EXPECT_DOUBLE_EQ(f.diagnostics().effective_alpha_vx, kAlphaVx);
+  const Eigen::Vector3d accel(0.0, 0.0, kG);
+  const Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
+  const double t0 = 1500 * kImuDt;
+  // Drive a few samples to escape the no-dt initial branch.
+  f.push_imu(t0, accel, gyro);
+  const double pxx_before = f.covariance()(X, X);
+  for (int i = 1; i < 2000; ++i) {  // 5 s
+    f.push_imu(t0 + i * kImuDt, accel, gyro);
+  }
+  const double pxx_after = f.covariance()(X, X);
+  EXPECT_GT(pxx_after, pxx_before);
+}
+
+TEST(Covariance, RpmShrinksVxVariance) {
+  auto f = make_stationary_filter();
+  const Eigen::Vector3d accel(0.0, 0.0, kG);
+  const Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
+  const double t0 = 1500 * kImuDt;
+  // Let P[VX, VX] inflate via predict-only.
+  for (int i = 0; i < 1000; ++i) {
+    f.push_imu(t0 + i * kImuDt, accel, gyro);
+  }
+  const double pvxvx_before = f.covariance()(VX, VX);
+  // Apply RPM updates and check covariance contracts.
+  for (int i = 0; i < 50; ++i) {
+    f.push_rpm(i * 0.0125, 100.0);
+  }
+  const double pvxvx_after = f.covariance()(VX, VX);
+  EXPECT_LT(pvxvx_after, pvxvx_before);
 }
 
 
 // ============================================================================
-// reset() clears Phase 3 state too
+// The killer test — Coriolis cornering regression
+//
+// Synthesise a constant-radius turn:
+//   vx_true  = 10 m/s
+//   ω_true   = 0.5 rad/s  →  R = vx/ω = 20 m
+//   a_x      = 0
+//   a_y      = ω·vx = 5.0 m/s²    (centripetal, body-y)
+//   δ        = atan(L·ω/vx) = atan(1.570·0.5/10) ≈ 0.07823 rad
+//
+// In a Coriolis-correct filter, body-frame v̇y = a_y − ω·vx = 0,
+// so |vy| stays small forever. The pre-rewrite complementary filter
+// integrated a_y directly and blew past 4 m/s within ~70 s.
 // ============================================================================
 
-TEST(OdometryFilterReset, ClearsPhase3State) {
-  auto f = make_stationary_filter();
-  f.push_steering(0.0, 0.4);
-  f.push_brake(0.0, 0.7);
-  f.push_rpm(0.0, 200.0);
-  ASSERT_DOUBLE_EQ(f.diagnostics().effective_alpha_vx, kAlphaVxBrake);
-  f.reset();
-  EXPECT_DOUBLE_EQ(f.diagnostics().effective_alpha_vx, kAlphaVx);
-  EXPECT_FALSE(f.diagnostics().slip_flag);
-  EXPECT_NEAR(f.diagnostics().yaw_residual_rad_s, 0.0, 1e-9);
+TEST(CoriolisCornering, SteadyVyIsNearZero) {
+  // Use looser steering R to let the steering update keep ω anchored
+  // (otherwise the predict-only ω would drift via gyro noise; the
+  // synthetic feed has no noise but the filter doesn't know that).
+  EkfParams params;
+  auto f = OdometryFilter(params);
+
+  // Calibrate with clean stationary IMU. Stop at calibration
+  // completion so we don't inflate P off-diagonals with extra
+  // "still" predict ticks.
+  const Eigen::Vector3d accel_stationary(0.0, 0.0, kG);
+  const Eigen::Vector3d gyro_stationary = Eigen::Vector3d::Zero();
+  for (int i = 0; i < kCalibrationSamples; ++i) {
+    f.push_imu(i * kImuDt, accel_stationary, gyro_stationary);
+    if (f.is_calibrated()) {
+      break;
+    }
+  }
+  ASSERT_TRUE(f.is_calibrated());
+
+  // Wind the filter up to vx = 10 m/s using RPM measurements before
+  // turning on the cornering feed. The Coriolis term only fires once
+  // vx is non-zero.
+  const double vx_target = 10.0;
+  const double rpm_target = vx_target / kRpmToMs;
+  for (int i = 0; i < 300; ++i) {
+    f.push_rpm(i * 0.0125, rpm_target);
+  }
+  ASSERT_NEAR(f.state().vx, vx_target, 0.2);
+
+  // Drive a 60 s constant-radius turn. IMU @ 400 Hz, RPM @ 80 Hz,
+  // steering @ 100 Hz. All synthesised consistently.
+  const double omega_true = 0.5;       // rad/s
+  const double a_y_true   = omega_true * vx_target;  // 5.0 m/s²
+  const double delta_true = std::atan(1.570 * omega_true / vx_target);
+
+  const Eigen::Vector3d accel_corner(0.0, a_y_true, kG);
+  const Eigen::Vector3d gyro_corner(0.0, 0.0, omega_true);
+
+  const double t0 = 1500 * kImuDt + 300 * 0.0125;
+  const int n_imu = 60 * 400;  // 60 s at 400 Hz
+  for (int i = 0; i < n_imu; ++i) {
+    const double t = t0 + i * kImuDt;
+    f.push_imu(t, accel_corner, gyro_corner);
+    if (i % 5 == 0) {                          // 80 Hz RPM
+      f.push_rpm(t, rpm_target);
+    }
+    if (i % 4 == 0) {                          // 100 Hz steering
+      f.push_steering(t, delta_true);
+    }
+  }
+
+  // The hard assertion: vy must stay small. Pre-rewrite filter would
+  // be at ~4 m/s here.
+  EXPECT_LT(std::abs(f.state().vy), 0.10) << "vy = " << f.state().vy;
 }
 
+
 // ============================================================================
-// Brake clamping
+// Jacobian sanity — analytical F vs numerical central-difference.
 // ============================================================================
 
-TEST(OdometryFilterBrake, ClampsOutOfRangeBrake) {
+TEST(Jacobian, MatchesNumeric) {
+  // Build a fresh, calibrated filter and force a non-trivial state.
   auto f = make_stationary_filter();
-  // Negative brake clamps to 0 → below threshold → normal α.
-  f.push_brake(0.0, -0.5);
-  f.push_rpm(0.0, 100.0);
-  EXPECT_DOUBLE_EQ(f.diagnostics().effective_alpha_vx, kAlphaVx);
-  // > 1 clamps to 1 → above threshold → brake α.
-  f.push_brake(0.0, 1.5);
-  f.push_rpm(0.0, 100.0);
-  EXPECT_DOUBLE_EQ(f.diagnostics().effective_alpha_vx, kAlphaVxBrake);
+
+  const Eigen::Vector3d accel(0.1, 0.05, kG);
+  const Eigen::Vector3d gyro(0.0, 0.0, 0.4);
+  // Step a few times to populate state.
+  const double t0 = 1500 * kImuDt;
+  for (int i = 0; i < 100; ++i) {
+    f.push_imu(t0 + i * kImuDt, accel, gyro);
+  }
+
+  // Capture current state vector.
+  Eigen::Matrix<double, kStateDim, 1> x = f.state_vector();
+
+  // We can't reach into predict_step directly. Instead, replicate the
+  // exact Euler-step formula here and form both analytical + numerical
+  // Jacobians of the SAME function. If the production code is wrong
+  // these tests don't catch it — but the Jacobian formula itself is
+  // what's at risk, and re-deriving here keeps the test simple.
+  const double dt = kImuDt;
+  // Bias-correct (using the just-computed state's biases, not the
+  // raw-IMU sample). Only wz is used directly in the analytical F
+  // below; ax/ay get used inside `step()` via shadowed locals.
+  const double wz = gyro(2) - x(BG_Z);
+
+  auto step = [&](const Eigen::Matrix<double, kStateDim, 1> & s)
+                -> Eigen::Matrix<double, kStateDim, 1> {
+    Eigen::Matrix<double, kStateDim, 1> out = s;
+    const double theta = s(THETA);
+    const double vx = s(VX);
+    const double vy = s(VY);
+    const double c = std::cos(theta), si = std::sin(theta);
+    const double ax_l = accel(0) - s(BA_X);
+    const double ay_l = accel(1) - s(BA_Y);
+    const double wz_l = gyro(2)  - s(BG_Z);
+    out(X)     = s(X) + (vx * c - vy * si) * dt;
+    out(Y)     = s(Y) + (vx * si + vy * c) * dt;
+    out(THETA) = s(THETA) + wz_l * dt;
+    out(VX)    = s(VX) + (ax_l + wz_l * vy) * dt;
+    out(VY)    = s(VY) + (ay_l - wz_l * vx) * dt;
+    out(OMEGA) = wz_l;
+    // Biases identity.
+    return out;
+  };
+
+  // Analytical F — must match the spec in odometry_filter.cpp.
+  // OMEGA is an assignment row (not propagated from state.OMEGA),
+  // so F[*, OMEGA] = 0 for every row. wz dependence on bg_z gives
+  // the bias-column entries for THETA / VX / VY / OMEGA.
+  const double theta = x(THETA);
+  const double vx = x(VX);
+  const double vy = x(VY);
+  const double c = std::cos(theta), si = std::sin(theta);
+  Eigen::Matrix<double, kStateDim, kStateDim> F_an =
+    Eigen::Matrix<double, kStateDim, kStateDim>::Identity();
+  F_an(X,     THETA) = (-vx * si - vy * c) * dt;
+  F_an(X,     VX)    =  c * dt;
+  F_an(X,     VY)    = -si * dt;
+  F_an(Y,     THETA) = ( vx * c - vy * si) * dt;
+  F_an(Y,     VX)    =  si * dt;
+  F_an(Y,     VY)    =  c * dt;
+  F_an(THETA, BG_Z)  = -dt;
+  F_an(VX,    VY)    =  wz * dt;
+  F_an(VX,    BA_X)  = -dt;
+  F_an(VX,    BG_Z)  = -vy * dt;
+  F_an(VY,    VX)    = -wz * dt;
+  F_an(VY,    BA_Y)  = -dt;
+  F_an(VY,    BG_Z)  =  vx * dt;
+  F_an(OMEGA, OMEGA) = 0.0;
+  F_an(OMEGA, BG_Z)  = -1.0;
+
+  // Numerical central-difference Jacobian.
+  const double h = 1.0e-6;
+  Eigen::Matrix<double, kStateDim, kStateDim> F_num;
+  for (int j = 0; j < kStateDim; ++j) {
+    auto x_p = x; x_p(j) += h;
+    auto x_m = x; x_m(j) -= h;
+    F_num.col(j) = (step(x_p) - step(x_m)) / (2.0 * h);
+  }
+
+  // Tight tolerance — central differences at h=1e-6 should match
+  // analytical to 1e-7 on a smooth function like this.
+  for (int i = 0; i < kStateDim; ++i) {
+    for (int j = 0; j < kStateDim; ++j) {
+      EXPECT_NEAR(F_an(i, j), F_num(i, j), 1e-7)
+        << "Jacobian mismatch at (" << i << ", " << j << ")";
+    }
+  }
 }

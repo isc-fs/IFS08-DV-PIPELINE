@@ -1,37 +1,61 @@
 // Copyright 2026 IFSSIM contributors.
 //
-// Dead-reckoning odometry filter for the IFS-08 DV pipeline.
+// 9-state EKF for body-frame odometry on the IFS-08 DV pipeline.
 //
-// This is the C++ port of the Python OdometryFilter (was
-// pipeline/sim_supervisor/sim_supervisor/odometry.py). The
-// algorithm is identical line-for-line — numeric equivalence to
-// 1e-9 verified by the gtest suite in test/test_odometry_filter.cpp
-// using the same fixtures as the Python pytest suite.
+// Replaces the prior complementary filter. The complementary version
+// integrated IMU body-y directly into vy, which during cornering reads
+// centripetal acceleration (= ω·vx) — so /odom.vy drifted to >4 m/s
+// after ~68 s of steady-state cornering and the inflated state.speed
+// fed back into PurePursuit was the trackdrive ceiling. The fix is to
+// carry the Coriolis cross-terms in a coupled state, which the
+// complementary filter cannot do. Hence the EKF.
 //
-// Inputs (both sides of the sim/real-car parity):
-//   * IMU (BMI088-class) — accel + gyro at native rate (~400 Hz).
-//     Used for prediction (vx integration via accel-x, yaw via
-//     gyro-z) and for stationary bias calibration.
+// State vector (9-d):
+//   x[X]      world-frame x  [m]
+//   x[Y]      world-frame y  [m]
+//   x[THETA]  world-frame yaw [rad], wrapped to (-π, π]
+//   x[VX]     body-frame longitudinal velocity [m/s]
+//   x[VY]     body-frame lateral velocity     [m/s]  (left positive, REP-103)
+//   x[OMEGA]  body-frame yaw rate              [rad/s]
+//   x[BA_X]   accelerometer bias, body-x      [m/s²]
+//   x[BA_Y]   accelerometer bias, body-y      [m/s²]
+//   x[BG_Z]   gyro bias, body-z                [rad/s]
+//
+// Process model (continuous, body-frame; ã = raw IMU, b_a = accel bias,
+//   ω̃ = raw gyro, b_g = gyro bias):
+//   ẋ      = vx·cosθ − vy·sinθ
+//   ẏ      = vx·sinθ + vy·cosθ
+//   θ̇      = ω
+//   v̇x     = (ã_x − b_a,x) + ω·vy        ← Coriolis term
+//   v̇y     = (ã_y − b_a,y) − ω·vx        ← Coriolis term
+//   ω̇      = 0           (ω is set from the bias-corrected gyro each tick)
+//   ḃ_a,*  = 0           (random walk via Q)
+//   ḃ_g,z  = 0           (random walk via Q)
+//
+// Measurement models:
+//   * RPM:        z = vx,     h(x) = vx
+//   * Steering:   z = (vx/L)·tan(δ),  h(x) = ω.   GATED — only applied
+//     when |residual| < slip_yaw_residual_threshold (above which the
+//     kinematic-bicycle model is wrong because the tires are sliding,
+//     so the measurement would corrupt the estimate). Outside the gate
+//     we still publish /odom_diag/yaw_residual + slip_flag for tuning.
+//
+// Inputs: same real-car parity set as before MINUS brake pressure
+// (which added noise, never signal — drop confirmed by user during
+// the rewrite scoping).
+//   * IMU (BMI088-class) — accel + gyro at native ~400 Hz. Used as the
+//     predict-step input AND for stationary bias calibration on
+//     activate.
 //   * Motor RPM (~80 Hz) — primary longitudinal velocity correction.
 //     Multiplied by rpm_to_ms to yield body-frame longitudinal speed
-//     at the rear axle.
+//     at base_link (rear axle midpoint per URDF).
 //   * Steering angle (rad) — kinematic-bicycle yaw cross-check.
-//   * Brake pressure ([0, 1]) — scales the RPM correction when
-//     wheels are potentially locked.
 //
-// Output: 6-state body-frame estimate
-//   pose:  x, y, yaw  (world-frame, integrated from spawn)
-//   twist: vx, vy, yaw_rate  (body-frame instantaneous)
+// Output state plus a 9×9 covariance (exposed for the lifecycle node
+// to populate nav_msgs/Odometry covariance fields meaningfully).
 //
-// Filter: complementary (predict on IMU, correct on RPM). The pure-
-// math class is ROS-agnostic — drivers / nodes wrap it. Sim uses
-// odometry_filter_node (planned Phase 2). The real-car uDV firmware
-// will link the same library.
-//
-// Why this lives outside sim_supervisor: the supervisor is sim-only
-// (faking the real-car uDV's plumbing). The filter is the only piece
-// of the supervisor that has a real-car counterpart — extracting it
-// makes that boundary explicit.
+// The pure-math class is ROS-agnostic — drivers / nodes wrap it.
+// The real-car uDV firmware links the same library.
 
 #ifndef ODOMETRY_FILTER__ODOMETRY_FILTER_HPP_
 #define ODOMETRY_FILTER__ODOMETRY_FILTER_HPP_
@@ -42,7 +66,7 @@
 namespace odometry_filter {
 
 // ---------------------------------------------------------------------
-// Module-level constants (mirror odometry.py module globals exactly).
+// Constants
 // ---------------------------------------------------------------------
 
 // Motor-RPM → body-frame longitudinal velocity.
@@ -51,85 +75,61 @@ namespace odometry_filter {
 // paired GT vs filter-output samples within ±50 ms windows, computed
 // mean(|GT.vx|) / mean(|/odom.vx|) = 0.9140 across 3324 paired
 // samples (p10=0.898, p90=0.944, spread 0.046 — tight, steady).
-// New constant 0.00898 × 0.9140 = 0.00821 recovers exactly the doc-
-// derived value from docs/dv_pipeline_rebuild.md §3.5:
+// Doc-derived value from docs/dv_pipeline_rebuild.md §3.5:
 //     RPM_TO_MS = (2π × WheelRadius / GearRatio) / 60
 //               = (2π × 0.228 / 2.909) / 60
 //               = 0.00821
 constexpr double kRpmToMs = 0.00821;
 
-// Drop motor-RPM samples this old (seconds). Sustained staleness
-// means the bridge stopped publishing; fall back to IMU-only
-// prediction rather than feeding stale velocity corrections.
-constexpr double kRpmStaleS = 0.5;
-
 // Stationary-calibration window. While collecting IMU samples the
 // filter does not publish — the autonomy stack tolerates brief
-// startup delay (it's already inside Phase 1's "configuring" stage).
-// Same value slam_node uses for its own bias calibration.
+// startup delay (it's already inside SetMission's "configuring" stage).
 constexpr double kCalibrationSeconds = 3.0;
 
-// Complementary-filter blend on vx. RPM correction strength per RPM
-// message. 0.10 = each new RPM sample pulls vx by 10 % of the
-// residual. With RPM at ~80 Hz that's an effective time constant of
-// ~125 ms — fast enough to track real accel/decel, slow enough to
-// average out RPM quantisation noise.
-constexpr double kAlphaVx = 0.10;
-
-// Wheelbase used in the kinematic-bicycle yaw prediction:
+// Wheelbase used in the kinematic-bicycle yaw cross-check:
 //     ω_pred = (v_x / wheelbase) · tan(δ)
-// Compared against IMU gyro_z to publish a yaw residual diagnostic +
-// detect lateral-slip events. 1.570 m is the authoritative IFS-08
-// spec — confirmed in docs/MODEL_IFS_08/DYNAMIC_MOD/Cooling/
-// BR_regenerativeBR.m (`L = 1.570`) and the MONO sheet of
-// docs/MODEL_IFS_08/ISC_IFS_08.xlsx (BQ64 `L = 1570 mm`). The previous
-// value (1.55) was sourced from the URDF, which itself was approximate
-// — see issue #462. inputs_vehicle_dynamics.m lists 1.627 (4% disagreement
-// between authors); 1.570 is what the BR/Sandra and master MONO sheet
-// agree on and what we treat as authoritative until the spec owners
-// converge.
+// 1.570 m is the authoritative IFS-08 spec — confirmed in
+// docs/MODEL_IFS_08/DYNAMIC_MOD/Cooling/BR_regenerativeBR.m
+// (`L = 1.570`) and the MONO sheet of docs/MODEL_IFS_08/ISC_IFS_08.xlsx
+// (BQ64 `L = 1570 mm`). The URDF currently lists 1.55 (approximate);
+// inputs_vehicle_dynamics.m lists 1.627 (4 % disagreement between
+// authors). 1.570 is what the BR/Sandra and master MONO sheet agree on.
 constexpr double kWheelbaseM = 1.570;
 
-// Brake-pressure threshold above which RPM is considered unreliable
-// (drive wheels potentially locked). When exceeded the complementary
-// filter's α_vx is scaled toward zero so vx integration tracks the
-// IMU prediction rather than the RPM-derived target. 0.30 (30 % brake
-// command) is a deliberately conservative floor.
-constexpr double kBrakeLockupThreshold = 0.30;
-
-// α_vx multiplier when brake_pressure > kBrakeLockupThreshold.
-// 0.05 keeps a small residual pull toward RPM so the filter
-// eventually re-converges after the brake event, but lets IMU
-// integration dominate during the slip window.
-constexpr double kAlphaVxBrake = 0.05;
-
-// |yaw_residual| > this → slip_flag goes true on the latest tick.
-// 0.3 rad/s ≈ 17 °/s — comfortably above sensor noise but well below
-// what the steering-angle range × wheelbase product would imply at
-// typical FS speeds.
+// |yaw_residual| > this → slip_flag goes true AND the steering update
+// is rejected (the kinematic-bicycle model is no longer applicable;
+// folding it in would corrupt yaw).
 constexpr double kSlipYawResidualThreshold = 0.3;
-
-// Body-frame lateral-velocity decay per IMU step. The kinematic
-// bicycle assumes vy ≈ 0 in clean rolling; this slow leak pulls vy
-// toward zero while the IMU accel-y prediction term still tracks
-// real lateral accel during yaw maneuvers. 1e-3 per IMU sample at
-// 400 Hz → ~2.5 s time constant.
-constexpr double kBetaVyLeak = 1e-3;
 
 // Gravity magnitude (sim's BMI088 model uses standard gravity).
 constexpr double kG = 9.81;
 
 
 // ---------------------------------------------------------------------
-// 6-DOF body-frame state /odom carries.
+// State indexing
+// ---------------------------------------------------------------------
+enum StateIdx : int {
+  X       = 0,
+  Y       = 1,
+  THETA   = 2,
+  VX      = 3,
+  VY      = 4,
+  OMEGA   = 5,
+  BA_X    = 6,
+  BA_Y    = 7,
+  BG_Z    = 8,
+};
+constexpr int kStateDim = 9;
+
+
+// ---------------------------------------------------------------------
+// Public state — the slice of the EKF state vector that downstream
+// consumers (the lifecycle node, /odom message, tests) care about.
 // ---------------------------------------------------------------------
 struct OdometryState {
-  // World-frame position, integrated from spawn (drifts long-term)
   double x{0.0};
   double y{0.0};
   double yaw{0.0};
-
-  // Body-frame velocity (vx forward, vy left per REP-103)
   double vx{0.0};
   double vy{0.0};
   double yaw_rate{0.0};
@@ -137,102 +137,126 @@ struct OdometryState {
 
 
 // ---------------------------------------------------------------------
-// Cross-check residuals the node surfaces on /odom_diag/* for tuning
-// + slip detection. Populated each IMU tick when both steering and
-// IMU samples are fresh.
+// Diagnostics — surfaced on /odom_diag/* by the lifecycle node.
 // ---------------------------------------------------------------------
 struct FilterDiagnostics {
-  // ω_pred - ω_measured, where ω_pred = (vx/L)·tan(δ).
-  // Persistent non-zero residual = car is sliding (yaw rate from
-  // IMU differs from what steering geometry would predict).
+  // ω_pred − ω, where ω_pred = (vx/L)·tan(δ). Persistent non-zero
+  // residual means the car is sliding (real ω diverges from kinematic
+  // prediction). Published every IMU tick.
   double yaw_residual_rad_s{0.0};
 
-  // True iff |yaw_residual| > kSlipYawResidualThreshold on the
+  // True iff |yaw_residual| > slip_yaw_residual_threshold on the
   // latest tick. Raw per-tick truth; downstream consumers debounce.
+  // When true, the steering kinematic measurement is REJECTED (not
+  // folded into the EKF update).
   bool slip_flag{false};
-
-  // Effective α_vx applied to the most recent RPM correction.
-  // Drops toward kAlphaVxBrake when brake_pressure > threshold.
-  double effective_alpha_vx{kAlphaVx};
 };
 
 
 // ---------------------------------------------------------------------
-// Complementary filter — IMU prediction + RPM correction.
+// Tunable parameters. All defaults are starting points; the
+// production-tuning knobs live here so YAML overrides at the node
+// level pass through cleanly.
+// ---------------------------------------------------------------------
+struct EkfParams {
+  // Geometry
+  double wheelbase_m = kWheelbaseM;
+
+  // RPM scaling (see kRpmToMs derivation)
+  double rpm_to_ms = kRpmToMs;
+
+  // Calibration window length [s]
+  double calibration_seconds = kCalibrationSeconds;
+
+  // Process noise std-devs (continuous-time densities; Q is built
+  // as diag(σ²) · dt at each predict step).
+  double sigma_ax = 0.05;       // accel-x density [m/s² / √Hz]
+  double sigma_ay = 0.05;       // accel-y density
+  double sigma_gz = 0.01;       // gyro-z  density [rad/s / √Hz]
+  double sigma_ba_walk = 1.0e-4;  // accel bias random-walk
+  double sigma_bg_walk = 1.0e-5;  // gyro bias random-walk
+
+  // Measurement noise std-devs.
+  // sigma_rpm is set tight (≈ 2 cm/s) so RPM dominates over the IMU
+  // accel integration in vx tracking — without this, predict-step
+  // accel-noise inflates P[VX,VX] slowly and RPM corrections become
+  // weak (low Kalman gain), letting vx drift by tenths of a m/s during
+  // cornering. With vx loose, the Coriolis cancellation
+  // (v̇y = ay − ω·vx) leaves residual that integrates into vy drift.
+  double sigma_rpm = 0.02;      // [m/s]
+  double sigma_steer = 0.30;    // [rad/s] — deliberately loose; gated under slip
+  // sigma_vy_nhc — non-holonomic-constraint pseudo-measurement. 0.10
+  // m/s lets the rolling-tire assumption pull vy → 0 on ~1 s
+  // timescales while tolerating small real lateral motion within
+  // sideslip tolerance. The constraint is gated off when slip_flag is
+  // raised (see correct_steering).
+  double sigma_vy_nhc = 0.10;   // [m/s]
+
+  // Steering gating
+  double slip_yaw_residual_threshold = kSlipYawResidualThreshold;
+
+  // dt clamps (s). dt outside [dt_min, dt_max] → predict step skipped.
+  double dt_min = 1.0e-5;
+  double dt_max = 0.1;
+};
+
+
+// ---------------------------------------------------------------------
+// 9-state EKF.
 //
 // Lifecycle:
-//   1. Construction: state is zero, calibration not started.
-//   2. push_imu() during first kCalibrationSeconds: accumulate bias
-//      estimates (assumes car is stationary; accel reads (0, 0, +g)
-//      modulo bias; gyro reads (0, 0, 0) modulo bias). Output
-//      undefined; is_calibrated() returns false.
-//   3. After calibration: push_imu() drives prediction (integrate
-//      accel-x into vx, accel-y into vy with leak, gyro-z into yaw).
-//      push_rpm() applies the correction step.
-//   4. state() always returns the latest estimate.
-//
-// All parameters keep their module-level defaults unless overridden
-// in the constructor — convenient for unit tests that want to bypass
-// calibration or use deterministic values.
+//   1. Construction: state and covariance hold their initial values;
+//      calibration is not yet started.
+//   2. push_imu() during first calibration_seconds: accumulate bias
+//      estimates from the stationary readings. Output undefined;
+//      is_calibrated() returns false.
+//   3. After calibration: push_imu() drives the predict step (with
+//      Coriolis-correct body-frame mechanics). push_rpm() applies the
+//      vx measurement update. push_steering() caches δ; the steering
+//      kinematic update fires on the next IMU tick (when vx is fresh).
+//   4. state(), diagnostics(), and covariance() return the current
+//      estimate.
 // ---------------------------------------------------------------------
-struct Params {
-  double rpm_to_ms = kRpmToMs;
-  double rpm_stale_s = kRpmStaleS;
-  double calibration_seconds = kCalibrationSeconds;
-  double alpha_vx = kAlphaVx;
-  double beta_vy_leak = kBetaVyLeak;
-  double wheelbase_m = kWheelbaseM;
-  double brake_lockup_threshold = kBrakeLockupThreshold;
-  double alpha_vx_brake = kAlphaVxBrake;
-  double slip_yaw_residual_threshold = kSlipYawResidualThreshold;
-};
-
-
 class OdometryFilter {
  public:
-  // Default-constructed filter uses all module defaults.
-  OdometryFilter() : OdometryFilter(Params{}) {}
-
-  // Custom-parameter constructor — for unit tests + production
-  // tuning. Pass a struct-literal Params{.alpha_vx = 0.05, ...}.
-  explicit OdometryFilter(const Params & params);
+  OdometryFilter() : OdometryFilter(EkfParams{}) {}
+  explicit OdometryFilter(const EkfParams & params);
 
   // ----- Public read-only accessors -----
   const OdometryState & state() const noexcept { return state_; }
   const FilterDiagnostics & diagnostics() const noexcept { return diag_; }
   bool is_calibrated() const noexcept { return calib_.completed; }
 
-  // Tear down all state. Use on lifecycle on_cleanup.
+  // 9×9 covariance copy. Cheap (576 bytes); called once per /odom
+  // publish (100 Hz) to populate nav_msgs/Odometry covariance fields.
+  Eigen::Matrix<double, kStateDim, kStateDim> covariance() const;
+
+  // Full state vector (for tests + tuning logs).
+  Eigen::Matrix<double, kStateDim, 1> state_vector() const;
+
+  // Tear down all state. Call on lifecycle on_activate so a
+  // deactivate→activate cycle starts a fresh stationary calibration.
   void reset();
 
   // ----- Ingestion API (called from the ROS node) -----
 
   // One IMU sample. Called from the IMU subscription callback at the
-  // BMI088 native rate (~400 Hz).
-  //
-  // accel, gyro are 3-vectors in body frame. accel is m/s² with
-  // gravity included (so a stationary upright IMU reads
-  // ~(0, 0, +9.81)); gyro is rad/s.
+  // BMI088 native rate (~400 Hz). accel and gyro are body-frame; accel
+  // includes gravity (a stationary upright IMU reads (0, 0, +9.81)).
   void push_imu(
     double t,
     const Eigen::Vector3d & accel,
     const Eigen::Vector3d & gyro);
 
   // One motor-RPM sample. Called from the RPM subscription (~80 Hz).
-  // t is wall-clock seconds; stored for the rpm_stale_s check.
+  // Triggers the vx EKF update step immediately.
   void push_rpm(double t, double rpm);
 
-  // One steering-angle sample (rad). Cached for the next push_imu's
-  // kinematic-bicycle cross-check.
+  // One steering-angle sample (rad). Cached; the EKF update fires from
+  // push_imu so vx, ω, and δ are time-aligned at the same tick.
   void push_steering(double t, double angle_rad);
 
-  // One brake-pressure sample. Clamped to [0, 1] defensively.
-  void push_brake(double t, double brake);
-
   // ----- Internal-state access for unit tests only -----
-  // Mirrors the Python test suite which pokes at _calib for the
-  // accel_bias / gyro_bias values. Production callers should NOT
-  // touch these — they may change without notice.
   const Eigen::Vector3d & accel_bias_for_tests() const noexcept {
     return calib_.accel_bias;
   }
@@ -244,8 +268,7 @@ class OdometryFilter {
   }
 
  private:
-  // Calibration accumulators — populated during the first
-  // calibration_seconds of push_imu calls, then frozen.
+  // ----- Calibration accumulators -----
   struct Calibration {
     int n_samples{0};
     Eigen::Vector3d accel_sum{Eigen::Vector3d::Zero()};
@@ -257,22 +280,52 @@ class OdometryFilter {
     Eigen::Vector3d gyro_bias{Eigen::Vector3d::Zero()};
   };
 
+  // Predict step: integrate the process model by dt (Euler), update
+  // covariance via F·P·Fᵀ + Q·dt. Uses the latest bias-corrected
+  // IMU input. Run on each post-calibration push_imu() tick.
+  void predict_step(
+    double dt,
+    const Eigen::Vector3d & accel,
+    const Eigen::Vector3d & gyro);
+
+  // Measurement update: z is the bias-corrected vx from RPM.
+  void correct_rpm(double z_vx);
+
+  // Measurement update: z is the kinematic-bicycle yaw-rate
+  // prediction from the latest steering angle. Gated: rejects when
+  // |z − ω| > slip_yaw_residual_threshold and raises slip_flag.
+  // Always updates diagnostics (yaw_residual + slip_flag).
+  void correct_steering();
+
+  // Non-holonomic-constraint pseudo-measurement: z = 0, h = vy. Gated
+  // by slip_flag (the caller skips when slipping). This is the only
+  // direct observation of vy — without it, bias-noise integration
+  // drives vy unbounded over seconds (see correct_nhc impl comment).
+  void correct_nhc();
+
+  // Stationary-calibration accumulator.
   void accumulate_calibration(
     double t,
     const Eigen::Vector3d & accel,
     const Eigen::Vector3d & gyro);
 
-  Params params_;
+  // Mirror the OdometryState slice of x_ into state_. Called after
+  // every predict/correct step.
+  void publish_state_view();
+
+  EkfParams params_;
   OdometryState state_;
-  Calibration calib_;
   FilterDiagnostics diag_;
+  Calibration calib_;
+
+  // Full EKF state vector + covariance.
+  Eigen::Matrix<double, kStateDim, 1> x_{Eigen::Matrix<double, kStateDim, 1>::Zero()};
+  Eigen::Matrix<double, kStateDim, kStateDim> P_{
+    Eigen::Matrix<double, kStateDim, kStateDim>::Zero()};
 
   std::optional<double> t_imu_last_{};
-  std::optional<double> t_rpm_last_{};
-  std::optional<double> latest_rpm_vx_{};
-
   double latest_steering_rad_{0.0};
-  double latest_brake_{0.0};
+  bool have_steering_{false};
 };
 
 }  // namespace odometry_filter

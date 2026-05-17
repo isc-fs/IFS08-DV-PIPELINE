@@ -1,6 +1,6 @@
 // Copyright 2026 IFSSIM contributors.
 //
-// odometry_filter_node — rclcpp wrapper around odometry_filter::OdometryFilter.
+// odometry_filter_node — rclcpp wrapper around odometry_filter's 9-state EKF.
 //
 // Subscribes:
 //   /imu                (sensor_msgs/Imu, BEST_EFFORT, deep queue —
@@ -8,30 +8,24 @@
 //                        when the publish timer is mid-tick).
 //   /motor_rpm          (std_msgs/Float32, BEST_EFFORT, depth 10 — ~80 Hz)
 //   /steering_angle     (std_msgs/Float32, BEST_EFFORT, depth 10 — ~100 Hz)
-//   /brake_pressure     (std_msgs/Float32, BEST_EFFORT, depth 10 — ~100 Hz)
 //
 // Publishes:
-//   /odom               (nav_msgs/Odometry @ 100 Hz, lifecycle pub)
+//   /odom                          (nav_msgs/Odometry @ 100 Hz, lifecycle pub)
 //   /odom_diag/yaw_residual_rad_s  (std_msgs/Float32 @ 100 Hz)
-//   /odom_diag/slip_flag           (std_msgs/Bool @ 100 Hz)
-//   /odom_diag/effective_alpha_vx  (std_msgs/Float32 @ 100 Hz)
+//   /odom_diag/slip_flag           (std_msgs/Bool    @ 100 Hz)
 //
 // Broadcasts:
 //   odom → base_link TF @ 100 Hz (alongside the Odometry message —
 //   identical pose; the TF copy is for tf2 consumers).
 //
-// Lifecycle layout — mirrors sim_supervisor_node.py's filter section:
-//   on_configure:  create pubs (lifecycle) + TF broadcaster, instantiate filter.
-//   on_activate:   reset filter, subscribe, start 100 Hz publish timer.
-//                  pubs flip to "emitting" state via super().on_activate().
-//   on_deactivate: drop subs + timer.
-//   on_cleanup:    drop pubs, TF broadcaster, filter.
-//
-// Coexistence with sim_supervisor: until Phase 3 strips the Python
-// filter, sim_supervisor still publishes /odom too. They publish to
-// the SAME topic — last-writer-wins is fine for testing, just be
-// aware. Phase 3 adds a `use_external_odometry_filter` param to
-// sim_supervisor and flips this node on by default.
+// Lifecycle layout (BaseLifecycleNode pattern from PR #518):
+//   on_configure_impl: create pubs (lifecycle) + TF broadcaster,
+//                      construct filter from ROS params.
+//   on_activate:       reset filter, subscribe, start 100 Hz publish
+//                      timer; super().on_activate() flips lifecycle
+//                      pubs to "emitting".
+//   on_deactivate:     drop subs + timer.
+//   on_cleanup_impl:   drop pubs, TF broadcaster, filter.
 
 #include <chrono>
 #include <cmath>
@@ -58,13 +52,36 @@ using CallbackReturn = LifecycleNodeInterface::CallbackReturn;
 
 namespace odometry_filter_node {
 
+namespace {
+// Sentinel for nav_msgs/Odometry covariance entries we don't estimate
+// (z, roll, pitch, vz, ωx, ωy). Following the REP-103 convention,
+// a large value signals "this DoF is not observed."
+constexpr double kCovUnknown = 1.0e6;
+}  // namespace
+
 class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
  public:
   explicit OdometryFilterNode(const rclcpp::NodeOptions & options)
   : node_base_cpp::BaseLifecycleNode("odometry_filter_node", options) {
+    // Topology / publish-loop knobs.
     declare_parameter<double>("publish_hz", 100.0);
     declare_parameter<std::string>("odom_frame", "odom");
     declare_parameter<std::string>("base_frame", "base_link");
+
+    // EKF tuning knobs, exposed via ~/ekf.* for YAML overrides.
+    declare_parameter<double>("ekf.wheelbase_m",        odometry_filter::kWheelbaseM);
+    declare_parameter<double>("ekf.rpm_to_ms",          odometry_filter::kRpmToMs);
+    declare_parameter<double>("ekf.calibration_seconds",odometry_filter::kCalibrationSeconds);
+    declare_parameter<double>("ekf.sigma_ax",           0.05);
+    declare_parameter<double>("ekf.sigma_ay",           0.05);
+    declare_parameter<double>("ekf.sigma_gz",           0.01);
+    declare_parameter<double>("ekf.sigma_ba_walk",      1.0e-4);
+    declare_parameter<double>("ekf.sigma_bg_walk",      1.0e-5);
+    declare_parameter<double>("ekf.sigma_rpm",          0.02);
+    declare_parameter<double>("ekf.sigma_steer",        0.30);
+    declare_parameter<double>("ekf.sigma_vy_nhc",       0.10);
+    declare_parameter<double>("ekf.slip_yaw_residual_threshold",
+                              odometry_filter::kSlipYawResidualThreshold);
   }
 
   // ------------------------------------------------------------------
@@ -72,7 +89,7 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
   // ------------------------------------------------------------------
   CallbackReturn on_configure_impl(const rclcpp_lifecycle::State &) override {
     RCLCPP_INFO(get_logger(),
-      "on_configure: lifecycle pubs + TF broadcaster + filter");
+      "on_configure: lifecycle pubs + TF broadcaster + EKF (Coriolis-correct)");
 
     publish_hz_ = get_parameter("publish_hz").as_double();
     odom_frame_ = get_parameter("odom_frame").as_string();
@@ -83,12 +100,25 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
       "/odom_diag/yaw_residual_rad_s", 10);
     slip_flag_pub_ = create_publisher<std_msgs::msg::Bool>(
       "/odom_diag/slip_flag", 10);
-    effective_alpha_pub_ = create_publisher<std_msgs::msg::Float32>(
-      "/odom_diag/effective_alpha_vx", 10);
 
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
 
-    filter_ = std::make_unique<odometry_filter::OdometryFilter>();
+    odometry_filter::EkfParams p;
+    p.wheelbase_m              = get_parameter("ekf.wheelbase_m").as_double();
+    p.rpm_to_ms                = get_parameter("ekf.rpm_to_ms").as_double();
+    p.calibration_seconds      = get_parameter("ekf.calibration_seconds").as_double();
+    p.sigma_ax                 = get_parameter("ekf.sigma_ax").as_double();
+    p.sigma_ay                 = get_parameter("ekf.sigma_ay").as_double();
+    p.sigma_gz                 = get_parameter("ekf.sigma_gz").as_double();
+    p.sigma_ba_walk            = get_parameter("ekf.sigma_ba_walk").as_double();
+    p.sigma_bg_walk            = get_parameter("ekf.sigma_bg_walk").as_double();
+    p.sigma_rpm                = get_parameter("ekf.sigma_rpm").as_double();
+    p.sigma_steer              = get_parameter("ekf.sigma_steer").as_double();
+    p.sigma_vy_nhc             = get_parameter("ekf.sigma_vy_nhc").as_double();
+    p.slip_yaw_residual_threshold =
+      get_parameter("ekf.slip_yaw_residual_threshold").as_double();
+
+    filter_ = std::make_unique<odometry_filter::OdometryFilter>(p);
     first_publish_logged_ = false;
 
     return CallbackReturn::SUCCESS;
@@ -99,13 +129,13 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
       "on_activate: subs + %.0f Hz publish timer", publish_hz_);
 
     // Reset the filter so a deactivate→activate cycle starts a fresh
-    // stationary calibration — matches sim_supervisor_node behavior.
+    // stationary calibration window.
     filter_->reset();
     first_publish_logged_ = false;
 
     // IMU — BEST_EFFORT, deep queue (2000). The bridge publishes at
     // ~400 Hz; we want to absorb backlog whenever the publish timer
-    // happens to be mid-tick. Matches sim_supervisor_node's QoS.
+    // happens to be mid-tick.
     auto imu_qos = rclcpp::QoS(rclcpp::KeepLast(2000))
                      .best_effort()
                      .durability_volatile();
@@ -122,9 +152,6 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
     sub_steering_ = create_subscription<std_msgs::msg::Float32>(
       "/steering_angle", rpm_qos,
       std::bind(&OdometryFilterNode::on_steering, this, std::placeholders::_1));
-    sub_brake_ = create_subscription<std_msgs::msg::Float32>(
-      "/brake_pressure", rpm_qos,
-      std::bind(&OdometryFilterNode::on_brake, this, std::placeholders::_1));
 
     const auto period = std::chrono::duration<double>(1.0 / publish_hz_);
     publish_timer_ = create_wall_timer(
@@ -140,7 +167,6 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
     sub_imu_.reset();
     sub_rpm_.reset();
     sub_steering_.reset();
-    sub_brake_.reset();
     return BaseLifecycleNode::on_deactivate(state);
   }
 
@@ -150,11 +176,9 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
     sub_imu_.reset();
     sub_rpm_.reset();
     sub_steering_.reset();
-    sub_brake_.reset();
     odom_pub_.reset();
     yaw_residual_pub_.reset();
     slip_flag_pub_.reset();
-    effective_alpha_pub_.reset();
     tf_broadcaster_.reset();
     filter_.reset();
     return CallbackReturn::SUCCESS;
@@ -181,20 +205,12 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
 
   void on_rpm(const std_msgs::msg::Float32::SharedPtr msg) {
     if (!filter_) {return;}
-    // Wall-clock timestamp — the bridge publishes Float32 with no
-    // header.stamp on /motor_rpm. Used for staleness inside the filter.
-    const double t = now().seconds();
-    filter_->push_rpm(t, static_cast<double>(msg->data));
+    filter_->push_rpm(now().seconds(), static_cast<double>(msg->data));
   }
 
   void on_steering(const std_msgs::msg::Float32::SharedPtr msg) {
     if (!filter_) {return;}
     filter_->push_steering(now().seconds(), static_cast<double>(msg->data));
-  }
-
-  void on_brake(const std_msgs::msg::Float32::SharedPtr msg) {
-    if (!filter_) {return;}
-    filter_->push_brake(now().seconds(), static_cast<double>(msg->data));
   }
 
   // ------------------------------------------------------------------
@@ -208,12 +224,11 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
 
     if (!first_publish_logged_) {
       RCLCPP_INFO(get_logger(),
-        "/odom first publish — IMU+RPM filter calibrated");
+        "/odom first publish — EKF calibrated");
       first_publish_logged_ = true;
     }
 
-    // 2D yaw → unit quaternion (axis-z) used by both the Odometry
-    // message and the TF broadcast.
+    // 2D yaw → unit quaternion (axis-z).
     const double half = 0.5 * s.yaw;
     const double qw = std::cos(half);
     const double qz = std::sin(half);
@@ -233,6 +248,41 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
     odom.twist.twist.linear.y = s.vy;
     odom.twist.twist.linear.z = 0.0;
     odom.twist.twist.angular.z = s.yaw_rate;
+
+    // Populate covariance from the EKF P matrix. nav_msgs/Odometry
+    // wants 6×6 row-major for (x,y,z,roll,pitch,yaw) on pose and
+    // (vx,vy,vz,ωx,ωy,ωz) on twist. We estimate the planar slice
+    // (x,y,yaw / vx,vy,ω); z/roll/pitch/vz/ωx/ωy get kCovUnknown.
+    const auto P = filter_->covariance();
+    // Pose: x, y, z, roll, pitch, yaw.
+    odom.pose.covariance.fill(0.0);
+    odom.pose.covariance[6 * 0 + 0] = P(odometry_filter::X, odometry_filter::X);
+    odom.pose.covariance[6 * 0 + 1] = P(odometry_filter::X, odometry_filter::Y);
+    odom.pose.covariance[6 * 0 + 5] = P(odometry_filter::X, odometry_filter::THETA);
+    odom.pose.covariance[6 * 1 + 0] = P(odometry_filter::Y, odometry_filter::X);
+    odom.pose.covariance[6 * 1 + 1] = P(odometry_filter::Y, odometry_filter::Y);
+    odom.pose.covariance[6 * 1 + 5] = P(odometry_filter::Y, odometry_filter::THETA);
+    odom.pose.covariance[6 * 2 + 2] = kCovUnknown;  // z
+    odom.pose.covariance[6 * 3 + 3] = kCovUnknown;  // roll
+    odom.pose.covariance[6 * 4 + 4] = kCovUnknown;  // pitch
+    odom.pose.covariance[6 * 5 + 0] = P(odometry_filter::THETA, odometry_filter::X);
+    odom.pose.covariance[6 * 5 + 1] = P(odometry_filter::THETA, odometry_filter::Y);
+    odom.pose.covariance[6 * 5 + 5] = P(odometry_filter::THETA, odometry_filter::THETA);
+    // Twist: vx, vy, vz, ωx, ωy, ωz.
+    odom.twist.covariance.fill(0.0);
+    odom.twist.covariance[6 * 0 + 0] = P(odometry_filter::VX, odometry_filter::VX);
+    odom.twist.covariance[6 * 0 + 1] = P(odometry_filter::VX, odometry_filter::VY);
+    odom.twist.covariance[6 * 0 + 5] = P(odometry_filter::VX, odometry_filter::OMEGA);
+    odom.twist.covariance[6 * 1 + 0] = P(odometry_filter::VY, odometry_filter::VX);
+    odom.twist.covariance[6 * 1 + 1] = P(odometry_filter::VY, odometry_filter::VY);
+    odom.twist.covariance[6 * 1 + 5] = P(odometry_filter::VY, odometry_filter::OMEGA);
+    odom.twist.covariance[6 * 2 + 2] = kCovUnknown;  // vz
+    odom.twist.covariance[6 * 3 + 3] = kCovUnknown;  // ωx
+    odom.twist.covariance[6 * 4 + 4] = kCovUnknown;  // ωy
+    odom.twist.covariance[6 * 5 + 0] = P(odometry_filter::OMEGA, odometry_filter::VX);
+    odom.twist.covariance[6 * 5 + 1] = P(odometry_filter::OMEGA, odometry_filter::VY);
+    odom.twist.covariance[6 * 5 + 5] = P(odometry_filter::OMEGA, odometry_filter::OMEGA);
+
     odom_pub_->publish(odom);
 
     geometry_msgs::msg::TransformStamped tf_msg;
@@ -257,10 +307,6 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
     std_msgs::msg::Bool slip;
     slip.data = diag.slip_flag;
     slip_flag_pub_->publish(slip);
-
-    std_msgs::msg::Float32 alpha;
-    alpha.data = static_cast<float>(diag.effective_alpha_vx);
-    effective_alpha_pub_->publish(alpha);
   }
 
   // ------------------------------------------------------------------
@@ -271,14 +317,12 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Float32>::SharedPtr yaw_residual_pub_;
   rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Bool>::SharedPtr slip_flag_pub_;
-  rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Float32>::SharedPtr effective_alpha_pub_;
 
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_rpm_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_steering_;
-  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_brake_;
 
   rclcpp::TimerBase::SharedPtr publish_timer_;
 
