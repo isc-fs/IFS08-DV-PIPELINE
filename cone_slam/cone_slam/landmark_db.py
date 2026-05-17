@@ -32,13 +32,59 @@ class Landmark:
 
     id: int                                # gtsam landmark key index
     position: np.ndarray = field(           # (3,) world-frame x, y, z. Updated
-        default_factory=lambda: np.zeros(3))  # by iSAM2 every scan.
+        default_factory=lambda: np.zeros(3))  # by iSAM2 every scan (cone_graph)
+                                              # OR by σ-weighted mean (phase1).
     n_observations: int = 0                # how many factors point at it
     last_seen_step: int = -1               # graph step index of last association
 
+    # ----- fields used by phase1_mapper (option-D rewrite, #496) -----
+    # sigma_xy is the standard-error of the position estimate in the
+    # XY plane. Drops as 1/sqrt(n) with each new observation under the
+    # σ-weighted running-mean update. Pre-rewrite this column was
+    # unused (iSAM2 carried its own covariance internally); we expose
+    # it explicitly here so Phase 2's frozen-map handoff can keep the
+    # measurement uncertainty without dragging GTSAM along.
+    sigma_xy: float = 0.30                 # default σ until first update
+    # Color tag carried through from cone_detection's classification.
+    # The lap detector reads this to find the big-orange gate; SLAM
+    # itself doesn't use it for DA.
+    is_big_orange: bool = False
+
     def update_estimate(self, position: np.ndarray) -> None:
-        """Refresh the working position estimate from iSAM2."""
+        """Refresh the working position estimate from iSAM2.
+
+        Used by cone_graph_slam (current implementation). Phase 1 of
+        the rewrite uses `update_running_mean` instead.
+        """
         self.position = position.copy()
+
+    def update_running_mean(
+        self,
+        observation_xy: np.ndarray,
+        observation_sigma: float,
+    ) -> None:
+        """σ-weighted running-mean update.
+
+        For independent observations of the same static landmark, the
+        Bayesian posterior is the inverse-variance weighted mean. After
+        N observations of equal sigma σ_obs, the estimated sigma drops
+        as σ_obs / sqrt(N). We track each landmark's running sigma
+        explicitly so the Phase 2 frozen-map handoff knows the
+        per-landmark confidence without re-fitting.
+
+        Updates only the XY components (Z stays at the initial value;
+        FSD cones are effectively 2D landmarks on the ground plane).
+        """
+        x_curr = self.position[:2]
+        s_curr = max(self.sigma_xy, 1e-3)
+        s_obs  = max(float(observation_sigma), 1e-3)
+        # Inverse-variance weights, in standard form.
+        w_curr = 1.0 / (s_curr * s_curr)
+        w_obs  = 1.0 / (s_obs * s_obs)
+        x_new  = (x_curr * w_curr + np.asarray(observation_xy, dtype=float)
+                  * w_obs) / (w_curr + w_obs)
+        self.position[:2] = x_new
+        self.sigma_xy = 1.0 / math.sqrt(w_curr + w_obs)
 
 
 class LandmarkDb:
@@ -50,13 +96,27 @@ class LandmarkDb:
 
     # ----- create ------------------------------------------------------------
 
-    def create(self, initial_position: np.ndarray, step: int) -> Landmark:
-        """Allocate a new landmark with a fresh ID."""
+    def create(
+        self,
+        initial_position: np.ndarray,
+        step: int,
+        *,
+        sigma_xy: float = 0.30,
+        is_big_orange: bool = False,
+    ) -> Landmark:
+        """Allocate a new landmark with a fresh ID.
+
+        `sigma_xy` and `is_big_orange` are keyword-only (post-rewrite
+        additions) so legacy call sites that pass only the positional
+        args (cone_graph_slam_node.py) keep working unchanged.
+        """
         lm = Landmark(
             id=self._next_id,
             position=np.asarray(initial_position, dtype=float).copy(),
             n_observations=1,
             last_seen_step=step,
+            sigma_xy=sigma_xy,
+            is_big_orange=is_big_orange,
         )
         self._landmarks[lm.id] = lm
         self._next_id += 1
