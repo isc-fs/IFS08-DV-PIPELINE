@@ -20,17 +20,12 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            # Phase 1 of the two-phase SLAM rewrite (#496). Node name
-            # is "slam_node" to match AUTONOMY_LIFECYCLE_NODES in
-            # mode_manager. Subscribes /odom + /Conos_raw + /Conos_Orange
-            # + /testing_only/odom (active state only); publishes
-            # /slam/pose, /Conos, /slam/finished, GT-aligned diagnostics;
-            # broadcasts map → odom TF.
-            "slam_node = cone_slam.slam_node:main",
-            # Legacy cone-graph SLAM kept as a second entry point so the
-            # replay regression suite + side-by-side comparison tool can
-            # still spin it up for baselines.
-            "slam_node_legacy = cone_slam.cone_graph_slam_node:main",
+            # Lifecycle SLAM node. ROS node name is "slam_node" to match
+            # the AUTONOMY_LIFECYCLE_NODES list in mode_manager. Subscribes
+            # /imu + /Conos_raw + /motor_rpm + /testing_only/odom (active
+            # state only); publishes /tf (odom → base_link),
+            # /cone_slam/state, /Conos, GT-aligned diagnostics.
+            "slam_node = cone_slam.cone_graph_slam_node:main",
         ],
     },
 )
