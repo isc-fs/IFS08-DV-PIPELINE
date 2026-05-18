@@ -258,6 +258,18 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # active either way.
         self.declare_parameter("cascade_spike_new_count_threshold", 3)
 
+        # Minimum re-observation count before a landmark is published
+        # on /Conos for downstream consumers. Single-shot detections
+        # are noisy (one-frame perception artifacts, phantom DA spawns
+        # from /odom yaw drift) and pollute the cone map the planner
+        # sees. Counting how many factors point at a landmark before
+        # exposing it filters those out without affecting the SLAM
+        # solve itself (the landmark stays in the factor graph, just
+        # not on /Conos). 3 is the smallest count that survives
+        # genuine perception noise (cone seen → missed → seen again);
+        # 0 disables the gate (legacy behaviour).
+        self.declare_parameter("min_observations_for_publish", 3)
+
         # I/O references — populated in on_configure / on_activate.
         self.map_frame: str = ""
         self.odom_frame: str = ""
@@ -1236,13 +1248,23 @@ class ConeGraphSlamNode(BaseLifecycleNode):
     def _publish_cone_map(self, stamp) -> None:
         """Publish the persistent cone landmark database to /Conos.
 
+        Filters out single-shot / under-observed landmarks. A cone
+        whose factor count is < `min_observations_for_publish` is
+        kept in the SLAM solve (still in self._db, still a factor in
+        the graph) but withheld from /Conos so the planner never
+        navigates around phantoms. Cf. autocross_track_20260404_
+        013721_20260517_232000: /Conos grew 13 → 130 over 68 s; a
+        real autocross has ~60–100 cones, so ~30–40 of those are
+        single-shot ghosts from imperfect DA accumulating against
+        /odom yaw drift.
+
         marker.id encodes the persistent SLAM landmark id so downstream
         consumers (path_planning) can track cone identity across scans.
-        Color is mapped to RGB so RViz/Foxglove renders correctly
-        without extra config.
         """
         if len(self._db) == 0:
             return
+
+        min_obs = int(self.get_parameter("min_observations_for_publish").value)
 
         out = MarkerArray()
         # First marker is DELETEALL so visualizers refresh cleanly.
@@ -1262,7 +1284,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # per-cone marker.id still encodes the persistent landmark id
         # so downstream consumers (path_planning) can identify cones
         # across scans.
+        n_published = 0
+        n_filtered = 0
         for lm in self._db:
+            if lm.n_observations < min_obs:
+                n_filtered += 1
+                continue
             m = Marker()
             m.header.stamp = stamp
             m.header.frame_id = self.map_frame
@@ -1281,8 +1308,21 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             m.color.b = 0.0
             m.color.a = 1.0
             out.markers.append(m)
+            n_published += 1
 
         self._cones_pub.publish(out)
+
+        # Periodic diagnostic — every ~5 s of /Conos publishes,
+        # surface the filter stats so the operator can confirm the
+        # gate is doing what it should (filtering some, keeping most).
+        if not hasattr(self, "_conos_log_counter"):
+            self._conos_log_counter = 0
+        self._conos_log_counter += 1
+        if self._conos_log_counter % 50 == 0:
+            self.get_logger().info(
+                f"CONOS_FILTER published={n_published} "
+                f"filtered={n_filtered} (min_obs={min_obs})"
+            )
 
 
 def main(args=None):
