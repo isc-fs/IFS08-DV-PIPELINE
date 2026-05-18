@@ -230,6 +230,53 @@ class FactorGraph:
         self._new_factors.add(gtsam.PriorFactorVector(
             V(self._k), v_world, noise))
 
+    def stage_odom_between(
+        self,
+        between_pose: gtsam.Pose3,
+        sigma_yaw_rad: float = 0.03,
+        sigma_xy_m: float = 0.10,
+        sigma_rp_rad: float = 0.05,
+        sigma_z_m: float = 0.05,
+    ) -> None:
+        """Stage a BetweenFactor on X(k-1) → X(k) sourced from /odom's
+        delta-pose over the scan window.
+
+        /odom is the 9-state EKF's output. It already fuses IMU + RPM +
+        steering with Coriolis-correct prediction, low-vx-gated steering
+        correction, and online gyro-bias tracking. Each /odom message
+        is a higher-quality pose estimate than what cone_graph_slam can
+        compute internally from IMU + RPM alone (its only fallback when
+        cone factors are skipped during cascade).
+
+        Wiring /odom as a BetweenFactor turns the EKF into a soft
+        constraint on SLAM's pose-to-pose motion. The advantage shows
+        up exactly when SLAM needs it most: during cascade-skip windows
+        in a curve, IMU-only predict produces 10 m / 94° pose jumps
+        (bag autocross_track_20260404_013721_20260518_095215); /odom's
+        per-scan drift is ~3 cm and ~0.1° over the same window.
+
+        Default sigmas reflect the post-#534/#539 EKF's measured per-
+        scan residuals to GT (yaw ~3.7° per 10 s = 0.4° per scan; xy
+        ~5-10 cm per scan). σ_yaw=0.03 rad (~1.7°) is loose enough to
+        not over-constrain SLAM relative to cone observations, tight
+        enough to anchor when cones go away.
+
+        The between_pose is in SE(3) and expresses the pose change
+        from X(k-1) to X(k) in X(k-1)'s body frame — exactly what
+        `prev_odom_pose.inverse().compose(current_odom_pose)` produces.
+        """
+        sigmas = np.array([
+            sigma_rp_rad,   # roll
+            sigma_rp_rad,   # pitch
+            sigma_yaw_rad,  # yaw — THE constraint
+            sigma_xy_m,     # tx
+            sigma_xy_m,     # ty
+            sigma_z_m,      # tz
+        ])
+        noise = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
+        self._new_factors.add(gtsam.BetweenFactorPose3(
+            X(self._k - 1), X(self._k), between_pose, noise))
+
     def stage_new_landmark(
         self,
         landmark_id: int,

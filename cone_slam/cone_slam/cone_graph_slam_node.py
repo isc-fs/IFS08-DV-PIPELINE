@@ -295,6 +295,10 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # scan tick.
         self._sub_supervisor_odom = None
         self._latest_supervisor_odom: Optional[Odometry] = None
+        # /odom pose at the previous SCAN tick (not the previous /odom
+        # message). Used to compute the EKF's per-scan delta-pose and
+        # stage it as a BetweenFactor on X(k-1)→X(k). Reset on activate.
+        self._prev_scan_odom_pose: Optional[gtsam.Pose3] = None
 
         # Publisher / broadcaster handles (created in on_configure)
         self._tf_broadcaster = None
@@ -334,6 +338,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._latest_rpm_t = None
         self._latest_gt = None
         self._gt_init_pose = None
+        self._latest_supervisor_odom = None
+        self._prev_scan_odom_pose = None
 
         # Optional per-landmark creation diagnostic. When DV_SLAM_LANDMARK_CAPTURE
         # is set to a writable path, every new landmark dumps one JSON line
@@ -429,6 +435,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._latest_rpm_t = None
         self._latest_gt = None
         self._gt_init_pose = None
+        self._latest_supervisor_odom = None
+        self._prev_scan_odom_pose = None
         self._obs_diag = {}
         self._obs_n_scans = 0
         self._obs_last_log_ns = 0
@@ -558,6 +566,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # is now dynamic, computed from slam_pose ⊖ /odom).
         self._tf_broadcaster = None
         self._latest_supervisor_odom = None
+        self._prev_scan_odom_pose = None
 
         # Components
         self._preint = None
@@ -726,6 +735,24 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                     v_body_long=self._latest_rpm,
                     predicted_yaw=_pred_yaw,
                 )
+
+        # Stage the /odom-derived BetweenFactor (the "trust the EKF"
+        # channel into the graph). /odom is the post-#534/#539 EKF's
+        # fused IMU + RPM + steering estimate with Coriolis correction.
+        # During cone-poor windows (the cascade-spike root cause), this
+        # factor anchors X(k) to a quality estimate that's drift-tracked
+        # by all available sensors — much better than SLAM's IMU-only
+        # internal fallback which produced 10 m / 94° pose jumps during
+        # cornering on bag _095215. First scan after activate has no
+        # previous cached /odom pose; we just record this one and skip
+        # the factor — the IMU+RPM priors carry the load that scan.
+        if self._latest_supervisor_odom is not None:
+            cur_odom_pose = _odom_to_pose3(self._latest_supervisor_odom)
+            if self._prev_scan_odom_pose is not None:
+                between_pose = (self._prev_scan_odom_pose.inverse()
+                                .compose(cur_odom_pose))
+                self._graph.stage_odom_between(between_pose)
+            self._prev_scan_odom_pose = cur_odom_pose
 
         # Parse cone observations from /Conos_raw markers.
         observations = self._observations_from_markers(msg)
