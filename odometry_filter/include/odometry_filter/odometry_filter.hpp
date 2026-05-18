@@ -196,7 +196,22 @@ struct EkfParams {
   double sigma_ay = 0.05;       // accel-y density
   double sigma_gz = 0.01;       // gyro-z  density [rad/s / √Hz]
   double sigma_ba_walk = 1.0e-4;  // accel bias random-walk
-  double sigma_bg_walk = 1.0e-5;  // gyro bias random-walk
+  // Gyro-bias random-walk density. Was 1e-5 (frozen-bias semantics:
+  // expects bg_z to drift < 0.004° over a 60 s run, which is the
+  // BMI088 datasheet stability), but in practice real bias drift
+  // from vibration / temperature is bigger mid-run. With the tight
+  // 1e-5 value, slip_flag gates the steering correction during
+  // cornering and bg_z gets no measurement update for seconds at a
+  // time → drift accumulates into θ as phantom yaw.
+  //
+  // 1e-4 lets the EKF allocate P[BG_Z] over those windows so the
+  // next steering correction (post-corner straight) can pull bg_z
+  // back to truth, but stays tight enough that bg_z doesn't track
+  // gyro noise during cornering and overcorrect on the next
+  // straight. (Tried 1e-3 first — killed the +44° first-turn jump
+  // on bag _235642 but introduced -100° overcorrection mid-run on
+  // bag _001700. 1e-4 splits the difference.)
+  double sigma_bg_walk = 1.0e-4;  // gyro bias random-walk
 
   // Measurement noise std-devs.
   // sigma_rpm is set tight (≈ 2 cm/s) so RPM dominates over the IMU

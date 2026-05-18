@@ -76,7 +76,7 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
     declare_parameter<double>("ekf.sigma_ay",           0.05);
     declare_parameter<double>("ekf.sigma_gz",           0.01);
     declare_parameter<double>("ekf.sigma_ba_walk",      1.0e-4);
-    declare_parameter<double>("ekf.sigma_bg_walk",      1.0e-5);
+    declare_parameter<double>("ekf.sigma_bg_walk",      1.0e-4);
     declare_parameter<double>("ekf.sigma_rpm",          0.02);
     declare_parameter<double>("ekf.sigma_steer",        0.30);
     declare_parameter<double>("ekf.sigma_vy_nhc",       0.10);
