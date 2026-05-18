@@ -322,6 +322,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._time = _time
         self._latest_rpm: Optional[float] = None
         self._latest_rpm_t: Optional[float] = None
+        self._latest_steering_rad: Optional[float] = None
+        self._latest_steering_t: Optional[float] = None
         self._latest_gt: Optional[Odometry] = None
         self._gt_init_pose: Optional[gtsam.Pose3] = None
 
@@ -378,6 +380,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._calib_started_t = None
         self._latest_rpm = None
         self._latest_rpm_t = None
+        self._latest_steering_rad = None
+        self._latest_steering_t = None
         self._latest_gt = None
         self._gt_init_pose = None
         self._latest_supervisor_odom = None
@@ -475,6 +479,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._db = LandmarkDb()
         self._latest_rpm = None
         self._latest_rpm_t = None
+        self._latest_steering_rad = None
+        self._latest_steering_t = None
         self._latest_gt = None
         self._gt_init_pose = None
         self._latest_supervisor_odom = None
@@ -519,6 +525,14 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         )
         self._sub_rpm = self.create_subscription(
             Float32, "/motor_rpm", self._on_rpm, rpm_qos)
+
+        # /steering_angle — bridge publishes the LWS-derived front-wheel
+        # angle in radians. Same caching pattern as RPM: latest sample
+        # consumed inside the scan callback. Drives the kinematic-bicycle
+        # BetweenFactor (ω = (vx/L)·tan(δ)) which constrains yaw rate
+        # during cone-poor windows, including cascade-spike skips.
+        self._sub_steering = self.create_subscription(
+            Float32, "/steering_angle", self._on_steering, rpm_qos)
 
         # /testing_only/odom — sim ground truth, used only for the
         # GT-aligned diagnostic. The bridge encodes this in ENU
@@ -649,6 +663,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._latest_rpm = float(msg.data) * RPM_TO_MS
         self._latest_rpm_t = self._time.monotonic()
 
+    def _on_steering(self, msg: Float32) -> None:
+        # Same caching pattern as RPM. Drives the steering-kinematic
+        # BetweenFactor inside _on_cones.
+        self._latest_steering_rad = float(msg.data)
+        self._latest_steering_t = self._time.monotonic()
+
     def _on_gt_odom(self, msg: Odometry) -> None:
         # Cache the latest /testing_only/odom sample. Used only to
         # publish the SLAM-vs-GT residual on /cone_slam/gt_aligned —
@@ -766,18 +786,60 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # (the cascade root cause). Skipped if RPM is stale or hasn't
         # arrived yet — the prior would be misleading rather than
         # helpful in that regime.
-        if self._latest_rpm is not None and self._latest_rpm_t is not None:
-            age = self._time.monotonic() - self._latest_rpm_t
-            if age <= RPM_STALE_S:
-                # Use the same predicted yaw we'll use for DA below.
-                _nav_state = gtsam.NavState(
-                    self._latest_result.pose, self._latest_result.velocity)
-                _pred_yaw = pim.predict(
-                    _nav_state, self._latest_result.bias).pose().rotation().yaw()
-                self._graph.stage_velocity_prior(
+        rpm_fresh = (self._latest_rpm is not None
+                     and self._latest_rpm_t is not None
+                     and (self._time.monotonic() - self._latest_rpm_t)
+                     <= RPM_STALE_S)
+        if rpm_fresh:
+            # Use the same predicted yaw we'll use for DA below.
+            _nav_state = gtsam.NavState(
+                self._latest_result.pose, self._latest_result.velocity)
+            _pred_state = pim.predict(_nav_state, self._latest_result.bias)
+            _pred_yaw = _pred_state.pose().rotation().yaw()
+            self._graph.stage_velocity_prior(
+                v_body_long=self._latest_rpm,
+                predicted_yaw=_pred_yaw,
+            )
+
+            # Stage the kinematic-bicycle yaw-rate BetweenFactor.
+            # This is the steering-sensor channel into the graph
+            # (PR C / fix for bag _095215's 94° pose jump during
+            # cascade): even when cone factors are skipped, this
+            # factor anchors yaw rate to the physical steering wheel
+            # via ω = (vx/L)·tan(δ). Slip-gated inside the staging
+            # method — if the IMU's measured Δyaw disagrees with the
+            # steering prediction by > slip_threshold, the chassis is
+            # sliding and the factor is dropped to avoid corruption.
+            steering_fresh = (
+                self._latest_steering_rad is not None
+                and self._latest_steering_t is not None
+                and (self._time.monotonic() - self._latest_steering_t)
+                <= RPM_STALE_S
+            )
+            if steering_fresh:
+                _prev_yaw = self._latest_result.pose.rotation().yaw()
+                _imu_dyaw = (_pred_yaw - _prev_yaw + np.pi) % (2 * np.pi) - np.pi
+                _gate_state = self._graph.stage_steering_between(
+                    dt=_dt,
                     v_body_long=self._latest_rpm,
-                    predicted_yaw=_pred_yaw,
+                    steering_rad=self._latest_steering_rad,
+                    prev_pose=self._latest_result.pose,
+                    imu_predicted_dyaw_rad=_imu_dyaw,
                 )
+                # Periodic diagnostic — emit a sample every ~5 s so
+                # the operator can confirm the factor is being staged
+                # (not silently slipping itself into "always slip").
+                if not hasattr(self, "_steering_factor_log_counter"):
+                    self._steering_factor_log_counter = 0
+                self._steering_factor_log_counter += 1
+                if self._steering_factor_log_counter % 50 == 0:
+                    self.get_logger().info(
+                        f"STEERING_FACTOR state={_gate_state} "
+                        f"vx={self._latest_rpm:+.2f} "
+                        f"delta={self._latest_steering_rad:+.3f}rad "
+                        f"imu_dyaw={_imu_dyaw*180/np.pi:+.2f}deg "
+                        f"dt={_dt:.3f}s"
+                    )
 
         # Stage the /odom-derived BetweenFactor (the "trust the EKF"
         # channel into the graph). /odom is the post-#534/#539 EKF's

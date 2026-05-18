@@ -277,6 +277,87 @@ class FactorGraph:
         self._new_factors.add(gtsam.BetweenFactorPose3(
             X(self._k - 1), X(self._k), between_pose, noise))
 
+    def stage_steering_between(
+        self,
+        dt: float,
+        v_body_long: float,
+        steering_rad: float,
+        prev_pose: gtsam.Pose3,
+        imu_predicted_dyaw_rad: float,
+        wheelbase_m: float = 1.570,
+        slip_threshold_rad_s: float = 0.30,
+        sigma_yaw_rad: float = 0.05,
+        sigma_xy_m: float = 1.0,
+    ) -> str:
+        """Stage a kinematic-bicycle BetweenFactor between X(k-1) and X(k).
+
+        This is the steering-sensor channel into the factor graph. The
+        kinematic-bicycle model says ω = (v_x / L) · tan(δ). Integrated
+        over the scan window dt, this predicts an expected relative pose
+        change with the chassis turning at that rate while moving v_x
+        body-x. A BetweenFactor encodes that expectation and constrains
+        the optimizer to follow steering+RPM during cone-poor windows
+        (the exact moment the gyro-only IMU predict was producing 10 m /
+        94° pose jumps in bag autocross_track_20260404_013721_20260518_095215).
+
+        The factor is slip-gated: if the IMU's measured Δyaw over dt
+        disagrees with the steering prediction by more than
+        slip_threshold_rad_s, the chassis is sliding (the kinematic-
+        bicycle model breaks down) and the factor is NOT staged. Caller
+        gets back the gate decision in the return string for logging.
+
+        Returned strings:
+          "staged"     — factor added.
+          "stopped"    — vehicle essentially stationary (|v| < 0.1).
+          "slip"       — slip-gate fired; factor skipped.
+
+        Sigmas are deliberately loose on translation (~1 m) so this
+        factor only meaningfully constrains *yaw rate*. Translation
+        comes from RPM + IMU; over-tightening here would conflict.
+        Yaw σ 0.05 rad ≈ 2.9° per scan window — about 2× the kinematic
+        bicycle's measured residual on FS-DV at speed.
+        """
+        if abs(v_body_long) < 0.1:
+            return "stopped"
+
+        # NOTE on sign: we tried negating omega_pred in commit 7037294
+        # (bag _104623 showed 80 % slip rate during cornering with same-
+        # magnitude opposite-sign mismatch between δ and IMU dyaw). It
+        # DID get the factor staging on more samples, but bag _105724
+        # showed the car turning the wrong direction at a curve — the
+        # "opposite sign" was misdiagnosed. What's actually happening:
+        # the kinematic-bicycle model OVER-PREDICTS yaw rate at FS-DV
+        # speeds during transients (slip equilibrium not built up), and
+        # the IMU's gyro reads small because gyro-bias drift suppresses
+        # the rotation. The slip-gate firing on cornering samples is
+        # CORRECT behaviour — the prediction is genuinely untrustworthy
+        # in that regime. Negating it just doubled the magnitude error
+        # and started corrupting yaw in the wrong direction.
+        omega_pred = (v_body_long / wheelbase_m) * np.tan(steering_rad)
+        omega_imu  = imu_predicted_dyaw_rad / dt if dt > 1e-6 else 0.0
+        if abs(omega_pred - omega_imu) > slip_threshold_rad_s:
+            return "slip"
+
+        dyaw_pred = omega_pred * dt
+        # BetweenFactor's relative transform is in prev_pose's body
+        # frame: forward motion = (v·dt, 0, 0), rotation = R_z(dyaw).
+        between = gtsam.Pose3(
+            gtsam.Rot3.Rz(dyaw_pred),
+            np.array([v_body_long * dt, 0.0, 0.0]),
+        )
+        sigmas = np.array([
+            0.1,           # roll  rad (unused — flat ground)
+            0.1,           # pitch rad (unused)
+            sigma_yaw_rad, # yaw   rad ← THE constraint we care about
+            sigma_xy_m,    # tx m — loose; IMU+RPM handle this
+            sigma_xy_m,    # ty m
+            0.1,           # tz m (flat ground)
+        ])
+        noise = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
+        self._new_factors.add(gtsam.BetweenFactorPose3(
+            X(self._k - 1), X(self._k), between, noise))
+        return "staged"
+
     def stage_new_landmark(
         self,
         landmark_id: int,
