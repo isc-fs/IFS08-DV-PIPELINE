@@ -100,33 +100,23 @@ void OdometryFilter::push_imu(
 
   // Non-holonomic constraint: rolling cars don't slide sideways. This
   // is a pseudo-measurement (z = 0, h = vy) applied every IMU tick.
-  // It's the only thing in the filter that observes vy directly:
-  //   * The Coriolis-correct predict cancels centripetal accel during
-  //     cornering (v̇y = ay − ω·vx ≈ 0 in steady-state turns), but it
-  //     does not OBSERVE vy. Any small residual ay from bias error or
-  //     sensor noise integrates into vy with nothing pulling it back.
-  //     Live-sim regression: a stationary car with calibrated biases
-  //     drifted to vy ≈ +0.96 m/s within ~10 s of activation, which
-  //     fed PurePursuit a false "the car is sliding" signal and sent
-  //     it off-track before the first turn.
-  //   * Gated on slip_flag (raised by correct_steering when the
-  //     kinematic-bicycle prediction disagrees with the gyro). Real
-  //     lateral motion (tire sideslip during hard cornering) violates
-  //     vy = 0; disabling NHC there lets the EKF carry the true
-  //     non-zero vy.
-  //   * sigma_vy_nhc is loose enough (0.10 m/s) that the EKF doesn't
-  //     fight legitimate body-y dynamics within rolling tolerance, but
-  //     tight enough to pull bias-noise integration back to zero on
-  //     ~1 s timescales.
-  // Prior memory note ("NHC failed 3 times — fix Coriolis instead")
-  // applied to NHC layered on top of the broken complementary predict,
-  // where NHC was masking the Coriolis-missing symptom and fighting
-  // real centripetal accel. With the predict now Coriolis-correct, NHC
-  // and predict don't conflict — NHC just bounds the unobservable-vy
-  // drift.
-  if (!diag_.slip_flag) {
-    correct_nhc();
-  }
+  // It's the only thing in the filter that observes vy directly.
+  //
+  // 2026-05-24 (fix/nhc-loose-during-slip): NHC fires every tick now,
+  // with the sigma adapted to slip state. Previously NHC was GATED
+  // OFF when slip_flag fired — which was "correct" in the sense that
+  // real tire slip means vy ≠ 0 — but bag analysis (#447 step C
+  // equivalent) on _20260524_123201 showed slip_flag fires for
+  // ~half of an autocross lap. During those windows vy ran to
+  // ±1 m/s and integrated into 56 m of /odom XY drift mid-lap. SLAM
+  // tracks /odom via the #545 BetweenFactor and inherited that
+  // drift → cone-DA cascade in the late corner.
+  //
+  // Slip-aware NHC (sigma_vy_nhc_slip = 0.5 m/s during slip vs the
+  // tight 0.10 m/s otherwise) keeps the constraint informative
+  // throughout the lap without forcing vy=0 during legitimate
+  // sideslip. correct_nhc() reads diag_.slip_flag to pick the sigma.
+  correct_nhc();
 
   publish_state_view();
 }
@@ -238,12 +228,44 @@ void OdometryFilter::correct_rpm(double z_vx) {
   const double y       = z_vx - x_(VX);              // innovation
   const double R_rpm   = params_.sigma_rpm * params_.sigma_rpm;
   const double S       = (H * P_ * H.transpose())(0, 0) + R_rpm;  // 1×1
-  const Eigen::Matrix<double, kStateDim, 1> K = P_ * H.transpose() / S;
+  Eigen::Matrix<double, kStateDim, 1> K = P_ * H.transpose() / S;
+
+  // Schmidt-Kalman partition: this observation reveals VX (and via
+  // accel-integration mismatch, BA_X/BA_Y). It reveals NOTHING about
+  // pose (X, Y, THETA), yaw rate (OMEGA), or gyro bias (BG_Z).
+  // Cross-correlations through P would otherwise pull all of them
+  // every tick. On bag _210206 the leakage through P[THETA, *]
+  // produced a +59° integrated yaw error mid-lap, even though gyro
+  // and yaw-rate matched truth — translated to 25-30 m of /odom
+  // position drift via vx·sin(θ_err) integration. Same bug class
+  // as the BG_Z leak; same fix recipe (zero the gain, keep Joseph
+  // form for symmetry).
+  K(X)     = 0.0;
+  K(Y)     = 0.0;
+  K(THETA) = 0.0;
+  K(OMEGA) = 0.0;
+  K(BG_Z)  = 0.0;
+  // Keep K[BA_X], K[BA_Y], K[VY] — RPM-vs-state-vx residual
+  // legitimately informs accel bias (integration mismatch) and
+  // through Coriolis P[VY, VX] couplings (rotational vx error
+  // manifests in vy too).
 
   x_ += K * y;
   x_(THETA) = wrap_pi(x_(THETA));
 
-  P_ = (Eigen::Matrix<double, kStateDim, kStateDim>::Identity() - K * H) * P_;
+  // Joseph-form covariance update — mandatory whenever K is
+  // artificially modified away from the optimal Kalman gain.
+  // Standard form P = (I-K·H)·P assumes K = P·Hᵀ/S exactly; with
+  // hand-zeroed K components the matrix becomes asymmetric and
+  // over many ticks can drift non-PSD, corrupting downstream
+  // consumers via the /odom covariance fields. Joseph form
+  //   P = (I-K·H)·P·(I-K·H)ᵀ + K·R·Kᵀ
+  // is symmetric + PSD for ANY K. Previous attempt (#550, closed)
+  // used standard form and broke path_planning via NaN-poisoned
+  // TF covariance — see #550 postmortem.
+  const Eigen::Matrix<double, kStateDim, kStateDim> IKH =
+      Eigen::Matrix<double, kStateDim, kStateDim>::Identity() - K * H;
+  P_ = IKH * P_ * IKH.transpose() + R_rpm * (K * K.transpose());
 }
 
 
@@ -254,15 +276,39 @@ void OdometryFilter::correct_nhc() {
   Eigen::Matrix<double, 1, kStateDim> H = Eigen::Matrix<double, 1, kStateDim>::Zero();
   H(0, VY) = 1.0;
 
+  // Slip-aware sigma: tighter when the kinematic-bicycle model is
+  // consistent with the gyro (the car is rolling normally), looser
+  // when slip_flag is on (real lateral motion is plausible up to
+  // ~0.5 m/s 1-σ). See call site in push_imu for the rationale.
+  const double sigma_vy = diag_.slip_flag
+      ? params_.sigma_vy_nhc_slip
+      : params_.sigma_vy_nhc;
+
   const double y       = 0.0 - x_(VY);                              // innovation
-  const double R_nhc   = params_.sigma_vy_nhc * params_.sigma_vy_nhc;
+  const double R_nhc   = sigma_vy * sigma_vy;
   const double S       = (H * P_ * H.transpose())(0, 0) + R_nhc;
-  const Eigen::Matrix<double, kStateDim, 1> K = P_ * H.transpose() / S;
+  Eigen::Matrix<double, kStateDim, 1> K = P_ * H.transpose() / S;
+
+  // Schmidt-Kalman partition: NHC observes VY only (and via accel
+  // integration mismatch, BA_Y). Pose (X, Y, THETA), yaw rate
+  // (OMEGA), forward velocity (VX), and gyro bias (BG_Z) are
+  // unobserved by this constraint. See correct_rpm for the full
+  // reasoning.
+  K(X)     = 0.0;
+  K(Y)     = 0.0;
+  K(THETA) = 0.0;
+  K(OMEGA) = 0.0;
+  K(VX)    = 0.0;
+  K(BG_Z)  = 0.0;
+  // K[VY], K[BA_X], K[BA_Y] preserved.
 
   x_ += K * y;
   x_(THETA) = wrap_pi(x_(THETA));
 
-  P_ = (Eigen::Matrix<double, kStateDim, kStateDim>::Identity() - K * H) * P_;
+  // Joseph-form covariance update (see correct_rpm).
+  const Eigen::Matrix<double, kStateDim, kStateDim> IKH =
+      Eigen::Matrix<double, kStateDim, kStateDim>::Identity() - K * H;
+  P_ = IKH * P_ * IKH.transpose() + R_nhc * (K * K.transpose());
 }
 
 
@@ -314,12 +360,30 @@ void OdometryFilter::correct_steering() {
   const double y       = omega_pred - x_(OMEGA);
   const double R_steer = params_.sigma_steer * params_.sigma_steer;
   const double S       = (H * P_ * H.transpose())(0, 0) + R_steer;
-  const Eigen::Matrix<double, kStateDim, 1> K = P_ * H.transpose() / S;
+  Eigen::Matrix<double, kStateDim, 1> K = P_ * H.transpose() / S;
+
+  // Schmidt-Kalman partition: kinematic-bicycle observation observes
+  // OMEGA only. Everything else (pose, velocities, biases) is
+  // unobserved by this measurement. The residual reflects model
+  // error (transient slip, suspension dynamics) — not state error in
+  // X/Y/THETA/VX/VY/biases. See correct_rpm for full reasoning.
+  K(X)     = 0.0;
+  K(Y)     = 0.0;
+  K(THETA) = 0.0;
+  K(VX)    = 0.0;
+  K(VY)    = 0.0;
+  K(BA_X)  = 0.0;
+  K(BA_Y)  = 0.0;
+  K(BG_Z)  = 0.0;
+  // K[OMEGA] preserved — this IS the observed state.
 
   x_ += K * y;
   x_(THETA) = wrap_pi(x_(THETA));
 
-  P_ = (Eigen::Matrix<double, kStateDim, kStateDim>::Identity() - K * H) * P_;
+  // Joseph-form covariance update (see correct_rpm).
+  const Eigen::Matrix<double, kStateDim, kStateDim> IKH =
+      Eigen::Matrix<double, kStateDim, kStateDim>::Identity() - K * H;
+  P_ = IKH * P_ * IKH.transpose() + R_steer * (K * K.transpose());
 }
 
 

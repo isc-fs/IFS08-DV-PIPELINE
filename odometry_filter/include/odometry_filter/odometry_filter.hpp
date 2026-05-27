@@ -222,12 +222,30 @@ struct EkfParams {
   // (v̇y = ay − ω·vx) leaves residual that integrates into vy drift.
   double sigma_rpm = 0.02;      // [m/s]
   double sigma_steer = 0.30;    // [rad/s] — deliberately loose; gated under slip
-  // sigma_vy_nhc — non-holonomic-constraint pseudo-measurement. 0.10
-  // m/s lets the rolling-tire assumption pull vy → 0 on ~1 s
-  // timescales while tolerating small real lateral motion within
-  // sideslip tolerance. The constraint is gated off when slip_flag is
-  // raised (see correct_steering).
-  double sigma_vy_nhc = 0.10;   // [m/s]
+  // sigma_vy_nhc — non-holonomic-constraint pseudo-measurement. The
+  // tight default (0.10 m/s) lets the rolling-tire assumption pull
+  // vy → 0 on ~1 s timescales while tolerating small real lateral
+  // motion within sideslip tolerance.
+  //
+  // Previously: NHC was gated OFF entirely when slip_flag fired. The
+  // gate is "correct" in the sense that real tire slip means vy ≠ 0,
+  // but bag analysis (#447) shows slip_flag fires for ~half of every
+  // autocross lap, and during those windows vy runs unbounded to
+  // ±1 m/s → integrates into 56 m of /odom XY drift mid-lap → SLAM
+  // cone-DA cascades because the /odom prior is far from truth.
+  //
+  // New behaviour (2026-05-24, fix/nhc-loose-during-slip): NHC fires
+  // every IMU tick. Its sigma adapts to slip state:
+  //   * !slip_flag  →  sigma_vy_nhc          (the tight 0.10 m/s)
+  //   * slip_flag   →  sigma_vy_nhc_slip     (loose, default 0.5 m/s)
+  // Loose enough to tolerate real sideslip up to ~0.5 m/s 1-σ without
+  // fighting the measurement, but still tight enough to bound the
+  // integration-error mode that produced the 56 m drift. If the car
+  // genuinely sideslips harder than that (heavy autocross), this will
+  // bias vy toward 0 — accept that trade because the alternative
+  // (slip_flag = T → no vy observation) is what kills the lap.
+  double sigma_vy_nhc      = 0.10;   // [m/s] — applied when !slip_flag
+  double sigma_vy_nhc_slip = 0.50;   // [m/s] — applied when slip_flag
 
   // Steering gating
   double slip_yaw_residual_threshold = kSlipYawResidualThreshold;
