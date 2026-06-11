@@ -1,0 +1,13 @@
+std_msgs/Header header
+float64 fl_rpm
+float64 fr_rpm
+float64 rl_rpm
+float64 rr_rpm
+float64 fl_rotation_angle
+float64 fr_rotation_angle
+float64 rl_rotation_angle
+float64 rr_rotation_angle
+float64 fl_steering_angle
+float64 fr_steering_angle
+float64 rl_steering_angle
+float64 rr_steering_angle

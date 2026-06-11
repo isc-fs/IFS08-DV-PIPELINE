@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>mode_manager</name>
+  <version>0.0.1</version>
+  <description>
+    mode_manager_node — fans out lifecycle change_state calls to the
+    autonomy nodes (perception, slam, path_planning, control) and
+    passes them the mission-specific strategy flag so each node knows
+    which inner behaviour to run (trackdrive / autocross / accel /
+    skidpad).
+
+    Exposes one service: `activate_mode` (custom srv) — request
+    carries the mission name; reply tells mission_control_node whether
+    every autonomy node reached `active`.
+
+    See docs/autonomy_pipeline.md §"Roles inside mission management".
+  </description>
+  <maintainer email="raul@isc-fs.com">Raul Moran</maintainer>
+  <license>GPL-3.0-or-later</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>lifecycle_msgs</depend>
+  <depend>dv_msgs</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
