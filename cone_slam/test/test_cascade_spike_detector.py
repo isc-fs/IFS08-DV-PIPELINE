@@ -39,12 +39,31 @@ def test_step_boundary_floor_is_inclusive() -> None:
 
 # ----- Percentage gate (legacy) -----
 
-def test_pct_gate_fires_at_high_new_ratio() -> None:
-    """8 of 13 = 62 %, above the 60 % gate; should trigger."""
+def test_pct_gate_fires_at_high_new_ratio_low_assoc() -> None:
+    """11 of 12 = 92 %, above the 60 % gate, and assoc=1 (< default
+    pct_max_assoc=2); should trigger."""
     triggered, reasons = cascade_spike_triggered(
-        n_new=8, total=13, step=100)
+        n_new=11, total=12, step=100)
     assert triggered is True
     assert any("pct" in r for r in reasons)
+
+
+def test_pct_gate_silent_when_assoc_anchors_pose() -> None:
+    """Bag _211619 cascade case (2026-05-25): obs=10 new=7 assoc=3.
+    70 % > 60 % so the pct ratio fires, but 3 cones are still
+    anchoring pose — pose-side cascade is not credible. With
+    pct_max_assoc=2 (default), the pct gate now stays silent here."""
+    triggered, _ = cascade_spike_triggered(
+        n_new=7, total=10, step=100)
+    assert triggered is False
+
+
+def test_pct_gate_legacy_assoc_agnostic_via_pct_max_assoc() -> None:
+    """Setting pct_max_assoc to a very large value restores the
+    pre-2026-05-25 assoc-agnostic behaviour."""
+    triggered, _ = cascade_spike_triggered(
+        n_new=7, total=10, step=100, pct_max_assoc=99)
+    assert triggered is True
 
 
 def test_pct_gate_silent_below_min_obs() -> None:
@@ -93,10 +112,10 @@ def test_count_gate_at_threshold_boundary() -> None:
 
 def test_count_gate_disabled_when_threshold_zero() -> None:
     """Setting count_threshold=0 disables the count gate completely."""
-    # 10/14 = 71 %, so percentage gate still fires — we test that
-    # count_threshold=0 doesn't add extra reasons.
+    # 11/12 = 92 %, assoc=1 < pct_max_assoc=2 → percentage gate fires.
+    # Verify count_threshold=0 doesn't add extra reasons.
     _, reasons = cascade_spike_triggered(
-        n_new=10, total=14, step=100, count_threshold=0)
+        n_new=11, total=12, step=100, count_threshold=0)
     assert any("pct" in r for r in reasons)
     assert all("n_new" not in r for r in reasons)
 
@@ -115,12 +134,12 @@ def test_both_gates_can_fire_at_once() -> None:
     assert any("n_new" in r for r in reasons)
 
 
-def test_percentage_gate_still_fires_with_some_associations() -> None:
-    """The percentage gate intentionally does NOT require assoc==0
-    — a 9-of-12 (75 %) burst with 3 associations is still cascade-
-    like and should be caught by the legacy pct gate."""
+def test_pct_gate_with_marginal_anchoring_assoc_1() -> None:
+    """With pct_max_assoc=2 (default), assoc=1 is still
+    insufficient to anchor 2D pose from bearing-range factors → pct
+    gate fires. 11 of 12 = 92 % new, 1 assoc."""
     triggered, reasons = cascade_spike_triggered(
-        n_new=9, total=12, step=100)
+        n_new=11, total=12, step=100)
     assert triggered is True
     assert any("pct" in r for r in reasons)
     assert not any("n_new" in r for r in reasons), (
