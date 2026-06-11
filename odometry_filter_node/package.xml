@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>odometry_filter_node</name>
+  <version>0.2.0</version>
+  <description>
+    Lifecycle-managed ROS 2 node that drives the OdometryFilter EKF
+    (provided by the odometry_filter package). Subscribes to /imu,
+    /motor_rpm, /steering_angle; publishes /odom (with covariance) +
+    /odom_diag/{yaw_residual_rad_s, slip_flag}; broadcasts
+    odom→base_link TF at 100 Hz. Inherits node_base_cpp's
+    BaseLifecycleNode for the standard ~/setup plumbing.
+
+    Driven by mode_manager via the two-phase SetMission protocol —
+    the same managed bring-up the rest of the autonomy pipeline uses.
+  </description>
+  <maintainer email="moranguerra18@gmail.com">Raúl Morán</maintainer>
+  <license>GPL-3.0-or-later</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>eigen3_cmake_module</buildtool_depend>
+
+  <depend>odometry_filter</depend>
+  <depend>node_base_cpp</depend>
+  <depend>dv_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>eigen</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

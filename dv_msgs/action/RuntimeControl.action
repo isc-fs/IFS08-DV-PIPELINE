@@ -1,0 +1,43 @@
+# RuntimeControl — Phase 2 of the runtime action protocol.
+#
+# Sent: backend / CLI → mission_control_node (after SetMission + EBS release).
+# sim_supervisor_node passively relays feedback to /fsds/control_command.
+#
+# Opened once Phase 1 (SetMission) reports success=true. Carries the
+# control-loop traffic for the duration of the mission: control_node's
+# throttle/steering proposals flow back from mission_control_node as
+# feedback, and `emergency` / `finished` flags from slam_node terminate
+# the action with a defined outcome.
+#
+# On the real car the same action is exchanged between
+# mission_control_node and the physical uDV (microROS endpoint over
+# USB CDC). Semantics are identical; only the DDS transport differs.
+
+# ---------------- Goal ----------------
+# Empty — opening the action is the request itself. The action stays
+# open until terminated by `finished`, `emergency`, or supervisor-side
+# cancellation (e.g. operator pressed RES).
+
+---
+# ---------------- Result ----------------
+# Why the runtime phase ended. One of:
+#   "finished"   — slam_node detected mission completion (e.g. lap-min
+#                  distance + big-orange detection)
+#   "emergency"  — slam_node or another node raised emergency=true
+#   "cancelled"  — supervisor cancelled (operator RES, mission switch)
+#   "error"      — unexpected failure inside mission_control_node
+string outcome
+
+# Human-readable diagnostic; empty unless outcome=="error".
+string message
+
+---
+# ---------------- Feedback ----------------
+# Per-tick control commands as they leave control_node. The supervisor
+# publishes these onto /fsds/control_command for the bridge to forward
+# into UE5. On the real car the same fields go to the uDV directly.
+float32 throttle    # [-1.0, 1.0] — negative = regen
+float32 steering    # [-1.0, 1.0] — left positive
+bool    emergency   # true → request EBS
+bool    finished    # true → mission complete
+builtin_interfaces/Time stamp

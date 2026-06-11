@@ -1,0 +1,173 @@
+<?xml version="1.0"?>
+<!--
+  IFS-08 placeholder URDF.
+
+  Frame conventions:
+    base_link   — origin at rear-axle midpoint, ground level, ROS REP-103
+                  axes (x forward, y left, z up). Canonical vehicle frame
+                  used everywhere downstream.
+    chassis     — visual-only box; no collision, no inertial.
+    *_wheel     — cylinder primitives, radius 0.225 m, width 0.20 m.
+
+  Approximate IFS-08 dimensions (NOT canonical — re-authoring from real
+  SolidWorks is tracked as #142):
+    wheelbase     1.55 m
+    track         1.20 m  (centre-to-centre)
+    wheel radius  0.225 m
+    wheel width   0.20  m
+    chassis box   2.85 m × 1.30 m × 1.05 m
+
+  Steering: each front wheel has its own steer joint (revolute, ±0.5 rad)
+  parent → wheel rotation joint (continuous) child. Rear wheels are bare
+  continuous rotation joints.
+
+  Inertials are deliberately omitted — this URDF is for TF publishing
+  and visualisation only. Chaos physics in UE5 owns the dynamics. If you
+  add inertials later for downstream tooling that needs them, mirror
+  the values used in FormulaMesh_PhysicsAsset rather than guessing.
+-->
+<robot name="ifs_08">
+
+  <!-- Materials -->
+  <material name="chassis_blue">
+    <color rgba="0.10 0.30 0.65 1.0"/>
+  </material>
+  <material name="wheel_black">
+    <color rgba="0.05 0.05 0.05 1.0"/>
+  </material>
+  <material name="hub_grey">
+    <color rgba="0.55 0.55 0.55 1.0"/>
+  </material>
+
+  <!-- ================================================================
+       base_link: empty root, rear-axle midpoint, z=0
+       ================================================================ -->
+  <link name="base_link"/>
+
+  <!-- ================================================================
+       Chassis: visual box only
+       ================================================================ -->
+  <link name="chassis_link">
+    <visual>
+      <origin xyz="0.7 0.0 0.40" rpy="0 0 0"/>
+      <geometry>
+        <box size="2.85 1.30 1.05"/>
+      </geometry>
+      <material name="chassis_blue"/>
+    </visual>
+  </link>
+
+  <joint name="chassis_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="chassis_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ================================================================
+       Rear wheels — bare continuous rotation about y
+       ================================================================ -->
+  <link name="rear_left_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.225" length="0.20"/>
+      </geometry>
+      <material name="wheel_black"/>
+    </visual>
+  </link>
+  <joint name="rear_left_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child  link="rear_left_wheel_link"/>
+    <origin xyz="0.0 0.60 0.225" rpy="0 0 0"/>
+    <axis   xyz="0 1 0"/>
+  </joint>
+
+  <link name="rear_right_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.225" length="0.20"/>
+      </geometry>
+      <material name="wheel_black"/>
+    </visual>
+  </link>
+  <joint name="rear_right_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child  link="rear_right_wheel_link"/>
+    <origin xyz="0.0 -0.60 0.225" rpy="0 0 0"/>
+    <axis   xyz="0 1 0"/>
+  </joint>
+
+  <!-- ================================================================
+       Front-left: steer link → wheel link
+       ================================================================ -->
+  <link name="front_left_steer_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.05" length="0.10"/>
+      </geometry>
+      <material name="hub_grey"/>
+    </visual>
+  </link>
+  <joint name="front_left_steer_joint" type="revolute">
+    <parent link="base_link"/>
+    <child  link="front_left_steer_link"/>
+    <origin xyz="1.55 0.60 0.225" rpy="0 0 0"/>
+    <axis   xyz="0 0 1"/>
+    <limit  lower="-0.5" upper="0.5" effort="100" velocity="2"/>
+  </joint>
+
+  <link name="front_left_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.225" length="0.20"/>
+      </geometry>
+      <material name="wheel_black"/>
+    </visual>
+  </link>
+  <joint name="front_left_wheel_joint" type="continuous">
+    <parent link="front_left_steer_link"/>
+    <child  link="front_left_wheel_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis   xyz="0 1 0"/>
+  </joint>
+
+  <!-- ================================================================
+       Front-right: steer link → wheel link
+       ================================================================ -->
+  <link name="front_right_steer_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.05" length="0.10"/>
+      </geometry>
+      <material name="hub_grey"/>
+    </visual>
+  </link>
+  <joint name="front_right_steer_joint" type="revolute">
+    <parent link="base_link"/>
+    <child  link="front_right_steer_link"/>
+    <origin xyz="1.55 -0.60 0.225" rpy="0 0 0"/>
+    <axis   xyz="0 0 1"/>
+    <limit  lower="-0.5" upper="0.5" effort="100" velocity="2"/>
+  </joint>
+
+  <link name="front_right_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.225" length="0.20"/>
+      </geometry>
+      <material name="wheel_black"/>
+    </visual>
+  </link>
+  <joint name="front_right_wheel_joint" type="continuous">
+    <parent link="front_right_steer_link"/>
+    <child  link="front_right_wheel_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis   xyz="0 1 0"/>
+  </joint>
+
+</robot>

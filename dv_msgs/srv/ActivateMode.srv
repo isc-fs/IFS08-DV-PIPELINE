@@ -1,0 +1,26 @@
+# ActivateMode — mission_control_node → mode_manager_node.
+#
+# Two-phase bring-up (mirrors alt_pipeline prepare / activate split):
+#
+#   activate=false  →  ~/setup + configure each node (SetMission /
+#                      prepare). Nodes stay inactive; Numba JIT runs here.
+#
+#   activate=true   →  activate nodes prepared by the last prepare call
+#                      (RuntimeControl open). Mission must match prepared.
+#
+# Empty mission deactivates+cleans up every autonomy node regardless of
+# activate (tear down / mission_id=0).
+#
+# Mission values:
+#   "trackdrive" | "autocross" | "accel" | "skidpad" | "scruti"
+#
+# Response field is `ok` (not `success`).
+
+# ---------------- Request ----------------
+string mission
+bool activate
+
+---
+# ---------------- Response ----------------
+bool ok
+string message
