@@ -25,6 +25,7 @@ Default path: RANSAC ground removal + DBSCAN, then per-cluster
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Literal
 
@@ -32,7 +33,11 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 
 from cone_detection.cone_fit import (
+    _CONE_BIG_D,
+    _LINEARITY_THRESHOLD,
+    cluster_linearity,
     cone_fit_2params,
+    cone_fit_collinear,
     cone_fit_template_dispatch,
 )
 from cone_detection.ransac import ransac2
@@ -79,6 +84,16 @@ class ConeDetectionConfig:
 
     # Passed to scipy / template fits where applicable
     cone_fit_solver: str = "L-BFGS-B"
+    template_fit_maxiter: int = 12
+
+    # Near-collinear clusters: closed-form collinear fit (no scipy).
+    use_collinear_fit: bool = True
+
+    # Skip the second template L-BFGS-B when cluster height strongly
+    # indicates small vs big-orange (saves ~half of fit time).
+    template_fit_early_exit: bool = True
+    template_early_exit_height_small_m: float = 0.40
+    template_early_exit_height_big_m: float = 0.50
 
     fit_backend: ConeFitBackend = "template_dispatch"
 
@@ -94,7 +109,11 @@ def _cluster_cone_mse(a: float, b: float, c: float, d: float, xyz: np.ndarray) -
 
 
 def _fit_cluster(
-    clean_cone: np.ndarray, cfg: ConeDetectionConfig
+    clean_cone: np.ndarray,
+    cfg: ConeDetectionConfig,
+    *,
+    cluster_height_m: float,
+    ground_z: float,
 ) -> tuple[float, float, float, float, float, float, bool]:
     """Return ``(a, b, c, d, res_min, res_other, is_big)`` like template dispatch."""
     if cfg.fit_backend == "two_param":
@@ -104,10 +123,37 @@ def _fit_cluster(
         is_big = bool(d > cfg.big_orange_d_threshold_m)
         return float(a), float(b), float(c), float(d), res_min, res_other, is_big
 
+    if cfg.use_collinear_fit and cluster_linearity(clean_cone) < _LINEARITY_THRESHOLD:
+        a, b, c, d_class = cone_fit_collinear(
+            clean_cone, lidar_xy=(0.0, 0.0), ground_z=ground_z
+        )
+        if np.isfinite(c):
+            res_min = _cluster_cone_mse(a, b, c, d_class, clean_cone)
+            is_big = bool(d_class >= _CONE_BIG_D - 1e-6)
+            return (
+                float(a),
+                float(b),
+                float(c),
+                float(d_class),
+                res_min,
+                float("nan"),
+                is_big,
+            )
+
+    only_small = only_big = None
+    if cfg.template_fit_early_exit:
+        if cluster_height_m < cfg.template_early_exit_height_small_m:
+            only_small = True
+        elif cluster_height_m > cfg.template_early_exit_height_big_m:
+            only_big = True
+
     return cone_fit_template_dispatch(
         clean_cone,
         lidar_xy=(0.0, 0.0),
         solver=cfg.cone_fit_solver,
+        maxiter=cfg.template_fit_maxiter,
+        only_small=only_small,
+        only_big=only_big,
     )
 
 
@@ -116,6 +162,8 @@ def clustering_separation_rt(
     config: ConeDetectionConfig | None = None,
     *,
     clustering_class: type = DBSCAN,
+    stage_timings: dict[str, float] | None = None,
+    ransac_iter_subsample_max: int = 5000,
 ):
     """Ground removal + rotation correction + DBSCAN, single scan.
 
@@ -128,23 +176,38 @@ def clustering_separation_rt(
     """
     cfg = config or ConeDetectionConfig()
     A = np.c_[np.ones(data.shape[0]), data]
+    t_ransac = time.perf_counter()
     inliers, def_coefs = ransac2(
-        A, prob=cfg.ransac_prob, threshold=cfg.ransac_threshold
+        A,
+        prob=cfg.ransac_prob,
+        threshold=cfg.ransac_threshold,
+        iter_subsample_max=ransac_iter_subsample_max,
     )
+    if stage_timings is not None:
+        stage_timings["ransac_ms"] = (time.perf_counter() - t_ransac) * 1000.0
     k = np.zeros(data.shape[1])
     k[-1] = 1
     outliers = np.ones(data.shape[0], dtype=bool)
     outliers[inliers] = False
+    t_rotate = time.perf_counter()
     data = (
         data
         @ vectors2matrix(k, def_coefs[1:] / np.linalg.norm(def_coefs[1:]))
     )[outliers]
+    if stage_timings is not None:
+        stage_timings["rotate_ms"] = (time.perf_counter() - t_rotate) * 1000.0
+        stage_timings["n_outliers"] = float(len(data))
     if len(data) == 0:
+        if stage_timings is not None:
+            stage_timings["dbscan_ms"] = 0.0
         return np.array([]), data, def_coefs
     clust_model = clustering_class(
         eps=cfg.dbscan_eps, min_samples=cfg.dbscan_min_samples
     )
+    t_dbscan = time.perf_counter()
     labels = clust_model.fit_predict(data)
+    if stage_timings is not None:
+        stage_timings["dbscan_ms"] = (time.perf_counter() - t_dbscan) * 1000.0
     return labels, data, def_coefs
 
 
@@ -163,6 +226,8 @@ class RealtimeConeDetector:
         debug_counters: dict | None = None,
         compare_logger=None,
         clustering_class: type = DBSCAN,
+        stage_timings: dict[str, float] | None = None,
+        ransac_iter_subsample_max: int = 5000,
     ) -> list[tuple[float, float, float, float]]:
         """Detect cones in a single LiDAR scan (same contract as ``final_cone_result_rt``)."""
         cfg = self.config
@@ -171,13 +236,23 @@ class RealtimeConeDetector:
         if len(data) == 0:
             return []
         labels, clean_data, def_coefs = clustering_separation_rt(
-            data, cfg, clustering_class=clustering_class
+            data,
+            cfg,
+            clustering_class=clustering_class,
+            stage_timings=stage_timings,
+            ransac_iter_subsample_max=ransac_iter_subsample_max,
         )
         if len(labels) == 0:
             return []
+        t_cluster_prep = time.perf_counter()
         separated_data = [
             np.array(clean_data[labels == label]) for label in np.unique(labels)
         ]
+        if stage_timings is not None:
+            stage_timings["cluster_prep_ms"] = (
+                time.perf_counter() - t_cluster_prep
+            ) * 1000.0
+            stage_timings["n_clusters"] = float(len(separated_data))
         if debug_counters is not None:
             debug_counters["n_clusters"] = len(separated_data)
             debug_counters["after_min_pts"] = 0
@@ -196,6 +271,7 @@ class RealtimeConeDetector:
         n_residual_rejected = 0
         n_shape_rejected = 0
         residuals_kept: list[float] = []
+        t_fit = time.perf_counter()
 
         for cone in separated_data:
             if len(cone) < cfg.min_cluster_points:
@@ -232,7 +308,10 @@ class RealtimeConeDetector:
                 debug_counters["after_shape_gate"] += 1
 
             a_xy, b_xy, _c_chosen, d_chosen, res_min, res_other, is_big = _fit_cluster(
-                clean_cone, cfg
+                clean_cone,
+                cfg,
+                cluster_height_m=cluster_height,
+                ground_z=float(lidar_distance_to_floor),
             )
             if not (np.isfinite(res_min) and res_min <= cfg.residual_gate_mse):
                 n_residual_rejected += 1
@@ -267,6 +346,9 @@ class RealtimeConeDetector:
             if ambiguous:
                 sigma_xy *= 1.5
             cone_positions.append((float(a_xy), float(b_xy), float(d_chosen), sigma_xy))
+
+        if stage_timings is not None:
+            stage_timings["fit_ms"] = (time.perf_counter() - t_fit) * 1000.0
 
         if compare_logger is not None and (
             cone_positions or n_residual_rejected or n_shape_rejected
