@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline replay harness for cone_graph_slam (P2 of issue #282).
 
-Reads a rosbag2 capture (`/imu` + `/Conos_raw` + `/motor_rpm` +
+Reads a rosbag2 capture (`/imu` + `/Conos_raw` + `/motor_rpm` + `/odom` +
 `/testing_only/odom`) and drives `ConeGraphSlamNode` through it
 deterministically. Compares SLAM pose to GT (re-anchored to SLAM's
 calibration-end frame, the same way the live diagnostic does) and
@@ -18,7 +18,7 @@ Inside the container, while the live pipeline is running:
     docker compose exec dv_pipeline_stack bash -lc \
       'source /opt/ros/humble/setup.bash && \
        ros2 bag record -o /tmp/slam_bag \
-         /imu /Conos_raw /motor_rpm /testing_only/odom'
+         /imu /Conos_raw /motor_rpm /odom /testing_only/odom'
 
 Then drive a representative session, Ctrl-C the recorder when done.
 Copy the bag out if you want it on the host:
@@ -53,6 +53,7 @@ REQUIRED_TOPICS = {
     "/imu",
     "/Conos_raw",
     "/motor_rpm",
+    "/odom",
     "/testing_only/odom",
 }
 
@@ -196,7 +197,7 @@ def main() -> int:
                 "yaw_err_rad": yaw_err,
             })
 
-        n_imu = n_cones = n_rpm = n_gt = 0
+        n_imu = n_cones = n_rpm = n_sup_odom = n_gt = 0
 
         # Read messages in chronological order. rosbag2's
         # SequentialReader interleaves topics by recording timestamp,
@@ -214,6 +215,9 @@ def main() -> int:
                 elif topic == "/motor_rpm":
                     node._on_rpm(msg)
                     n_rpm += 1
+                elif topic == "/odom":
+                    node._on_supervisor_odom(msg)
+                    n_sup_odom += 1
                 elif topic == "/testing_only/odom":
                     node._on_gt_odom(msg)
                     n_gt += 1
@@ -238,7 +242,11 @@ def main() -> int:
         print(f"  imu:   {n_imu} samples")
         print(f"  cones: {n_cones} scans")
         print(f"  rpm:   {n_rpm} samples")
+        print(f"  /odom: {n_sup_odom} samples")
         print(f"  gt:    {n_gt} samples")
+        if n_sup_odom == 0:
+            print("  WARNING: no /odom in bag — SLAM EKF pose prior (#545) was not exercised",
+                  file=sys.stderr)
 
         if not residuals:
             print("  no residuals collected — calibration may not have "

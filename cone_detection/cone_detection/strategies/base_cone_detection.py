@@ -56,7 +56,13 @@ class BaseConeDetection(ConeDetectionStrategy):
             self._numba_warmup_done = True
             self._log.info("Numba warmup complete")
 
-    def detect_cones(self, point_cloud: np.ndarray) -> DetectionResult:
+    def detect_cones(
+        self,
+        point_cloud: np.ndarray,
+        *,
+        stage_timings: dict[str, float] | None = None,
+        ransac_iter_subsample_max: int = 5000,
+    ) -> DetectionResult:
         """Run RANSAC + DBSCAN + template-dispatch fit; no ROS types."""
         compare_logger = None
         if self.LOG_FIT_COMPARISON_EVERY_N > 0:
@@ -73,6 +79,8 @@ class BaseConeDetection(ConeDetectionStrategy):
                 point_cloud,
                 debug_counters=debug_counters,
                 compare_logger=compare_logger,
+                stage_timings=stage_timings,
+                ransac_iter_subsample_max=ransac_iter_subsample_max,
             )
             cones = [
                 ConeObservation(

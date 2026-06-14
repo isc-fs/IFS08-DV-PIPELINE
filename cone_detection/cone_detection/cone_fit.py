@@ -558,6 +558,7 @@ def cone_fit_template(
     d_fix,
     lidar_xy=(0.0, 0.0),
     solver="L-BFGS-B",
+    maxiter: int = 12,
 ):
     """Fit (a, b) only, with cone slope ``c`` and apex height ``d`` held fixed.
 
@@ -609,6 +610,7 @@ def cone_fit_template(
             method=solver,
             jac=True,
             bounds=bounds,
+            options={"maxiter": maxiter},
         )
         a = float(result.x[0])
         b = float(result.x[1])
@@ -623,6 +625,10 @@ def cone_fit_template_dispatch(
     data,
     lidar_xy=(0.0, 0.0),
     solver="L-BFGS-B",
+    maxiter: int = 12,
+    *,
+    only_small: bool | None = None,
+    only_big: bool | None = None,
 ):
     """Fit a cluster against both FSAE templates; return the lower-residual one.
 
@@ -644,11 +650,35 @@ def cone_fit_template_dispatch(
         the chosen fit's MSE (m²), ``residual_other`` is the rejected fit's
         MSE, and ``is_big`` is True iff the big-orange template won.
     """
+    if only_big:
+        a_b, b_b, c_b, d_b, res_b = cone_fit_template(
+            data,
+            _CONE_BIG_C,
+            _CONE_BIG_D,
+            lidar_xy=lidar_xy,
+            solver=solver,
+            maxiter=maxiter,
+        )
+        return a_b, b_b, c_b, d_b, res_b, float("inf"), True
+
     a_s, b_s, c_s, d_s, res_s = cone_fit_template(
-        data, _CONE_SMALL_C, _CONE_SMALL_D, lidar_xy=lidar_xy, solver=solver
+        data,
+        _CONE_SMALL_C,
+        _CONE_SMALL_D,
+        lidar_xy=lidar_xy,
+        solver=solver,
+        maxiter=maxiter,
     )
+    if only_small:
+        return a_s, b_s, c_s, d_s, res_s, float("inf"), False
+
     a_b, b_b, c_b, d_b, res_b = cone_fit_template(
-        data, _CONE_BIG_C, _CONE_BIG_D, lidar_xy=lidar_xy, solver=solver
+        data,
+        _CONE_BIG_C,
+        _CONE_BIG_D,
+        lidar_xy=lidar_xy,
+        solver=solver,
+        maxiter=maxiter,
     )
     if res_s <= res_b:
         return a_s, b_s, c_s, d_s, res_s, res_b, False

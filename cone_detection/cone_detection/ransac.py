@@ -10,7 +10,14 @@ import numba
 
 
 @numba.jit(nopython=True)
-def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=200):
+def ransac2(
+    data,
+    m=3,
+    prob=0.999,
+    threshold=None,
+    max_iter=200,
+    iter_subsample_max=5000,
+):
     """RANSAC plane fit. Returns (inlier_mask, plane coefficients).
 
     Args:
@@ -27,6 +34,10 @@ def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=200):
             variance one.
         max_iter: hard upper bound on iterations. Degenerate scans
             with no consensus fall through cleanly at this cap.
+        iter_subsample_max: cap on points used in the RANSAC iteration
+            loop (#247). Consensus scoring runs on at most this many
+            points; the final inlier mask always uses the full cloud.
+            Set to 0 or negative to disable subsampling (profiling only).
 
     Returns:
         np.where-style index of inlier points in the full input cloud,
@@ -54,12 +65,14 @@ def ransac2(data, m=3, prob=0.999, threshold=None, max_iter=200):
     # parallel and on the full cloud was sustaining 8-10 cores at 90%.
     # The final inlier set is computed against the FULL cloud in the
     # return statement so callers see identical outlier indices.
-    N_SUBSAMPLE = 5000
-    if data_size > N_SUBSAMPLE:
-        sub_idx = np.random.choice(data_size, N_SUBSAMPLE, replace=False)
+    n_sub = int(iter_subsample_max)
+    if n_sub <= 0:
+        n_sub = data_size
+    if data_size > n_sub:
+        sub_idx = np.random.choice(data_size, n_sub, replace=False)
         A_xy = np.ascontiguousarray(A_xy_full[sub_idx])
         A_z = np.ascontiguousarray(A_z_full[sub_idx])
-        iter_data_size = N_SUBSAMPLE
+        iter_data_size = n_sub
     else:
         A_xy = A_xy_full
         A_z = A_z_full
