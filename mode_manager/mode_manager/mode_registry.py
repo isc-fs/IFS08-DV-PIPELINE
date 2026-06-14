@@ -59,7 +59,22 @@ MODE_REGISTRY: Mapping[str, ModeDefinition] = MappingProxyType({
             _node("cone_detection_node", "base"),
             _node("slam_node", "autocross"),
             _node("path_planning_node", "autocross"),
-            _node("control_node", "stanley"),
+            # Switched stanley → pure_pursuit 2026-05-26 after bag
+            # _221138 analysis. Stanley's heading-error term ψ_e enters
+            # the formula in radians with NO gain, and during transient
+            # FS-DV cornering ψ_e easily reaches 30-40° on its own —
+            # saturating the actuator before the cross-track term even
+            # plays. Tuning stanley_k (cross-track gain) didn't help
+            # (the dominant term wasn't gain-tunable); enabling
+            # stanley_k_yaw_rate produced under-correction in normal
+            # cornering. Pure Pursuit has the β·R radius cap
+            # (lookahead_radius_factor=0.7) which is the canonical
+            # geometric guard against the late-corner hairpin
+            # oversteer pattern. Trackdrive + accel already use PP for
+            # this reason. Skidpad keeps Stanley because its constant-
+            # curvature figure-8 is where Stanley's nearest-projection
+            # geometry shines (no chase-target tuning).
+            _node("control_node", "pure_pursuit"),
         ),
     ),
     "accel": ModeDefinition(

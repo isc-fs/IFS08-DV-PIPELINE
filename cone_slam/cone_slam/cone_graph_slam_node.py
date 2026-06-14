@@ -244,6 +244,34 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # Set to 0 to disable the veto.
         self.declare_parameter("new_landmark_proximity_veto_m", 1.5)
 
+        # Per-scan cap on how many new landmarks may be committed.
+        # Bag _083231 (2026-05-26) showed cascade-skip-recovery
+        # dumping 7-10 new landmarks per recovery cycle, with the map
+        # ballooning from 138 → 210 cones in a 5 s window. Each
+        # dumped "new" cone in the late-corner geometry is most
+        # likely a duplicate of an already-mapped cone (pose drifted
+        # past the 1.0 m DA gate, so cones don't associate, but
+        # proximity-veto only catches the ones within 1.5 m — the
+        # others slip through and corrupt the persistent map). Once
+        # corrupted, future DA matches against ghosts, pose drifts
+        # more, more ghosts spawn — runaway.
+        #
+        # Capping new landmarks per scan rate-limits the damage
+        # regardless of why DA failed. Normal exploration adds 0-1
+        # cones per scan; bursts at the start of a new region add
+        # 3-5; cascade-recovery dumps add 7-10. A cap of 3 lets
+        # normal exploration through unchanged, lets genuine
+        # post-cascade exploration build up gradually over multiple
+        # scans (rate-limited), and prevents any single scan from
+        # injecting more ghosts than the proximity-veto can defend
+        # against in subsequent ticks.
+        #
+        # Excess new candidates are dropped (not buffered). If they
+        # were real new cones, future scans will re-observe and
+        # admit them (one of them per scan, sequentially). If they
+        # were ghosts, they're rejected for good.
+        self.declare_parameter("max_new_landmarks_per_scan", 3)
+
         # Count-based DA-spike threshold (issue #447, post-Phase-2 finding).
         # The original spike detector compared n_new_pre against
         # 60 % of total observations — but a 5-of-14 burst (36 %)
@@ -1014,9 +1042,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # guard — see parameter docstring).
         veto_m = float(self.get_parameter(
             "new_landmark_proximity_veto_m").value)
+        max_new = int(self.get_parameter(
+            "max_new_landmarks_per_scan").value)
         n_new = 0
         n_assoc = 0
         n_vetoed = 0
+        n_rate_capped = 0
         for o, m in zip(observations, matches):
             if m.landmark_id == -1:
                 world_xyz = self._body_to_world(
@@ -1026,6 +1057,16 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                     if d_near < veto_m:
                         n_vetoed += 1
                         continue
+                # Per-scan rate cap on new-landmark commits. Drops
+                # any extra new candidates once max_new has been
+                # spawned this scan — defends against cascade-skip-
+                # recovery dumps that would otherwise inject ghost
+                # duplicates of already-mapped cones (see param
+                # docstring). Set max_new_landmarks_per_scan = 0 to
+                # disable.
+                if max_new > 0 and n_new >= max_new:
+                    n_rate_capped += 1
+                    continue
                 lm = self._db.create(world_xyz, self._graph.step)
                 self._graph.stage_new_landmark(lm.id, world_xyz)
                 self._graph.stage_cone_observation(
@@ -1061,12 +1102,19 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         per_scan["new"] = n_new
         per_scan["assoc"] = n_assoc
         per_scan["vetoed"] = n_vetoed
+        per_scan["rate_capped"] = n_rate_capped
         if n_vetoed > 0:
             self.get_logger().info(
                 f"proximity-veto: dropped {n_vetoed} would-be-new "
                 f"landmark(s) within {veto_m:.2f} m of existing ones "
                 f"(cascade guard; obs={len(observations)} "
                 f"new={n_new} assoc={n_assoc})")
+        if n_rate_capped > 0:
+            self.get_logger().info(
+                f"rate-cap: dropped {n_rate_capped} would-be-new "
+                f"landmark(s) above max_new_landmarks_per_scan={max_new} "
+                f"(cascade dump guard; obs={len(observations)} "
+                f"new={n_new} assoc={n_assoc} vetoed={n_vetoed})")
 
         self._accumulate_obs_diag(per_scan)
 
@@ -1165,6 +1213,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             f"assoc={_avg('assoc'):4.1f} "
             f"new={_avg('new'):3.1f} "
             f"vetoed={_avg('vetoed'):.1f} "
+            f"rate_capped={_avg('rate_capped'):.1f} "
             f"skip={_avg('skipped'):.1f}"
         )
         self._obs_diag = {}
