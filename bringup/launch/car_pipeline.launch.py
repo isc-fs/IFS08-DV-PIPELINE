@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
 
 from bringup.launch_common import (
     autonomy_actions,
@@ -26,7 +27,11 @@ from bringup.launch_common import (
 
 
 def generate_launch_description() -> LaunchDescription:
-    actions: list = []
+    actions: list = [
+        # Real car: real sensors carry real stamps and there is no /clock.
+        # Nodes must run on the wall clock, so use_sim_time defaults false.
+        DeclareLaunchArgument("use_sim_time", default_value="false"),
+    ]
     # Real-car management layout: no sim_supervisor.
     actions += management_actions(include_sim_supervisor=False)
     actions += autonomy_actions()

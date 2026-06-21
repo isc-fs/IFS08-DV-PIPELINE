@@ -86,6 +86,14 @@ constexpr double kRpmToMs = 0.00821;
 // startup delay (it's already inside SetMission's "configuring" stage).
 constexpr double kCalibrationSeconds = 3.0;
 
+// Wheel speed (m/s) below which the car counts as stationary for bias
+// calibration. The window's "mean gyro = bias" assumption only holds at a
+// true standstill: if the car is already turning during the window (bag
+// recorder opens late / mid-motion launch), that real rotation gets soaked
+// into the gyro bias and drifts heading until SLAM loses lock. Gate bias
+// accumulation on rpm ≈ 0 instead of trusting a fixed time window.
+constexpr double kStationarySpeedMs = 0.1;
+
 // Wheelbase used in the kinematic-bicycle yaw cross-check:
 //     ω_pred = (v_x / wheelbase) · tan(δ)
 // 1.570 m is the authoritative IFS-08 spec — confirmed in
@@ -189,6 +197,10 @@ struct EkfParams {
 
   // Calibration window length [s]
   double calibration_seconds = kCalibrationSeconds;
+
+  // Wheel speed (m/s) below which the car counts as stationary for bias
+  // calibration. See kStationarySpeedMs.
+  double stationary_speed_ms = kStationarySpeedMs;
 
   // Process noise std-devs (continuous-time densities; Q is built
   // as diag(σ²) · dt at each predict step).
@@ -385,6 +397,12 @@ class OdometryFilter {
   std::optional<double> t_imu_last_{};
   double latest_steering_rad_{0.0};
   bool have_steering_{false};
+
+  // Latest wheel speed [m/s] and whether any RPM sample has arrived.
+  // Tracked even before calibration completes so accumulate_calibration
+  // can gate the bias estimate on a genuine standstill (rpm ≈ 0).
+  double latest_rpm_ms_{0.0};
+  bool have_rpm_{false};
 };
 
 }  // namespace odometry_filter

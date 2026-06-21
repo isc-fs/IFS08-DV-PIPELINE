@@ -174,6 +174,18 @@ RPM_TO_MS = 0.00821
 # rather than constraining the optimizer with last-good-but-stale data.
 RPM_STALE_S = 0.5
 
+# Wheel speed (m/s, already scaled by RPM_TO_MS) below which the car counts
+# as stationary for INIT bias calibration. A non-stationary calibration window
+# soaks real rotation into the gyro bias and drifts SLAM's heading.
+STATIONARY_SPEED_MS = 0.1
+
+
+def _env_truthy(name: str) -> bool:
+    """Read a boolean toggle from the environment (1/true/yes/on)."""
+    import os
+
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
 
 class State(Enum):
     INIT_WAITING_IMU = 1
@@ -215,6 +227,26 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("base_frame", "base_link")
+
+        # Motion model between LiDAR scans (issue: "use the EKF instead
+        # of IMU preintegration").
+        #   "odom" (default) — EKF-as-motion-model. The 9-state EKF's
+        #          /odom per-scan delta-pose is the PRIMARY pose-to-pose
+        #          constraint (stage_odom_motion_step). No IMU
+        #          preintegration factor, no separate RPM velocity prior
+        #          or steering BetweenFactor — the EKF already fused IMU
+        #          + RPM + steering, so re-adding them double-counts. The
+        #          EKF prediction also drives data association and the
+        #          pose-jump sanity check. Cone BearingRange factors keep
+        #          doing what only the graph can: correcting accumulated
+        #          drift via landmark consistency.
+        #   "imu"  — legacy path. ImuFactor motion model + RPM velocity
+        #          prior + steering BetweenFactor + a soft /odom backstop,
+        #          pim.predict() for DA. Kept for A/B benchmarking and
+        #          rollback. Defaults can flip back here without code
+        #          changes.
+        # An invalid value falls back to "odom" with a warning.
+        self.declare_parameter("motion_model", "odom")
         # Pose-jump sanity check thresholds (#273 follow-up).
         # Maximum allowed deviation between iSAM2's optimized pose and
         # the IMU-predicted pose at each scan. When a wrong cone match
@@ -295,10 +327,40 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # on transient ~0.2-0.3 s DA bursts.
         self.declare_parameter("cascade_skip_recovery_threshold", 5)
 
+        # --- GT-cone debug mode (sim only) -----------------------------
+        # When `debug_gt_cones` is true, SLAM ignores the *perceived*
+        # cone positions on /Conos_raw and instead synthesizes body-frame
+        # cone observations from the latched sim ground-truth track
+        # (/testing_only/track) projected through the GT pose
+        # (/testing_only/odom). The real /Conos_raw message is still used
+        # as the scan trigger and timestamp, so IMU preintegration, the
+        # /odom BetweenFactor cadence and everything else are byte-for-byte
+        # identical to a normal run — ONLY the cone xy positions change
+        # from "what perception saw" to "perfect". This is the isolation
+        # test for "does SLAM lose lock because of cone quality, or in
+        # spite of perfect cones?": if it still diverges here, the fault
+        # is in the pose/odom fusion (IMU bias, /odom drift), not
+        # perception. Requires the sim GT topics, so it only works in
+        # simulation (they're hidden in competition mode). Default off,
+        # but DV_SLAM_GT_CONES=1 in the environment flips the default so
+        # docker-compose can carry it across container restarts (a bare
+        # `ros2 param set` is lost on relaunch). An explicit launch/CLI
+        # parameter still overrides the env default.
+        self.declare_parameter(
+            "debug_gt_cones", _env_truthy("DV_SLAM_GT_CONES"))
+        # FOV/range gate applied to the GT cones so SLAM sees roughly the
+        # same cone *set* a real LiDAR scan would (not the whole track).
+        # Defaults mirror the sim LiDAR (settings.json: ±60° H-FOV,
+        # 0.5 m min range) and the node's MAX_OBSERVATION_RANGE_M reach.
+        self.declare_parameter("debug_gt_range_m", MAX_OBSERVATION_RANGE_M)
+        self.declare_parameter("debug_gt_min_range_m", 0.5)
+        self.declare_parameter("debug_gt_hfov_deg", 60.0)
+
         # I/O references — populated in on_configure / on_activate.
         self.map_frame: str = ""
         self.odom_frame: str = ""
         self.base_frame: str = ""
+        self._motion_model: str = "odom"
         self._preint: Optional[ImuPreintegrator] = None
         self._graph: Optional[FactorGraph] = None
         self._db: Optional[LandmarkDb] = None
@@ -327,11 +389,18 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._latest_gt: Optional[Odometry] = None
         self._gt_init_pose: Optional[gtsam.Pose3] = None
 
+        # GT-cone debug mode (see debug_gt_cones parameter). Read in
+        # on_configure; the latched sim track is cached here when active.
+        self._debug_gt_cones: bool = False
+        self._latest_track: Optional[list[tuple[float, float, int]]] = None
+
         # Subscription handles (created in on_activate)
         self._sub_imu = None
         self._sub_cones = None
         self._sub_rpm = None
+        self._sub_steering = None
         self._sub_gt = None
+        self._sub_track = None
 
         # Subscription for sim_supervisor's /odom (Phase 2 #382 —
         # needed to compute map→odom drift correction). Cached
@@ -343,6 +412,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # message). Used to compute the EKF's per-scan delta-pose and
         # stage it as a BetweenFactor on X(k-1)→X(k). Reset on activate.
         self._prev_scan_odom_pose: Optional[gtsam.Pose3] = None
+        # Last published map→odom correction (dx, dy, dyaw). On a scan
+        # with no cone correction (e.g. zero cones), we hold this
+        # constant and recompose it with the live supervisor odom so
+        # map→base keeps moving on the EKF instead of freezing. See
+        # _ekf_holdover_result. Reset on activate/cleanup.
+        self._last_correction: Optional[tuple] = None
 
         # Publisher / broadcaster handles (created in on_configure)
         self._tf_broadcaster = None
@@ -355,6 +430,41 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # in a follow-up. Stays latched so a late mission_control
         # subscriber inherits the current value.
         self._finished_pub = None
+
+    # ------------------------------------------------------------------
+    # Run-memory reset
+    # ------------------------------------------------------------------
+    def _reset_run_memory(self) -> None:
+        """Drop every piece of state that carries information from a run.
+
+        This is the single source of truth for "forget the previous
+        run": the factor graph, landmark DB and IMU preintegrator are
+        rebuilt from scratch, the state machine returns to
+        INIT_WAITING_IMU, and all cached sensor samples / diagnostics
+        are cleared. Called from on_configure, on_activate (so a fresh
+        run starts clean) and on_deactivate (so a *stopped* node retains
+        nothing, regardless of when — or whether — it is re-activated).
+        """
+        self._state = State.INIT_WAITING_IMU
+        self._calib_started_t = None
+        self._latest_result = None
+        self._preint = ImuPreintegrator()
+        self._graph = FactorGraph()
+        self._db = LandmarkDb()
+        self._latest_rpm = None
+        self._latest_rpm_t = None
+        self._latest_steering_rad = None
+        self._latest_steering_t = None
+        self._latest_gt = None
+        self._gt_init_pose = None
+        self._latest_track = None
+        self._latest_supervisor_odom = None
+        self._prev_scan_odom_pose = None
+        self._last_correction = None
+        self._obs_diag = {}
+        self._obs_n_scans = 0
+        self._obs_last_log_ns = 0
+        self._consecutive_cascade_skips = 0
 
     # ------------------------------------------------------------------
     # Lifecycle transitions
@@ -371,21 +481,34 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self.odom_frame = self.get_parameter("odom_frame").value
         self.base_frame = self.get_parameter("base_frame").value
 
-        # Components
-        self._preint = ImuPreintegrator()
-        self._graph = FactorGraph()
-        self._db = LandmarkDb()
-        self._latest_result = None
-        self._state = State.INIT_WAITING_IMU
-        self._calib_started_t = None
-        self._latest_rpm = None
-        self._latest_rpm_t = None
-        self._latest_steering_rad = None
-        self._latest_steering_t = None
-        self._latest_gt = None
-        self._gt_init_pose = None
-        self._latest_supervisor_odom = None
-        self._prev_scan_odom_pose = None
+        motion_model = str(self.get_parameter("motion_model").value).lower()
+        if motion_model not in ("odom", "imu"):
+            self.get_logger().warn(
+                f"motion_model='{motion_model}' invalid — falling back to "
+                f"'odom' (EKF-as-motion-model)")
+            motion_model = "odom"
+        self._motion_model = motion_model
+        if self._motion_model == "odom":
+            self.get_logger().info(
+                "motion_model=odom — EKF /odom delta is the primary "
+                "motion constraint; IMU preintegration / RPM-prior / "
+                "steering factors are DISABLED (the EKF already fuses "
+                "them).")
+        else:
+            self.get_logger().info(
+                "motion_model=imu — legacy IMU-preintegration motion "
+                "model with soft /odom backstop.")
+
+        self._debug_gt_cones = bool(self.get_parameter("debug_gt_cones").value)
+        if self._debug_gt_cones:
+            self.get_logger().warn(
+                "DEBUG_GT_CONES ENABLED — feeding SLAM perfect cone "
+                "positions from /testing_only/track projected through the "
+                "GT pose. /Conos_raw is the scan trigger only; perceived "
+                "cone xy are IGNORED. SIM-ONLY diagnostic; never run on car.")
+
+        # Components + run-memory: start from a clean slate.
+        self._reset_run_memory()
 
         # Optional per-landmark creation diagnostic. When DV_SLAM_LANDMARK_CAPTURE
         # is set to a writable path, every new landmark dumps one JSON line
@@ -470,25 +593,10 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # cycle should look like a fresh run, not a resumed one — the
         # IMU preintegrator can't bridge the deactivated gap, and any
         # downstream consumer reading /tf during the gap will already
-        # have stale data.
-        self._state = State.INIT_WAITING_IMU
-        self._calib_started_t = None
-        self._latest_result = None
-        self._preint = ImuPreintegrator()
-        self._graph = FactorGraph()
-        self._db = LandmarkDb()
-        self._latest_rpm = None
-        self._latest_rpm_t = None
-        self._latest_steering_rad = None
-        self._latest_steering_t = None
-        self._latest_gt = None
-        self._gt_init_pose = None
-        self._latest_supervisor_odom = None
-        self._prev_scan_odom_pose = None
-        self._obs_diag = {}
-        self._obs_n_scans = 0
-        self._obs_last_log_ns = 0
-        self._consecutive_cascade_skips = 0
+        # have stale data. (on_deactivate also calls this so a stopped
+        # node holds no memory of the previous run even before the next
+        # activate rebuilds it.)
+        self._reset_run_memory()
 
         # Subscriptions.
         # Bigger IMU queue than qos_profile_sensor_data's default 10:
@@ -567,6 +675,24 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._sub_supervisor_odom = self.create_subscription(
             Odometry, "/odom", self._on_supervisor_odom, odom_qos)
 
+        # /testing_only/track — latched full-track GT layout, only
+        # subscribed in GT-cone debug mode. The bridge publishes it
+        # TRANSIENT_LOCAL (latched) at ~0.2 Hz, so a late subscriber
+        # still inherits the layout; match durability or it never
+        # arrives. fs_msgs is imported lazily so production builds that
+        # don't ship the debug path don't hard-depend on it here.
+        if self._debug_gt_cones:
+            from fs_msgs.msg import Track
+
+            track_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            )
+            self._sub_track = self.create_subscription(
+                Track, "/testing_only/track", self._on_track, track_qos)
+
         # Latch /slam/finished=false on activate (#384 stub). The
         # publisher exists from on_configure; this fires the default
         # value so a subscriber that joins between configure and
@@ -581,15 +707,26 @@ class ConeGraphSlamNode(BaseLifecycleNode):
     ) -> TransitionCallbackReturn:
         self.get_logger().info("on_deactivate: dropping subscriptions")
         for sub in (self._sub_imu, self._sub_cones,
-                    self._sub_rpm, self._sub_gt,
-                    self._sub_supervisor_odom):
+                    self._sub_rpm, self._sub_steering, self._sub_gt,
+                    self._sub_supervisor_odom, self._sub_track):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_imu = None
         self._sub_cones = None
         self._sub_rpm = None
+        self._sub_steering = None
         self._sub_gt = None
         self._sub_supervisor_odom = None
+        self._sub_track = None
+
+        # Wipe all memory of the run we just stopped. The components
+        # (factor graph, landmark DB, IMU preintegrator) and the cached
+        # sensor samples are recreated fresh here so a deactivated node
+        # carries no landmarks/poses/bias from the previous run — even
+        # if the next activate is skipped by an orchestrator that thinks
+        # the stack is "already prepared". on_activate calls this again
+        # (cheap) so the rebuild is idempotent.
+        self._reset_run_memory()
         return super().on_deactivate(state)
 
     def on_cleanup(
@@ -597,15 +734,17 @@ class ConeGraphSlamNode(BaseLifecycleNode):
     ) -> TransitionCallbackReturn:
         self.get_logger().info("on_cleanup: destroying publishers + components")
         for sub in (self._sub_imu, self._sub_cones,
-                    self._sub_rpm, self._sub_gt,
-                    self._sub_supervisor_odom):
+                    self._sub_rpm, self._sub_steering, self._sub_gt,
+                    self._sub_supervisor_odom, self._sub_track):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_imu = None
         self._sub_cones = None
         self._sub_rpm = None
+        self._sub_steering = None
         self._sub_gt = None
         self._sub_supervisor_odom = None
+        self._sub_track = None
 
         for pub in (self._state_pub, self._cones_pub,
                     self._gt_aligned_pub, self._gt_error_pub,
@@ -624,6 +763,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._tf_broadcaster = None
         self._latest_supervisor_odom = None
         self._prev_scan_odom_pose = None
+        self._last_correction = None
 
         # Components
         self._preint = None
@@ -689,6 +829,63 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 f"yaw={np.degrees(self._gt_init_pose.rotation().yaw()):+.1f}°"
             )
 
+    def _on_track(self, msg) -> None:
+        """Cache the latched sim GT track layout (GT-cone debug mode only).
+
+        Stored as a flat ``(world_x, world_y, color)`` list in ENU world
+        frame — the same frame /testing_only/odom lives in, so
+        :meth:`_gt_observations` can project it straight into base_link.
+        The layout is static for the session; we just keep the latest.
+        """
+        track = getattr(msg, "track", None)
+        if not track:
+            return
+        self._latest_track = [
+            (float(c.location.x), float(c.location.y), int(c.color))
+            for c in track
+        ]
+
+    def _gt_observations(self) -> list[Observation]:
+        """Body-frame cone observations from GT track + GT pose.
+
+        Projects every cached world cone into base_link using the latest
+        /testing_only/odom pose, then applies the same forward-half-plane
+        / min-range / max-range / horizontal-FOV gate a real LiDAR scan
+        would, so SLAM sees roughly the cone *set* it normally would —
+        just at perfect positions. Returns [] until both the track and a
+        GT pose have arrived (that scan then runs IMU-only, exactly like
+        a perceived empty scan). sigma_xy=-1 makes SLAM use its default
+        range-only weighting, identical to a perceived cone that reports
+        no sigma — so only the cone xy change, not the factor weights.
+        """
+        if self._latest_track is None or self._latest_gt is None:
+            return []
+        pos = self._latest_gt.pose.pose.position
+        q = self._latest_gt.pose.pose.orientation
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = np.arctan2(siny, cosy)
+        c, s = np.cos(yaw), np.sin(yaw)
+        rng = float(self.get_parameter("debug_gt_range_m").value)
+        min_rng = float(self.get_parameter("debug_gt_min_range_m").value)
+        hfov = np.radians(float(self.get_parameter("debug_gt_hfov_deg").value))
+        out: list[Observation] = []
+        for cx, cy, _color in self._latest_track:
+            dx = cx - pos.x
+            dy = cy - pos.y
+            bx = c * dx + s * dy
+            by = -s * dx + c * dy
+            if bx <= 0.0:  # behind the car
+                continue
+            r = float(np.hypot(bx, by))
+            if r < min_rng or r > rng:
+                continue
+            if abs(np.arctan2(by, bx)) > hfov + 1e-9:
+                continue
+            out.append(Observation(
+                body_x=float(bx), body_y=float(by), height=0.0, sigma_xy=-1.0))
+        return out
+
     # ----- IMU callback ------------------------------------------------------
 
     def _on_imu(self, msg: Imu) -> None:
@@ -703,7 +900,15 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             msg.angular_velocity.y,
             msg.angular_velocity.z,
         ])
-        self._preint.push_sample(ImuSample(t=t, accel=accel, gyro=gyro))
+        # Tag whether the car is at a genuine standstill (wheel speed ~0) so
+        # the INIT bias calibration only averages stationary samples. Before
+        # the first /motor_rpm arrives (_latest_rpm is None) we can't confirm a
+        # standstill, so treat the sample as moving — better to default the bias
+        # to zero than to soak unknown motion into it (see estimate_bias).
+        stationary = (self._latest_rpm is not None
+                      and abs(self._latest_rpm) <= STATIONARY_SPEED_MS)
+        self._preint.push_sample(
+            ImuSample(t=t, accel=accel, gyro=gyro, stationary=stationary))
 
         if self._state == State.INIT_WAITING_IMU:
             self._calib_started_t = t
@@ -764,118 +969,188 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         if self._latest_result is None:
             return
 
+        # Wall-clock entry time for the per-scan latency diagnostic
+        # (consumed in _publish_map_to_odom). Measures how long this scan's
+        # processing takes — the signal that distinguishes a real-time
+        # backlog (proc time climbs into a corner) from a clean solve.
+        self._on_cones_t0 = self._time.monotonic()
+
         # MarkerArray has no top-level header, but every Cone_Detection
         # marker carries the originating LiDAR scan's header.stamp.
         stamp = self._stamp_msg(msg)
         if stamp is None:
-            # Empty array — nothing to do.
+            # No cones this scan, but the EKF is still moving. Publish the
+            # EKF-dead-reckoned pose (held map→odom correction recomposed
+            # with the current supervisor odom) so map→base keeps
+            # advancing and downstream pose lookups (path planning) don't
+            # freeze on the last cone-corrected scan. Also republish the
+            # held cone map so the planner keeps ticking against the fresh
+            # pose. No-op until we have a correction + EKF sample.
+            holdover = self._ekf_holdover_result()
+            if holdover is not None:
+                hstamp = self._latest_supervisor_odom.header.stamp
+                self._publish_map_to_odom(hstamp, holdover)
+                self._publish_state(hstamp, holdover)
+                self._publish_cone_map(hstamp)
             return
         t_scan = stamp.sec + stamp.nanosec * 1e-9
 
-        # Stage IMU preintegration for this scan window.
-        try:
-            pim, _dt = self._preint.integrate_to(t_scan)
-        except RuntimeError as e:
-            self.get_logger().warn(f"skip scan: {e}")
-            return
-        self._graph.stage_imu_factor(pim, self._latest_result)
-
-        # Stage the motor-RPM velocity prior on V(k). This is the
-        # anchor that prevents the optimizer from rotating the global
-        # frame to find a cheaper minimum during cone-poor windows
-        # (the cascade root cause). Skipped if RPM is stale or hasn't
-        # arrived yet — the prior would be misleading rather than
-        # helpful in that regime.
-        rpm_fresh = (self._latest_rpm is not None
-                     and self._latest_rpm_t is not None
-                     and (self._time.monotonic() - self._latest_rpm_t)
-                     <= RPM_STALE_S)
-        if rpm_fresh:
-            # Use the same predicted yaw we'll use for DA below.
-            _nav_state = gtsam.NavState(
-                self._latest_result.pose, self._latest_result.velocity)
-            _pred_state = pim.predict(_nav_state, self._latest_result.bias)
-            _pred_yaw = _pred_state.pose().rotation().yaw()
-            self._graph.stage_velocity_prior(
-                v_body_long=self._latest_rpm,
-                predicted_yaw=_pred_yaw,
-            )
-
-            # Stage the kinematic-bicycle yaw-rate BetweenFactor.
-            # This is the steering-sensor channel into the graph
-            # (PR C / fix for bag _095215's 94° pose jump during
-            # cascade): even when cone factors are skipped, this
-            # factor anchors yaw rate to the physical steering wheel
-            # via ω = (vx/L)·tan(δ). Slip-gated inside the staging
-            # method — if the IMU's measured Δyaw disagrees with the
-            # steering prediction by > slip_threshold, the chassis is
-            # sliding and the factor is dropped to avoid corruption.
-            steering_fresh = (
-                self._latest_steering_rad is not None
-                and self._latest_steering_t is not None
-                and (self._time.monotonic() - self._latest_steering_t)
-                <= RPM_STALE_S
-            )
-            if steering_fresh:
-                _prev_yaw = self._latest_result.pose.rotation().yaw()
-                _imu_dyaw = (_pred_yaw - _prev_yaw + np.pi) % (2 * np.pi) - np.pi
-                _gate_state = self._graph.stage_steering_between(
-                    dt=_dt,
-                    v_body_long=self._latest_rpm,
-                    steering_rad=self._latest_steering_rad,
-                    prev_pose=self._latest_result.pose,
-                    imu_predicted_dyaw_rad=_imu_dyaw,
-                )
-                # Periodic diagnostic — emit a sample every ~5 s so
-                # the operator can confirm the factor is being staged
-                # (not silently slipping itself into "always slip").
-                if not hasattr(self, "_steering_factor_log_counter"):
-                    self._steering_factor_log_counter = 0
-                self._steering_factor_log_counter += 1
-                if self._steering_factor_log_counter % 50 == 0:
-                    self.get_logger().info(
-                        f"STEERING_FACTOR state={_gate_state} "
-                        f"vx={self._latest_rpm:+.2f} "
-                        f"delta={self._latest_steering_rad:+.3f}rad "
-                        f"imu_dyaw={_imu_dyaw*180/np.pi:+.2f}deg "
-                        f"dt={_dt:.3f}s"
-                    )
-
-        # Stage the /odom-derived BetweenFactor (the "trust the EKF"
-        # channel into the graph). /odom is the post-#534/#539 EKF's
-        # fused IMU + RPM + steering estimate with Coriolis correction.
-        # During cone-poor windows (the cascade-spike root cause), this
-        # factor anchors X(k) to a quality estimate that's drift-tracked
-        # by all available sensors — much better than SLAM's IMU-only
-        # internal fallback which produced 10 m / 94° pose jumps during
-        # cornering on bag _095215. First scan after activate has no
-        # previous cached /odom pose; we just record this one and skip
-        # the factor — the IMU+RPM priors carry the load that scan.
-        if self._latest_supervisor_odom is not None:
+        # --- Motion model: advance the graph by one scan ---------------
+        # Both branches stage X(k)/V(k)/B(k) plus their motion factor(s)
+        # and set `predicted_pose` — the pre-optimization pose at X(k)
+        # that drives data association and the pose-jump sanity check.
+        if self._motion_model == "odom":
+            # EKF-as-motion-model. The 9-state EKF's /odom per-scan
+            # delta-pose is the PRIMARY motion constraint
+            # (stage_odom_motion_step). No IMU preintegration factor, no
+            # RPM velocity prior, no steering BetweenFactor — the EKF
+            # already fused IMU + RPM + steering with Coriolis correction
+            # and online gyro-bias tracking, so re-adding any of them
+            # would double-count those sensors and re-introduce the
+            # degenerate-timestamp preintegration error the EKF is immune
+            # to. Cone BearingRange factors still correct accumulated
+            # global drift via landmark consistency.
+            if self._latest_supervisor_odom is None:
+                # No EKF estimate has arrived yet — no motion source this
+                # scan. Hold pose and republish so /slam/pose and the TF
+                # tree don't freeze.
+                self._publish_map_to_odom(stamp, self._latest_result)
+                self._publish_state(stamp, self._latest_result)
+                self._publish_cone_map(stamp)
+                return
             cur_odom_pose = _odom_to_pose3(self._latest_supervisor_odom)
-            if self._prev_scan_odom_pose is not None:
-                between_pose = (self._prev_scan_odom_pose.inverse()
-                                .compose(cur_odom_pose))
-                self._graph.stage_odom_between(between_pose)
+            if self._prev_scan_odom_pose is None:
+                # First scan after calibration: no previous /odom sample
+                # to delta against. Record this one as the baseline and
+                # hold pose; the next scan advances normally.
+                self._prev_scan_odom_pose = cur_odom_pose
+                self._publish_map_to_odom(stamp, self._latest_result)
+                self._publish_state(stamp, self._latest_result)
+                self._publish_cone_map(stamp)
+                return
+            between_pose = (self._prev_scan_odom_pose.inverse()
+                            .compose(cur_odom_pose))
+            v_world = self._odom_world_velocity(self._latest_supervisor_odom)
+            predicted_pose = self._graph.stage_odom_motion_step(
+                between_pose, self._latest_result, v_world)
             self._prev_scan_odom_pose = cur_odom_pose
+        else:
+            # Legacy IMU-preintegration motion model (motion_model=imu).
+            # Stage IMU preintegration for this scan window.
+            try:
+                pim, _dt = self._preint.integrate_to(t_scan)
+            except RuntimeError as e:
+                self.get_logger().warn(f"skip scan: {e}")
+                return
+            self._graph.stage_imu_factor(pim, self._latest_result)
 
-        # Parse cone observations from /Conos_raw markers.
-        observations = self._observations_from_markers(msg)
+            # Stage the motor-RPM velocity prior on V(k). This is the
+            # anchor that prevents the optimizer from rotating the global
+            # frame to find a cheaper minimum during cone-poor windows
+            # (the cascade root cause). Skipped if RPM is stale or hasn't
+            # arrived yet — the prior would be misleading rather than
+            # helpful in that regime.
+            rpm_fresh = (self._latest_rpm is not None
+                         and self._latest_rpm_t is not None
+                         and (self._time.monotonic() - self._latest_rpm_t)
+                         <= RPM_STALE_S)
+            if rpm_fresh:
+                # Use the same predicted yaw we'll use for DA below.
+                _nav_state = gtsam.NavState(
+                    self._latest_result.pose, self._latest_result.velocity)
+                _pred_state = pim.predict(_nav_state, self._latest_result.bias)
+                _pred_yaw = _pred_state.pose().rotation().yaw()
+                self._graph.stage_velocity_prior(
+                    v_body_long=self._latest_rpm,
+                    predicted_yaw=_pred_yaw,
+                )
+
+                # Stage the kinematic-bicycle yaw-rate BetweenFactor.
+                # This is the steering-sensor channel into the graph
+                # (PR C / fix for bag _095215's 94° pose jump during
+                # cascade): even when cone factors are skipped, this
+                # factor anchors yaw rate to the physical steering wheel
+                # via ω = (vx/L)·tan(δ). Slip-gated inside the staging
+                # method — if the IMU's measured Δyaw disagrees with the
+                # steering prediction by > slip_threshold, the chassis is
+                # sliding and the factor is dropped to avoid corruption.
+                steering_fresh = (
+                    self._latest_steering_rad is not None
+                    and self._latest_steering_t is not None
+                    and (self._time.monotonic() - self._latest_steering_t)
+                    <= RPM_STALE_S
+                )
+                if steering_fresh:
+                    _prev_yaw = self._latest_result.pose.rotation().yaw()
+                    _imu_dyaw = (
+                        _pred_yaw - _prev_yaw + np.pi) % (2 * np.pi) - np.pi
+                    _gate_state = self._graph.stage_steering_between(
+                        dt=_dt,
+                        v_body_long=self._latest_rpm,
+                        steering_rad=self._latest_steering_rad,
+                        prev_pose=self._latest_result.pose,
+                        imu_predicted_dyaw_rad=_imu_dyaw,
+                    )
+                    # Periodic diagnostic — emit a sample every ~5 s so
+                    # the operator can confirm the factor is being staged
+                    # (not silently slipping itself into "always slip").
+                    if not hasattr(self, "_steering_factor_log_counter"):
+                        self._steering_factor_log_counter = 0
+                    self._steering_factor_log_counter += 1
+                    if self._steering_factor_log_counter % 50 == 0:
+                        self.get_logger().info(
+                            f"STEERING_FACTOR state={_gate_state} "
+                            f"vx={self._latest_rpm:+.2f} "
+                            f"delta={self._latest_steering_rad:+.3f}rad "
+                            f"imu_dyaw={_imu_dyaw*180/np.pi:+.2f}deg "
+                            f"dt={_dt:.3f}s"
+                        )
+
+            # Stage the /odom-derived BetweenFactor (the "trust the EKF"
+            # channel into the graph) as a SOFT backstop alongside the
+            # IMU factor. /odom is the post-#534/#539 EKF's fused IMU +
+            # RPM + steering estimate with Coriolis correction. During
+            # cone-poor windows (the cascade-spike root cause), this
+            # factor anchors X(k) to a quality estimate that's drift-
+            # tracked by all available sensors — much better than SLAM's
+            # IMU-only internal fallback which produced 10 m / 94° pose
+            # jumps during cornering on bag _095215. First scan after
+            # activate has no previous cached /odom pose; we just record
+            # this one and skip the factor — the IMU+RPM priors carry the
+            # load that scan.
+            if self._latest_supervisor_odom is not None:
+                cur_odom_pose = _odom_to_pose3(self._latest_supervisor_odom)
+                if self._prev_scan_odom_pose is not None:
+                    between_pose = (self._prev_scan_odom_pose.inverse()
+                                    .compose(cur_odom_pose))
+                    self._graph.stage_odom_between(between_pose)
+                self._prev_scan_odom_pose = cur_odom_pose
+
+            # Predicted pose at X(k) from IMU preintegration, used for DA
+            # and the pose-jump sanity check (we've staged X(k) but not
+            # committed yet).
+            nav_state = gtsam.NavState(
+                self._latest_result.pose, self._latest_result.velocity)
+            predicted_pose = pim.predict(
+                nav_state, self._latest_result.bias).pose()
+
+        # Parse cone observations from /Conos_raw markers. In GT-cone
+        # debug mode the perceived positions are discarded and replaced
+        # with perfect cones synthesized from the sim GT track + GT pose
+        # — /Conos_raw still gated the scan above, so timing is unchanged.
+        if self._debug_gt_cones:
+            observations = self._gt_observations()
+        else:
+            observations = self._observations_from_markers(msg)
 
         # Per-scan obs tally for the SLAM_OBS diagnostic. No colour
         # breakdown anymore — the body_y classifier is gone, every
         # cone is just a position.
         per_scan = {"obs_total": len(observations)}
 
-        # Run data association against the predicted body-frame position
-        # of every existing landmark, using the iSAM2-predicted pose
-        # from the IMU step (still inside the optimizer's "predicted"
-        # state — we've staged X(k) but not committed yet, so use the
-        # pose that pim.predict produced from the previous result).
-        nav_state = gtsam.NavState(
-            self._latest_result.pose, self._latest_result.velocity)
-        predicted_pose = pim.predict(
-            nav_state, self._latest_result.bias).pose()
+        # Data association runs against the predicted body-frame position
+        # of every existing landmark, using the pre-commit predicted pose
+        # at X(k) (EKF-delta in odom mode, pim.predict in imu mode).
         pred_x = predicted_pose.x()
         pred_y = predicted_pose.y()
         pred_yaw = predicted_pose.rotation().yaw()
@@ -982,14 +1257,16 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 triggered = False  # fall through to the spawn path
 
         if triggered:
+            motion_label = ("EKF-odom" if self._motion_model == "odom"
+                            else "IMU")
             self.get_logger().warn(
                 f"skip cone factors: DA-failure spike "
                 f"[{', '.join(reasons)}] "
                 f"(obs={total_pre} new={n_new_pre} "
-                f"assoc={total_pre - n_new_pre}) — IMU-only update")
-            # Commit the staged IMU factor + bias-RW factor (the only
-            # things staged at this point — cone factors are staged
-            # only after this check). iSAM2 advances pose by IMU
+                f"assoc={total_pre - n_new_pre}) — {motion_label}-only update")
+            # Commit the staged motion factor(s) (the only things staged
+            # at this point — cone factors are staged only after this
+            # check). iSAM2 advances pose by the motion model's
             # prediction; no cone constraints applied this scan.
             result = self._graph.commit()
             self._latest_result = result
@@ -1222,11 +1499,77 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             0.0,
         ])
 
+    @staticmethod
+    def _odom_world_velocity(msg: Odometry) -> np.ndarray:
+        """World-frame (nav-frame) velocity from a nav_msgs/Odometry.
+
+        GTSAM's V(k) lives in the navigation frame, but nav_msgs/Odometry
+        twist is expressed in child_frame_id (base_link / body). Rotate
+        the planar body velocity through the pose yaw; z is taken as-is
+        (flat track). Used to seed and softly anchor V(k) in
+        ``motion_model='odom'`` so the velocity node stays determined
+        without an IMU factor.
+        """
+        pose = _odom_to_pose3(msg)
+        yaw = pose.rotation().yaw()
+        vb = msg.twist.twist.linear
+        c, s = np.cos(yaw), np.sin(yaw)
+        return np.array([
+            c * vb.x - s * vb.y,
+            s * vb.x + c * vb.y,
+            float(vb.z),
+        ])
+
     # ----- output ------------------------------------------------------------
 
     def _on_supervisor_odom(self, msg: Odometry) -> None:
         """Cache sim_supervisor's latest /odom sample for map→odom math."""
         self._latest_supervisor_odom = msg
+
+    def _ekf_holdover_result(self) -> Optional[ScanResult]:
+        """EKF-dead-reckoned pose for a scan with no cone correction.
+
+        Holds the most recent `map→odom` correction constant and
+        recomposes it with the *current* supervisor odom
+        (`odom→base_link`), so `map→base` keeps advancing on the EKF's
+        dead-reckoning instead of freezing. This is the inverse of
+        `compute_map_to_odom`:
+
+            T_map_base = T_map_odom · T_odom_base
+            ⇒ base = Δpos + R(Δyaw) · sup_pos,  yaw = Δyaw + sup_yaw
+
+        Why this is needed: republishing the held *absolute* pose would
+        make `_publish_map_to_odom` recompute the correction against the
+        moved supervisor odom — absorbing and cancelling the EKF motion,
+        i.e. a freeze. Holding the *correction* constant and letting
+        `map→base` move is what keeps downstream pose lookups (path
+        planning) alive during cone-poor windows.
+
+        Returns None when there's no cached correction, no supervisor
+        odom, or no prior result to clone velocity/bias from.
+        """
+        if (self._last_correction is None
+                or self._latest_supervisor_odom is None
+                or self._latest_result is None):
+            return None
+        dx, dy, dyaw = self._last_correction
+        sup = self._latest_supervisor_odom.pose.pose
+        sup_x = sup.position.x
+        sup_y = sup.position.y
+        sup_yaw = 2.0 * np.arctan2(sup.orientation.z, sup.orientation.w)
+        c, s = np.cos(dyaw), np.sin(dyaw)
+        bx = dx + c * sup_x - s * sup_y
+        by = dy + s * sup_x + c * sup_y
+        byaw = (dyaw + sup_yaw + np.pi) % (2.0 * np.pi) - np.pi
+        pose = gtsam.Pose3(
+            gtsam.Rot3.Yaw(float(byaw)),
+            gtsam.Point3(float(bx), float(by), self._latest_result.pose.z()),
+        )
+        return ScanResult(
+            pose=pose,
+            velocity=self._latest_result.velocity,
+            bias=self._latest_result.bias,
+        )
 
     def _publish_map_to_odom(self, stamp, result: ScanResult) -> None:
         """Broadcast the dynamic `map → odom` transform (Phase 2 #382).
@@ -1271,6 +1614,11 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 sup_x, sup_y, sup_yaw,
             )
 
+        # Cache the correction so a no-cone scan can hold it constant and
+        # recompose it with the live EKF odom (see _ekf_holdover_result),
+        # keeping map→base moving when there's no cone correction to apply.
+        self._last_correction = (float(dx), float(dy), float(dyaw))
+
         t = TransformStamped()
         t.header.stamp = stamp
         t.header.frame_id = self.map_frame
@@ -1284,6 +1632,34 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         t.transform.rotation.y = 0.0
         t.transform.rotation.z = float(np.sin(half))
         self._tf_broadcaster.sendTransform(t)
+
+        # --- Per-scan latency / correction diagnostic --------------------
+        # Distinguishes the two corner-failure mechanisms (see #382 thread):
+        #   proc_ms  — wall time spent processing this scan. Climbs into a
+        #              corner ⇒ real-time backlog (single-threaded executor
+        #              falling behind), which makes the published stamp stale.
+        #   age_ms   — ROS-time gap between now and this scan's stamp; this
+        #              is the staleness path planning's TF lookup actually
+        #              sees. Grows with the backlog.
+        #   corr     — magnitude of the map→odom drift correction. A spike
+        #              here (with age flat) means a genuine SLAM pose jump,
+        #              not a timing problem.
+        #   dt_pub   — wall gap since the previous publish (effective scan
+        #              cadence).
+        # Logged every scan; grep `SLAM_LAT` and plot the columns.
+        now_mono = self._time.monotonic()
+        proc_ms = (now_mono - getattr(self, "_on_cones_t0", now_mono)) * 1e3
+        dt_pub_ms = (now_mono - getattr(self, "_last_publish_mono", now_mono)) * 1e3
+        self._last_publish_mono = now_mono
+        scan_s = stamp.sec + stamp.nanosec * 1e-9
+        age_ms = (self.get_clock().now().nanoseconds * 1e-9 - scan_s) * 1e3
+        corr_mag = float(np.hypot(dx, dy))
+        self.get_logger().info(
+            f"SLAM_LAT proc={proc_ms:6.1f}ms age={age_ms:7.1f}ms "
+            f"dt_pub={dt_pub_ms:6.1f}ms "
+            f"corr=({dx:+.2f},{dy:+.2f}|{corr_mag:.2f}m,"
+            f"{np.degrees(dyaw):+.1f}deg)"
+        )
 
     def _publish_state(self, stamp, result: ScanResult) -> None:
         msg = Odometry()

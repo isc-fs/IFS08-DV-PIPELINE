@@ -44,11 +44,33 @@ from typing import Iterable
 
 from launch.actions import EmitEvent, RegisterEventHandler
 from launch.events import matches_action
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import LifecycleNode
 from launch_ros.event_handlers import OnStateTransition
 from launch_ros.events.lifecycle import ChangeState
+from launch_ros.parameter_descriptions import ParameterValue
 
 from lifecycle_msgs.msg import Transition
+
+
+def use_sim_time_params() -> list:
+    """`parameters=` fragment that binds use_sim_time to the launch arg.
+
+    Every pipeline node reads its clock through this so the whole graph
+    shares one toggle: sim launches declare `use_sim_time:=true` (the
+    bridge publishes /clock from UE sim time), the car build declares
+    `false` (real sensors carry real stamps, no /clock). Every launch
+    file that inserts these actions MUST DeclareLaunchArgument(
+    "use_sim_time") or the substitution is unresolved at launch.
+
+    value_type=bool is required: LaunchConfiguration yields the string
+    "true"/"false", and rclcpp would otherwise reject a string for the
+    bool use_sim_time parameter.
+    """
+    return [{
+        "use_sim_time": ParameterValue(
+            LaunchConfiguration("use_sim_time"), value_type=bool),
+    }]
 
 
 # ---------------------------------------------------------------------
@@ -62,6 +84,9 @@ REMAP_LIDAR    = ("/fsds/lidar/Lidar1", "/lidar/Lidar1")
 REMAP_GSS      = ("/fsds/gss",          "/gss")
 REMAP_IMU      = ("/fsds/imu",          "/imu")
 REMAP_GT       = ("/fsds/testing_only/odom", "/testing_only/odom")
+# GT track layout — only consumed by slam's debug_gt_cones diagnostic.
+# Harmless when that mode is off (no subscription is created).
+REMAP_TRACK    = ("/fsds/testing_only/track", "/testing_only/track")
 REMAP_RPM      = ("/fsds/motor_rpm",    "/motor_rpm")
 REMAP_CMD      = ("/fsds/control_command", "/control_command")
 REMAP_STEERING = ("/fsds/steering_angle", "/steering_angle")
@@ -88,6 +113,7 @@ def auto_active(
         namespace="",
         output="screen",
         remappings=list(remappings or []),
+        parameters=use_sim_time_params(),
     )
     configure = EmitEvent(event=ChangeState(
         lifecycle_node_matcher=matches_action(node),
@@ -124,6 +150,7 @@ def autonomy_lifecycle(
         namespace="",
         output="screen",
         remappings=list(remappings or []),
+        parameters=use_sim_time_params(),
     )
 
 
@@ -146,7 +173,7 @@ def autonomy_actions() -> list:
         ),
         autonomy_lifecycle(
             "cone_slam", "slam_node", "slam_node",
-            remappings=[REMAP_IMU, REMAP_RPM, REMAP_GT],
+            remappings=[REMAP_IMU, REMAP_RPM, REMAP_GT, REMAP_TRACK],
         ),
         autonomy_lifecycle(
             "path_planning", "path_planning_node", "path_planning_node",

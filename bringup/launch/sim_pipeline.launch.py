@@ -29,6 +29,9 @@ def generate_launch_description() -> LaunchDescription:
         # isn't included in this layout.
         DeclareLaunchArgument("mission_name", default_value="trackdrive"),
         DeclareLaunchArgument("track_name",   default_value="A"),
+        # Sim runs on the bridge's /clock (UE sim time). The externally-
+        # launched bridge must be publishing /clock for the nodes to tick.
+        DeclareLaunchArgument("use_sim_time",  default_value="true"),
     ]
 
     # Sim layout still includes sim_supervisor: even without the

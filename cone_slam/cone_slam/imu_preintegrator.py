@@ -39,6 +39,12 @@ GYRO_BIAS_RW_STD = 1e-5    # rad/s/√s
 # trapezoidal IMU integration. GTSAM default is 1e-8 m²/s³.
 INTEGRATION_NOISE_VAR = 1e-8
 
+# Pairwise header-stamp deltas below this are stamp-quantisation duplicates
+# (UE sim tick repeats the same ns across consecutive 400 Hz frames; the
+# bridge may bump +1 ns). The odometry EKF skips these (dt_min) but still
+# gets RPM/steering every step — SLAM only has IMU between 10 Hz scans.
+STAMP_DT_EPS = 1e-5
+
 
 @dataclass
 class ImuSample:
@@ -46,6 +52,7 @@ class ImuSample:
     t: float                # absolute time in seconds
     accel: np.ndarray       # (3,) m/s²
     gyro: np.ndarray        # (3,) rad/s
+    stationary: bool = True  # car at rest (wheel speed ~0) when sampled?
 
 
 class ImuPreintegrator:
@@ -127,12 +134,24 @@ class ImuPreintegrator:
         if not self._buffer:
             raise RuntimeError("No IMU samples buffered for calibration")
 
-        # Stack buffered samples into Nx3 arrays.
-        accels = np.array([s.accel for s in self._buffer])
-        gyros = np.array([s.gyro for s in self._buffer])
-
-        accel_mean = accels.mean(axis=0)
-        gyro_mean = gyros.mean(axis=0)
+        # Only average samples taken at a genuine standstill (wheel speed
+        # ~0). A non-stationary calibration window soaks real motion into the
+        # bias: a measured +5.2 deg/s turn during the 3 s window became a
+        # +5.2 deg/s gyro-bias error that drifted SLAM's heading until it lost
+        # lock. The true gyro bias is ~0 (sensor slope vs GT yaw-rate = 0.992),
+        # so when no standstill is captured (recorder opens late / bag starts
+        # mid-motion) a zero bias + level gravity is far closer to truth than a
+        # contaminated mean. Samples default stationary=True for callers that
+        # don't tag motion, preserving the original behaviour.
+        still = [s for s in self._buffer if s.stationary]
+        if still:
+            accels = np.array([s.accel for s in still])
+            gyros = np.array([s.gyro for s in still])
+            accel_mean = accels.mean(axis=0)
+            gyro_mean = gyros.mean(axis=0)
+        else:
+            accel_mean = np.array([0.0, 0.0, 9.81])
+            gyro_mean = np.zeros(3)
 
         # The mean accel is the IMU's specific-force reading at rest.
         # An accelerometer in a level body frame at rest reads
@@ -207,26 +226,48 @@ class ImuPreintegrator:
         # Reset accumulator before integrating this window.
         self._pim.resetIntegration()
 
-        # Walk buffered samples that fall in (last_integration_t, t_end].
-        # Use trapezoidal integration with the dt to the next sample as
-        # the step. Samples beyond t_end stay in the buffer for the
-        # next call.
+        # Collect samples in (last_integration_t, t_end]; trim the rest.
+        window: List[ImuSample] = []
         kept: List[ImuSample] = []
-        consumed = 0
         for i, s in enumerate(self._buffer):
             if s.t > t_end:
                 kept = self._buffer[i:]
                 break
-            # dt to the next sample (or to t_end for the final one).
-            if i + 1 < len(self._buffer) and self._buffer[i + 1].t <= t_end:
-                dt = self._buffer[i + 1].t - s.t
-            else:
-                dt = t_end - s.t
-            if dt > 0:
-                self._pim.integrateMeasurement(s.accel, s.gyro, dt)
-                consumed += 1
+            window.append(s)
         else:
             kept = []
+
+        dt_total = t_end - self._last_integration_t
+        if not window or dt_total <= 0:
+            consumed = 0
+        else:
+            pair_dts = [
+                window[i + 1].t - window[i].t
+                for i in range(len(window) - 1)
+            ]
+            # When most pairwise stamp deltas are zero/clumped, trapezoidal
+            # integration skips the samples and the IMU factor under-counts
+            # yaw and distance (EKF stays healthy via RPM/steering).
+            degenerate = (
+                len(pair_dts) > 0
+                and sum(1 for d in pair_dts if d < STAMP_DT_EPS)
+                > len(pair_dts) // 2
+            )
+            consumed = 0
+            if degenerate:
+                dt_each = dt_total / len(window)
+                for s in window:
+                    self._pim.integrateMeasurement(s.accel, s.gyro, dt_each)
+                consumed = len(window)
+            else:
+                for i, s in enumerate(window):
+                    if i + 1 < len(window):
+                        dt = window[i + 1].t - s.t
+                    else:
+                        dt = t_end - s.t
+                    if dt > 0:
+                        self._pim.integrateMeasurement(s.accel, s.gyro, dt)
+                        consumed += 1
 
         if consumed == 0:
             buf_first = self._buffer[0].t if self._buffer else None
@@ -241,7 +282,6 @@ class ImuPreintegrator:
                 + ")"
             )
 
-        dt_total = t_end - self._last_integration_t
         self._last_integration_t = t_end
         self._buffer = kept
 

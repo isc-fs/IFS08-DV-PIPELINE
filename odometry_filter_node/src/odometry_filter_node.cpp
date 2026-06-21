@@ -159,9 +159,17 @@ class OdometryFilterNode : public node_base_cpp::BaseLifecycleNode {
       "/steering_angle", rpm_qos,
       std::bind(&OdometryFilterNode::on_steering, this, std::placeholders::_1));
 
+    // ROS-clock timer (NOT create_wall_timer): under use_sim_time the
+    // publish cadence must track /clock, not steady wall time. UE runs
+    // ~0.77x real-time, so a wall timer would emit ~30% too many /odom
+    // samples per sim-second and would decouple entirely under offline
+    // bag replay. The EKF integrates on header/now() stamps either way;
+    // this keeps the publish rate on the same clock as those stamps.
     const auto period = std::chrono::duration<double>(1.0 / publish_hz_);
-    publish_timer_ = create_wall_timer(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(period),
+    publish_timer_ = rclcpp::create_timer(
+      this, get_clock(),
+      rclcpp::Duration(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(period)),
       std::bind(&OdometryFilterNode::publish_odom, this));
 
     return BaseLifecycleNode::on_activate(state);

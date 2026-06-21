@@ -102,6 +102,15 @@ class FactorGraph:
 
         self._k: int = 0  # scan index. 0 is the anchor.
 
+        # Full iSAM2 estimate, recomputed once per commit in
+        # _flush_update and reused for every read this scan (tip pose/vel/
+        # bias AND every landmark_position query). calculateEstimate() is
+        # a full back-substitution over the whole graph; reading the tip
+        # plus refreshing ~N landmarks used to trigger ~N+1 of them per
+        # scan (O(landmarks × graph-size) — the proc-time blowup). One
+        # solve/scan instead. None until the first commit.
+        self._latest_estimate: Optional[gtsam.Values] = None
+
     # ----- INIT (called once) ------------------------------------------------
 
     def initialize_anchor(
@@ -276,6 +285,90 @@ class FactorGraph:
         noise = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
         self._new_factors.add(gtsam.BetweenFactorPose3(
             X(self._k - 1), X(self._k), between_pose, noise))
+
+    def stage_odom_motion_step(
+        self,
+        between_pose: gtsam.Pose3,
+        prev_result: ScanResult,
+        world_velocity: np.ndarray,
+        sigma_yaw_rad: float = 0.02,
+        sigma_xy_m: float = 0.05,
+        sigma_rp_rad: float = 0.05,
+        sigma_z_m: float = 0.05,
+        vel_sigma: float = 0.5,
+    ) -> gtsam.Pose3:
+        """EKF-as-motion-model: advance the graph by one scan using the
+        /odom delta-pose as the PRIMARY motion constraint, with no IMU
+        preintegration factor.
+
+        This is the counterpart to stage_imu_factor for the
+        ``motion_model='odom'`` configuration. Where stage_imu_factor
+        adds an ImuFactor (and relies on the looser stage_odom_between
+        as a soft backup), this method makes the 9-state EKF's per-scan
+        delta the dominant pose-to-pose constraint and drops the IMU
+        factor entirely — the EKF already fuses IMU + RPM + steering
+        with Coriolis correction and online gyro-bias tracking, so a
+        separate ImuFactor would double-count the IMU (the accelerometer
+        and gyro enter the graph twice, through /odom and through the
+        raw IMU factor, as if they were independent measurements) and
+        re-introduce the degenerate-timestamp preintegration error that
+        the EKF is immune to.
+
+        What gets staged for X(k), V(k), B(k):
+          * X(k) initialised at ``prev_pose ∘ between_pose`` and
+            constrained by a TIGHT BetweenFactor on X(k-1)→X(k). Sigmas
+            default tighter than stage_odom_between (yaw 0.02 rad ≈ 1.1°,
+            xy 5 cm) because here /odom is the only motion source rather
+            than a backstop — it must out-weight a noisy cone factor in
+            cone-poor windows. Cone BearingRange factors still correct
+            accumulated global drift; the EKF only owns short-horizon
+            motion.
+          * V(k) seeded from the EKF twist (``world_velocity``) and held
+            by a loose unary prior. Without an IMU factor V(k) would
+            otherwise be unconstrained (indeterminate). The prior keeps
+            it well-posed and gives /slam/pose a sensible twist.
+          * B(k) carried forward unchanged with a bias random-walk
+            BetweenFactor. The bias is unused for motion in this mode
+            but the B chain must stay connected back to the B(0) prior
+            so iSAM2 doesn't see an indeterminate variable, and so the
+            ScanResult bias field stays readable.
+
+        Returns the predicted (pre-optimization) pose at X(k) so the
+        caller can use it for data association and the pose-jump sanity
+        check — the EKF prediction replaces pim.predict() in this mode.
+        """
+        prev_k = self._k
+        self._k += 1
+        new_k = self._k
+
+        predicted_pose = prev_result.pose.compose(between_pose)
+        self._new_values.insert(X(new_k), predicted_pose)
+        self._new_values.insert(V(new_k), world_velocity)
+        self._new_values.insert(B(new_k), prev_result.bias)
+
+        sigmas = np.array([
+            sigma_rp_rad,   # roll
+            sigma_rp_rad,   # pitch
+            sigma_yaw_rad,  # yaw — THE constraint
+            sigma_xy_m,     # tx
+            sigma_xy_m,     # ty
+            sigma_z_m,      # tz
+        ])
+        noise = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
+        self._new_factors.add(gtsam.BetweenFactorPose3(
+            X(prev_k), X(new_k), between_pose, noise))
+
+        vel_noise = gtsam.noiseModel.Isotropic.Sigma(3, vel_sigma)
+        self._new_factors.add(gtsam.PriorFactorVector(
+            V(new_k), world_velocity, vel_noise))
+
+        bias_rw_noise = gtsam.noiseModel.Diagonal.Sigmas(BIAS_RW_SIGMAS)
+        self._new_factors.add(gtsam.BetweenFactorConstantBias(
+            B(prev_k), B(new_k),
+            gtsam.imuBias.ConstantBias(),
+            bias_rw_noise,
+        ))
+        return predicted_pose
 
     def stage_steering_between(
         self,
@@ -547,10 +640,20 @@ class FactorGraph:
 
     def landmark_position(self, landmark_id: int) -> Optional[np.ndarray]:
         """Return the latest world-frame Point3 estimate for a
-        landmark, or None if iSAM2 hasn't merged it yet."""
+        landmark, or None if iSAM2 hasn't merged it yet.
+
+        Reads from the estimate cached by the last _flush_update rather
+        than recomputing calculateEstimate() per call. update_from_estimate
+        invokes this once per landmark, so a per-call full back-substitution
+        meant ~N full solves of the whole graph per scan — the dominant
+        cost behind the proc-time blowup. The cache is refreshed on every
+        commit and is only ever read in the same scan right after one, so
+        it's always fresh.
+        """
+        if self._latest_estimate is None:
+            return None
         try:
-            estimate = self._isam.calculateEstimate()
-            return np.array(estimate.atPoint3(L(landmark_id)))
+            return np.array(self._latest_estimate.atPoint3(L(landmark_id)))
         except Exception:
             return None
 
@@ -650,7 +753,13 @@ class FactorGraph:
         self._new_factors.resize(0)
         self._new_values.clear()
 
-        estimate = self._isam.calculateEstimate()
+        # Compute the full estimate ONCE per commit and cache it. The tip
+        # reads below and every landmark_position() query this scan reuse
+        # this single back-substitution instead of each triggering a fresh
+        # full solve (was ~N+1 solves/scan of the whole graph). Same
+        # numbers as before — only the cost changes.
+        self._latest_estimate = self._isam.calculateEstimate()
+        estimate = self._latest_estimate
         return ScanResult(
             pose=estimate.atPose3(X(self._k)),
             velocity=estimate.atVector(V(self._k)),

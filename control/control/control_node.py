@@ -318,10 +318,20 @@ class ControlNode(BaseLifecycleNode):
         # the apex (test_submodule first hairpin, #260 follow-up).
         self.declare_parameter("lookahead_min", 1.0)
         self.declare_parameter("lookahead_k", 0.5)
-        # Stanley lateral controller parameters. Defaults match the
-        # alt_pipeline reference port. mode_manager pushes these
-        # per-mode via SetParameters before the configure transition;
-        # see pipeline/mode_manager/mode_manager/mode_registry.py.
+        # Stanley lateral controller parameters. Retuned for the IFS-08
+        # sim's operating speed (v_max=3.0, a_lat_max=3.0 → ~1-3 m/s in
+        # practice). The original alt_pipeline gains (k=4.0, k_soft=6.0)
+        # were sized for a much faster car: k_soft is a velocity (m/s)
+        # that dominates the cross-track denominator at low speed, so at
+        # 1-3 m/s the cross-track time constant τ≈(k_soft+v)/(k·v) ran
+        # 0.75-3.3 s — sluggish and worse the slower the car went.
+        # Dropping k_soft to 1.5 makes τ≈0.4-0.7 s across the regime and
+        # far more speed-stable. The lower k_soft makes the controller
+        # more reactive to planner-yaw noise, so k_damp_steer=0.2 hedges
+        # the single-tick swings the 40 Hz slew limiter won't fully
+        # absorb. mode_manager pushes these per-mode via SetParameters
+        # before the configure transition; see
+        # pipeline/mode_manager/mode_manager/mode_registry.py.
         #   stanley_k:           cross-track gain (1/s scaling on cte)
         #   stanley_k_soft:      softening term (m/s) keeping the
         #                        cte denominator stable at v→0
@@ -329,10 +339,10 @@ class ControlNode(BaseLifecycleNode):
         #                        (rad / (rad/s)); 0.0 disables
         #   stanley_k_damp_steer: optional single-tick damping against
         #                         the previous command; 0.0 disables
-        self.declare_parameter("stanley_k", 4.0)
-        self.declare_parameter("stanley_k_soft", 6.0)
+        self.declare_parameter("stanley_k", 3.5)
+        self.declare_parameter("stanley_k_soft", 1.5)
         self.declare_parameter("stanley_k_yaw_rate", 0.0)
-        self.declare_parameter("stanley_k_damp_steer", 0.0)
+        self.declare_parameter("stanley_k_damp_steer", 0.2)
         # Kinematic-bicycle geometry. Used by every lateral controller
         # via the shared KinematicBicycle model. Default matches the
         # IFS-08 chassis (also the default inside bicycle.py).

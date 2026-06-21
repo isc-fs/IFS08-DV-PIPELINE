@@ -56,6 +56,10 @@ OdometryFilter make_stationary_filter() {
   OdometryFilter f;
   const Eigen::Vector3d accel_stationary(0.0, 0.0, kG);
   const Eigen::Vector3d gyro_stationary(0.0, 0.0, 0.0);
+  // rpm = 0 marks a genuine standstill so the bias calibration folds these
+  // samples (the gate requires wheel speed ≈ 0). latest_rpm sticks at 0, so
+  // one push before the loop covers the whole window.
+  f.push_rpm(0.0, 0.0);
   for (int i = 0; i < kCalibrationSamples; ++i) {
     f.push_imu(static_cast<double>(i) * kImuDt, accel_stationary, gyro_stationary);
     if (f.is_calibrated()) {
@@ -93,6 +97,7 @@ TEST(OdometryFilterCalibration, EstimatesAccelBias) {
   const double bias_x = 0.05;
   const Eigen::Vector3d accel(bias_x, 0.0, kG);
   const Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
+  f.push_rpm(0.0, 0.0);  // standstill — let the bias gate fold these samples
   for (int i = 0; i < 1500; ++i) {
     f.push_imu(i * kImuDt, accel, gyro);
   }
@@ -123,6 +128,7 @@ TEST(BiasEstimation, RecoversNonZeroAccelBias) {
   const double bx = 0.15, by = -0.10;
   const Eigen::Vector3d accel(bx, by, kG + 0.02);
   const Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
+  f.push_rpm(0.0, 0.0);  // standstill — let the bias gate fold these samples
   for (int i = 0; i < 1500; ++i) {
     f.push_imu(i * kImuDt, accel, gyro);
   }
@@ -144,6 +150,7 @@ TEST(BiasEstimation, RecoversGyroBias) {
   OdometryFilter f;
   const Eigen::Vector3d accel(0.0, 0.0, kG);
   const Eigen::Vector3d gyro(0.0, 0.0, 0.02);  // 0.02 rad/s bias
+  f.push_rpm(0.0, 0.0);  // standstill — let the bias gate fold these samples
   for (int i = 0; i < 1500; ++i) {
     f.push_imu(i * kImuDt, accel, gyro);
   }

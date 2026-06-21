@@ -55,6 +55,8 @@ void OdometryFilter::reset() {
   t_imu_last_.reset();
   latest_steering_rad_ = 0.0;
   have_steering_ = false;
+  latest_rpm_ms_ = 0.0;
+  have_rpm_ = false;
 }
 
 Eigen::Matrix<double, kStateDim, kStateDim> OdometryFilter::covariance() const {
@@ -123,11 +125,14 @@ void OdometryFilter::push_imu(
 
 
 void OdometryFilter::push_rpm(double /*t*/, double rpm) {
+  // Track wheel speed even before calibration completes so the bias
+  // calibration can gate on a genuine standstill (rpm ≈ 0).
+  latest_rpm_ms_ = rpm * params_.rpm_to_ms;
+  have_rpm_ = true;
   if (!calib_.completed) {
     return;
   }
-  const double z_vx = rpm * params_.rpm_to_ms;
-  correct_rpm(z_vx);
+  correct_rpm(latest_rpm_ms_);
   publish_state_view();
 }
 
@@ -290,17 +295,29 @@ void OdometryFilter::correct_nhc() {
   Eigen::Matrix<double, kStateDim, 1> K = P_ * H.transpose() / S;
 
   // Schmidt-Kalman partition: NHC observes VY only (and via accel
-  // integration mismatch, BA_Y). Pose (X, Y, THETA), yaw rate
-  // (OMEGA), forward velocity (VX), and gyro bias (BG_Z) are
-  // unobserved by this constraint. See correct_rpm for the full
-  // reasoning.
+  // integration mismatch, the LATERAL bias BA_Y). Pose (X, Y, THETA),
+  // yaw rate (OMEGA), forward velocity (VX), longitudinal bias (BA_X),
+  // and gyro bias (BG_Z) are unobserved by this constraint. See
+  // correct_rpm for the full reasoning.
+  //
+  // BA_X is zeroed here on purpose, even though P[VY, BA_X] is non-zero:
+  // that cross-covariance is a spurious by-product of the Coriolis
+  // coupling (BA_X → VX → −ω·vx → VY). Letting the vy pseudo-measurement
+  // pull BA_X through it is not a real observation of longitudinal bias.
+  // While /odom always has RPM, correct_rpm anchors BA_X every tick and
+  // the leak is masked; but in any IMU-only window (RPM dropout) the leak
+  // drives BA_X to ~−0.4 m/s², which feeds a phantom +0.4 m/s² into
+  // ax = accel_x − BA_X and runs vx away. Same partition reasoning as the
+  // BG_Z zeroing. Joseph form below keeps P symmetric/PSD for this
+  // hand-modified K.
   K(X)     = 0.0;
   K(Y)     = 0.0;
   K(THETA) = 0.0;
   K(OMEGA) = 0.0;
   K(VX)    = 0.0;
+  K(BA_X)  = 0.0;
   K(BG_Z)  = 0.0;
-  // K[VY], K[BA_X], K[BA_Y] preserved.
+  // K[VY], K[BA_Y] preserved.
 
   x_ += K * y;
   x_(THETA) = wrap_pi(x_(THETA));
@@ -399,27 +416,42 @@ void OdometryFilter::accumulate_calibration(
     calib_.t_first = t;
   }
 
-  calib_.accel_sum += accel;
-  calib_.gyro_sum  += gyro;
-  calib_.n_samples += 1;
+  // Only fold samples taken at a genuine standstill (wheel speed ≈ 0). A
+  // non-stationary window soaks real motion into the bias: a measured
+  // +5.2°/s turn during the 3 s window became a +5.2°/s gyro-bias error
+  // that drifted SLAM's heading until it lost lock (the true gyro bias is
+  // ~0). Require at least one RPM sample so a not-yet-seen rpm
+  // (latest_rpm_ms_ still 0) can't masquerade as a standstill.
+  if (have_rpm_ && std::abs(latest_rpm_ms_) <= params_.stationary_speed_ms) {
+    calib_.accel_sum += accel;
+    calib_.gyro_sum  += gyro;
+    calib_.n_samples += 1;
+  }
 
   if ((t - *calib_.t_first) < params_.calibration_seconds) {
     return;
   }
-  if (calib_.n_samples == 0) {
-    return;
+
+  if (calib_.n_samples > 0) {
+    const Eigen::Vector3d accel_mean =
+      calib_.accel_sum / static_cast<double>(calib_.n_samples);
+    const Eigen::Vector3d gyro_mean =
+      calib_.gyro_sum / static_cast<double>(calib_.n_samples);
+
+    // Accel bias: subtract gravity (assumed body-z because the car
+    // is stationary on a level surface at spawn). x/y biases are
+    // whatever's left.
+    calib_.accel_bias = accel_mean - Eigen::Vector3d(0.0, 0.0, kG);
+    calib_.gyro_bias  = gyro_mean;
+  } else {
+    // No standstill captured in the window (recorder opened late / bag
+    // starts mid-motion). Don't fabricate a bias from moving data —
+    // default to zero bias and level gravity. The gyro is accurate, so 0
+    // is far closer to truth than a contaminated mean, and RPM aiding
+    // anchors vx regardless of the accel bias.
+    calib_.accel_bias = Eigen::Vector3d::Zero();
+    calib_.gyro_bias  = Eigen::Vector3d::Zero();
   }
-
-  const Eigen::Vector3d accel_mean =
-    calib_.accel_sum / static_cast<double>(calib_.n_samples);
-  const Eigen::Vector3d gyro_mean =
-    calib_.gyro_sum / static_cast<double>(calib_.n_samples);
-
-  // Accel bias: subtract gravity (assumed body-z because the car
-  // is stationary on a level surface at spawn). x/y biases are
-  // whatever's left.
-  calib_.accel_bias = accel_mean - Eigen::Vector3d(0.0, 0.0, kG);
-  calib_.gyro_bias  = gyro_mean;
   calib_.completed  = true;
 
   // Anchor pose at origin once calibrated; biases land in the state.

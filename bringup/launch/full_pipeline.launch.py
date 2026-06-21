@@ -24,6 +24,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 from bringup.launch_common import (
     autonomy_actions,
@@ -76,6 +77,11 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("port",         default_value="41451"),
         DeclareLaunchArgument("mission_name", default_value="trackdrive"),
         DeclareLaunchArgument("track_name",   default_value="A"),
+        # Sim build: the bridge publishes /clock from UE sim time and every
+        # autonomy/management node runs on it. The bridge itself is the clock
+        # SOURCE and must stay on the wall clock (no use_sim_time below), or
+        # it would block waiting on the /clock it's supposed to produce.
+        DeclareLaunchArgument("use_sim_time",  default_value="true"),
 
         # ------------------ UE5 bridge ------------------
         Node(
@@ -90,6 +96,7 @@ def generate_launch_description() -> LaunchDescription:
                 "track_name":           LaunchConfiguration("track_name"),
                 "competition_mode":     False,
                 "lidar_viz_decimation": LIDAR_VIZ_DECIMATION,
+                # Deliberately NOT use_sim_time: this node is the /clock source.
             }],
         ),
 
@@ -103,7 +110,9 @@ def generate_launch_description() -> LaunchDescription:
                 "port":              8765,
                 "address":           "0.0.0.0",
                 "send_buffer_limit": 64 * 1024 * 1024,
-                "use_sim_time":      False,
+                # Match the pipeline clock so timestamps line up in the viewer.
+                "use_sim_time":      ParameterValue(
+                    LaunchConfiguration("use_sim_time"), value_type=bool),
                 "topic_whitelist":   _FOXGLOVE_TOPIC_WHITELIST,
                 "use_compression":   True,
             }],
