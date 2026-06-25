@@ -45,25 +45,9 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional
 
-import numpy as np
-
-import rclpy
-from node_base.base_lifecycle_node import BaseLifecycleNode
-from rclpy.lifecycle import TransitionCallbackReturn, State as LifecycleState
-from rclpy.qos import (
-    QoSDurabilityPolicy,
-    QoSHistoryPolicy,
-    QoSProfile,
-    QoSReliabilityPolicy,
-)
-
 import gtsam
-from geometry_msgs.msg import TransformStamped
-from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
-from std_msgs.msg import Bool, Float32
-from tf2_ros import TransformBroadcaster
-from visualization_msgs.msg import Marker, MarkerArray
+import numpy as np
+import rclpy
 
 # color_classifier deleted: SLAM is position-only, no per-cone colour
 # anywhere. Visualization renders all landmarks with the same colour.
@@ -71,6 +55,21 @@ from cone_slam.data_association import DISTANCE_GATE_M, Observation, associate
 from cone_slam.factor_graph import FactorGraph, ScanResult
 from cone_slam.imu_preintegrator import ImuPreintegrator, ImuSample
 from cone_slam.landmark_db import LandmarkDb
+from geometry_msgs.msg import TransformStamped
+from nav_msgs.msg import Odometry
+from node_base.base_lifecycle_node import BaseLifecycleNode
+from rclpy.lifecycle import State as LifecycleState
+from rclpy.lifecycle import TransitionCallbackReturn
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSHistoryPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+)
+from sensor_msgs.msg import Imu
+from std_msgs.msg import Bool, Float32
+from tf2_ros import TransformBroadcaster
+from visualization_msgs.msg import Marker, MarkerArray
 
 
 def _odom_to_pose3(msg: Odometry) -> "gtsam.Pose3":
@@ -86,7 +85,6 @@ def _odom_to_pose3(msg: Odometry) -> "gtsam.Pose3":
 # compute_map_to_odom lives in cone_slam.tf_math (pure-Python helper,
 # no rclpy import, unit-testable). Re-imported here for the call site.
 from cone_slam.tf_math import compute_map_to_odom  # noqa: E402, F401
-
 
 CALIBRATION_SECONDS = 3.0
 
@@ -302,6 +300,35 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # 0 disables the gate (legacy behaviour).
         self.declare_parameter("min_observations_for_publish", 3)
 
+        # Radius (m) around the car within which landmarks are PUBLISHED
+        # to /Conos. The full map stays in the iSAM2 graph (loop closure
+        # still uses every landmark) — this only crops the per-scan
+        # MarkerArray we serialize out. Without it, /Conos publishing is
+        # O(map): SLAM_PROF showed the publish stage growing to 50-84 ms
+        # at map=212 (the dominant per-scan cost, > the 100 ms / 10 Hz
+        # budget — the real "path falls behind in corners" mechanism).
+        # The only /Conos consumer is path_planning, which is event-
+        # driven on the topic and internally sorts cones outward from the
+        # car, so it only needs the local track ahead; far/behind cones
+        # are pure overhead. Cropping makes the publish cost O(local) ≈
+        # constant regardless of laps driven, at full 10 Hz cadence.
+        # Default 25 m: ~2-3× a path planner's lookahead, covers cones
+        # ahead and a margin behind. Set to 0 to disable (publish all).
+        self.declare_parameter("cone_map_publish_radius_m", 25.0)
+
+        # KEYFRAME interval (in scans) for the full cone map on
+        # /Conos_full. /Conos_full is published every scan as a delta
+        # (only new/moved cones — see _publish_full_cone_map), so the
+        # per-scan cost is O(changed), not O(map). Every N scans we instead
+        # send a keyframe (DELETEALL + the whole map) to resync a late-
+        # joining viewer (VOLATILE QoS, no history) and recover any dropped
+        # frames — that one is O(map). Keep it brisk enough that a freshly-
+        # connected Foxglove fills in quickly but rare enough that the
+        # O(map) build doesn't land on the loop-closure relinearization
+        # burst. Default 50 (~5 s at 10 Hz). 0 disables keyframes (deltas
+        # only; a viewer that misses the initial spawn never recovers).
+        self.declare_parameter("cone_map_full_publish_every_n_scans", 50)
+
         # Cascade-skip recovery. After this many consecutive scans
         # rejected by the cascade-spike gate, force-accept the next
         # scan instead of skipping it. The theory: 10 scans in a row
@@ -327,6 +354,49 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # on transient ~0.2-0.3 s DA bursts.
         self.declare_parameter("cascade_skip_recovery_threshold", 5)
 
+        # --- Loop-closure mapping freeze -------------------------------
+        # Once the car completes a lap, the track is fully mapped: every
+        # subsequent observation should re-associate to an existing
+        # landmark, never spawn a new one. Freezing landmark creation at
+        # loop closure kills the duplicate-spawn amplifier — when the
+        # loop-closure relinearization burst leaves /slam/pose briefly
+        # stale, a transient bad DA can no longer bloat the map with
+        # phantom cones (the failure that ran the map 239→359 and drove
+        # the car off track). Matched cone factors still apply, so the
+        # known map keeps correcting pose; unmatched observations are
+        # simply dropped instead of spawned.
+        self.declare_parameter("freeze_mapping_on_loop_close", True)
+        # Loop closure is declared when the pose returns within
+        # loop_close_radius_m of the origin (SLAM frame origin == car
+        # spawn ≈ start/finish) AFTER having been at least
+        # loop_close_min_radius_m away (proof a real lap happened, not
+        # just start-line jitter).
+        self.declare_parameter("loop_close_radius_m", 6.0)
+        self.declare_parameter("loop_close_min_radius_m", 15.0)
+
+        # --- Localization-only after loop closure ----------------------
+        # Once mapping is frozen the map is final, so we stop growing the
+        # smoothed iSAM2 graph and switch each scan to a fixed-size
+        # pose-only solve against the frozen landmarks (FactorGraph.
+        # localize). This removes the loop-closure relinearization burst
+        # (the 150–250 ms scans that stalled the pose feed and let the
+        # car drift off track): there is no graph growth and no
+        # relinearization, so per-scan cost stays flat and constant for
+        # the rest of the run. The pose prior anchors the solve at the
+        # EKF-odom motion prediction; cone BearingRange factors correct
+        # accumulated drift on top of it. Set False to keep the legacy
+        # full-SLAM update after closure (still benefits from the
+        # mapping freeze, but the burst returns).
+        self.declare_parameter("localization_only_after_loop_close", True)
+        # Pose-prior sigmas for the localization solve. Loose enough that
+        # cones can pull the pose to correct drift, tight enough to dead-
+        # reckon on the prediction when cones are sparse/rejected. Mirror
+        # the EKF-odom motion confidence (xy ~5 cm/scan, yaw ~1°), widened
+        # to absolute-pose scale since this anchors the absolute pose, not
+        # a between-step delta.
+        self.declare_parameter("loc_prior_sigma_xy_m", 0.30)
+        self.declare_parameter("loc_prior_sigma_yaw_rad", 0.05)
+
         # --- GT-cone debug mode (sim only) -----------------------------
         # When `debug_gt_cones` is true, SLAM ignores the *perceived*
         # cone positions on /Conos_raw and instead synthesizes body-frame
@@ -346,8 +416,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # docker-compose can carry it across container restarts (a bare
         # `ros2 param set` is lost on relaunch). An explicit launch/CLI
         # parameter still overrides the env default.
-        self.declare_parameter(
-            "debug_gt_cones", _env_truthy("DV_SLAM_GT_CONES"))
+        self.declare_parameter("debug_gt_cones", _env_truthy("DV_SLAM_GT_CONES"))
         # FOV/range gate applied to the GT cones so SLAM sees roughly the
         # same cone *set* a real LiDAR scan would (not the whole track).
         # Defaults mirror the sim LiDAR (settings.json: ±60° H-FOV,
@@ -381,6 +450,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._obs_last_log_ns = 0
 
         import time as _time
+
         self._time = _time
         self._latest_rpm: Optional[float] = None
         self._latest_rpm_t: Optional[float] = None
@@ -423,6 +493,13 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._tf_broadcaster = None
         self._state_pub = None
         self._cones_pub = None
+        self._cones_full_pub = None
+        # /Conos_full delta state: last published position per landmark id.
+        # We publish only new/moved cones each scan and let the viewer hold
+        # the rest (markers persist by id until replaced/deleted), so the
+        # cost is O(changed) not O(map). Reset on activate so the first
+        # publish of a run is a full keyframe. See _publish_full_cone_map.
+        self._full_pub_last: dict[int, tuple] = {}
         self._gt_aligned_pub = None
         self._gt_error_pub = None
         # /slam/finished publisher (#384). Always emits default-false
@@ -465,13 +542,21 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._obs_n_scans = 0
         self._obs_last_log_ns = 0
         self._consecutive_cascade_skips = 0
+        # Loop-closure mapping freeze (see params + _update_loop_closure).
+        # _mapping_frozen latches true once a lap is detected; reset when a
+        # fresh run anchors at origin. _loop_max_dist tracks how far the
+        # pose has ever been from origin, the "a real lap happened" proof.
+        self._mapping_frozen = False
+        self._loop_max_dist = 0.0
+        # Monotonic scan counter for the post-freeze localization path
+        # (DA staleness gating / diagnostics). Continues from the frozen
+        # graph step since iSAM2's own step stops advancing once frozen.
+        self._loc_scan = 0
 
     # ------------------------------------------------------------------
     # Lifecycle transitions
     # ------------------------------------------------------------------
-    def on_configure(
-        self, state: LifecycleState
-    ) -> TransitionCallbackReturn:
+    def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         ret = super().on_configure(state)
         if ret != TransitionCallbackReturn.SUCCESS:
             return ret
@@ -485,7 +570,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         if motion_model not in ("odom", "imu"):
             self.get_logger().warn(
                 f"motion_model='{motion_model}' invalid — falling back to "
-                f"'odom' (EKF-as-motion-model)")
+                f"'odom' (EKF-as-motion-model)"
+            )
             motion_model = "odom"
         self._motion_model = motion_model
         if self._motion_model == "odom":
@@ -493,11 +579,13 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 "motion_model=odom — EKF /odom delta is the primary "
                 "motion constraint; IMU preintegration / RPM-prior / "
                 "steering factors are DISABLED (the EKF already fuses "
-                "them).")
+                "them)."
+            )
         else:
             self.get_logger().info(
                 "motion_model=imu — legacy IMU-preintegration motion "
-                "model with soft /odom backstop.")
+                "model with soft /odom backstop."
+            )
 
         self._debug_gt_cones = bool(self.get_parameter("debug_gt_cones").value)
         if self._debug_gt_cones:
@@ -505,7 +593,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 "DEBUG_GT_CONES ENABLED — feeding SLAM perfect cone "
                 "positions from /testing_only/track projected through the "
                 "GT pose. /Conos_raw is the scan trigger only; perceived "
-                "cone xy are IGNORED. SIM-ONLY diagnostic; never run on car.")
+                "cone xy are IGNORED. SIM-ONLY diagnostic; never run on car."
+            )
 
         # Components + run-memory: start from a clean slate.
         self._reset_run_memory()
@@ -518,12 +607,14 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # have body_y near the threshold and get locked the wrong colour, the
         # hypothesis is confirmed.
         import os as _os
+
         self._lm_capture_path = _os.environ.get("DV_SLAM_LANDMARK_CAPTURE", "")
         if self._lm_capture_path:
             try:
                 self._lm_capture_fh = open(self._lm_capture_path, "w")
                 self.get_logger().info(
-                    f"DV_SLAM_LANDMARK_CAPTURE → {self._lm_capture_path}")
+                    f"DV_SLAM_LANDMARK_CAPTURE → {self._lm_capture_path}"
+                )
             except OSError as ex:
                 self.get_logger().error(f"landmark capture open failed: {ex}")
                 self._lm_capture_fh = None
@@ -534,10 +625,23 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # implementation. Frame_id flipped from odom → map (pose is
         # SLAM-absolute, drift-corrected; map→odom→base_link chain
         # resolves to the same value via TF).
-        self._state_pub = self.create_lifecycle_publisher(
-            Odometry, "/slam/pose", 10)
-        self._cones_pub = self.create_lifecycle_publisher(
-            MarkerArray, "/Conos", 10)
+        self._state_pub = self.create_lifecycle_publisher(Odometry, "/slam/pose", 10)
+        self._cones_pub = self.create_lifecycle_publisher(MarkerArray, "/Conos", 10)
+        # Full (uncropped) cone map for visualization only. /Conos is
+        # cropped to a local radius for the planner (per-scan O(local)
+        # cost); this topic carries the WHOLE map so Foxglove/RViz can
+        # show the complete track. Published at low rate (every N scans —
+        # see _publish_full_cone_map). QoS deliberately matches /Conos
+        # (RELIABLE + VOLATILE, depth 10): the Foxglove/Lichtblick bridge
+        # renders /Conos fine, but TRANSIENT_LOCAL (latched) topics
+        # frequently fail to subscribe/render through the bridge (it left
+        # /Conos_full at Subscription count 0 and a blank panel). VOLATILE
+        # means a late-joining viewer waits one publish interval (≤ ~1 s)
+        # for the next full-map frame instead of getting it instantly —
+        # a fine trade for actually showing up. Not a planner input.
+        self._cones_full_pub = self.create_lifecycle_publisher(
+            MarkerArray, "/Conos_full", 10
+        )
         # GT-aligned diagnostic odometry. Same Odometry shape as
         # /slam/pose but containing the ground truth re-expressed in
         # SLAM's anchored body-frame world. SLAM-vs-GT divergence in
@@ -547,9 +651,11 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # namespace, separate from /slam/* which is the production
         # consumer surface.
         self._gt_aligned_pub = self.create_lifecycle_publisher(
-            Odometry, "/cone_slam/gt_aligned", 10)
+            Odometry, "/cone_slam/gt_aligned", 10
+        )
         self._gt_error_pub = self.create_lifecycle_publisher(
-            Float32, "/cone_slam/gt_error_m", 10)
+            Float32, "/cone_slam/gt_error_m", 10
+        )
 
         # /slam/finished — mission-completion signal consumed by
         # mission_control_node (#384). Latched + default-false so a
@@ -568,7 +674,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         )
         self._finished_pub = self.create_lifecycle_publisher(
-            Bool, "/slam/finished", finished_qos)
+            Bool, "/slam/finished", finished_qos
+        )
 
         # TF broadcaster — non-lifecycle (tf2 doesn't ship lifecycle
         # variants). Used to publish the dynamic `map → odom` drift
@@ -581,13 +688,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
 
         return TransitionCallbackReturn.SUCCESS
 
-    def on_activate(
-        self, state: LifecycleState
-    ) -> TransitionCallbackReturn:
+    def on_activate(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(
             "on_activate: subscriptions + state-machine reset "
             f"(map='{self.map_frame}', odom='{self.odom_frame}', "
-            f"base='{self.base_frame}')")
+            f"base='{self.base_frame}')"
+        )
 
         # Reset state machine and runtime state. A deactivate→activate
         # cycle should look like a fresh run, not a resumed one — the
@@ -612,13 +718,13 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             depth=2000,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
-        self._sub_imu = self.create_subscription(
-            Imu, "/imu", self._on_imu, imu_qos)
+        self._sub_imu = self.create_subscription(Imu, "/imu", self._on_imu, imu_qos)
         # /Conos_raw is the scan trigger AND the source of cone
         # observations. Cone_Detection publishes ~10 Hz, in base_link
         # frame, with cone height encoded on marker.scale.z.
         self._sub_cones = self.create_subscription(
-            MarkerArray, "/Conos_raw", self._on_cones, 10)
+            MarkerArray, "/Conos_raw", self._on_cones, 10
+        )
 
         # /motor_rpm — bridge publishes at 100 Hz from getCarState().
         # We don't fire on every sample; we cache the latest and consume
@@ -632,7 +738,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             durability=QoSDurabilityPolicy.VOLATILE,
         )
         self._sub_rpm = self.create_subscription(
-            Float32, "/motor_rpm", self._on_rpm, rpm_qos)
+            Float32, "/motor_rpm", self._on_rpm, rpm_qos
+        )
 
         # /steering_angle — bridge publishes the LWS-derived front-wheel
         # angle in radians. Same caching pattern as RPM: latest sample
@@ -640,7 +747,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # BetweenFactor (ω = (vx/L)·tan(δ)) which constrains yaw rate
         # during cone-poor windows, including cascade-spike skips.
         self._sub_steering = self.create_subscription(
-            Float32, "/steering_angle", self._on_steering, rpm_qos)
+            Float32, "/steering_angle", self._on_steering, rpm_qos
+        )
 
         # /testing_only/odom — sim ground truth, used only for the
         # GT-aligned diagnostic. The bridge encodes this in ENU
@@ -658,7 +766,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             durability=QoSDurabilityPolicy.VOLATILE,
         )
         self._sub_gt = self.create_subscription(
-            Odometry, "/testing_only/odom", self._on_gt_odom, gt_qos)
+            Odometry, "/testing_only/odom", self._on_gt_odom, gt_qos
+        )
 
         # /odom from sim_supervisor (Phase 2 — #382). Cached and
         # consumed in _publish_map_to_odom on every scan tick to
@@ -673,7 +782,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             durability=QoSDurabilityPolicy.VOLATILE,
         )
         self._sub_supervisor_odom = self.create_subscription(
-            Odometry, "/odom", self._on_supervisor_odom, odom_qos)
+            Odometry, "/odom", self._on_supervisor_odom, odom_qos
+        )
 
         # /testing_only/track — latched full-track GT layout, only
         # subscribed in GT-cone debug mode. The bridge publishes it
@@ -691,7 +801,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
             )
             self._sub_track = self.create_subscription(
-                Track, "/testing_only/track", self._on_track, track_qos)
+                Track, "/testing_only/track", self._on_track, track_qos
+            )
 
         # Latch /slam/finished=false on activate (#384 stub). The
         # publisher exists from on_configure; this fires the default
@@ -702,13 +813,17 @@ class ConeGraphSlamNode(BaseLifecycleNode):
 
         return super().on_activate(state)
 
-    def on_deactivate(
-        self, state: LifecycleState
-    ) -> TransitionCallbackReturn:
+    def on_deactivate(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info("on_deactivate: dropping subscriptions")
-        for sub in (self._sub_imu, self._sub_cones,
-                    self._sub_rpm, self._sub_steering, self._sub_gt,
-                    self._sub_supervisor_odom, self._sub_track):
+        for sub in (
+            self._sub_imu,
+            self._sub_cones,
+            self._sub_rpm,
+            self._sub_steering,
+            self._sub_gt,
+            self._sub_supervisor_odom,
+            self._sub_track,
+        ):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_imu = None
@@ -729,13 +844,17 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._reset_run_memory()
         return super().on_deactivate(state)
 
-    def on_cleanup(
-        self, state: LifecycleState
-    ) -> TransitionCallbackReturn:
+    def on_cleanup(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info("on_cleanup: destroying publishers + components")
-        for sub in (self._sub_imu, self._sub_cones,
-                    self._sub_rpm, self._sub_steering, self._sub_gt,
-                    self._sub_supervisor_odom, self._sub_track):
+        for sub in (
+            self._sub_imu,
+            self._sub_cones,
+            self._sub_rpm,
+            self._sub_steering,
+            self._sub_gt,
+            self._sub_supervisor_odom,
+            self._sub_track,
+        ):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_imu = None
@@ -746,13 +865,20 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._sub_supervisor_odom = None
         self._sub_track = None
 
-        for pub in (self._state_pub, self._cones_pub,
-                    self._gt_aligned_pub, self._gt_error_pub,
-                    self._finished_pub):
+        for pub in (
+            self._state_pub,
+            self._cones_pub,
+            self._cones_full_pub,
+            self._gt_aligned_pub,
+            self._gt_error_pub,
+            self._finished_pub,
+        ):
             if pub is not None:
                 self.destroy_publisher(pub)
         self._state_pub = None
         self._cones_pub = None
+        self._cones_full_pub = None
+        self._full_pub_last = {}
         self._gt_aligned_pub = None
         self._gt_error_pub = None
         self._finished_pub = None
@@ -780,9 +906,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
 
         return super().on_cleanup(state)
 
-    def on_shutdown(
-        self, state: LifecycleState
-    ) -> TransitionCallbackReturn:
+    def on_shutdown(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info("on_shutdown")
         # Reuse cleanup logic — shutdown after cleanup is a no-op.
         if self._lm_capture_fh is not None:
@@ -820,8 +944,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # _finish_calibration to snapshot one, take the first sample
         # that does arrive as the anchor. Off by < 100 ms typically;
         # immaterial for a SLAM-drift visualisation.
-        if (self._state == State.SLAM_RUNNING
-                and self._gt_init_pose is None):
+        if self._state == State.SLAM_RUNNING and self._gt_init_pose is None:
             self._gt_init_pose = _odom_to_pose3(msg)
             self.get_logger().info(
                 f"GT alignment anchor (late): "
@@ -841,8 +964,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         if not track:
             return
         self._latest_track = [
-            (float(c.location.x), float(c.location.y), int(c.color))
-            for c in track
+            (float(c.location.x), float(c.location.y), int(c.color)) for c in track
         ]
 
     def _gt_observations(self) -> list[Observation]:
@@ -882,40 +1004,51 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 continue
             if abs(np.arctan2(by, bx)) > hfov + 1e-9:
                 continue
-            out.append(Observation(
-                body_x=float(bx), body_y=float(by), height=0.0, sigma_xy=-1.0))
+            out.append(
+                Observation(
+                    body_x=float(bx), body_y=float(by), height=0.0, sigma_xy=-1.0
+                )
+            )
         return out
 
     # ----- IMU callback ------------------------------------------------------
 
     def _on_imu(self, msg: Imu) -> None:
         t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        accel = np.array([
-            msg.linear_acceleration.x,
-            msg.linear_acceleration.y,
-            msg.linear_acceleration.z,
-        ])
-        gyro = np.array([
-            msg.angular_velocity.x,
-            msg.angular_velocity.y,
-            msg.angular_velocity.z,
-        ])
+        accel = np.array(
+            [
+                msg.linear_acceleration.x,
+                msg.linear_acceleration.y,
+                msg.linear_acceleration.z,
+            ]
+        )
+        gyro = np.array(
+            [
+                msg.angular_velocity.x,
+                msg.angular_velocity.y,
+                msg.angular_velocity.z,
+            ]
+        )
         # Tag whether the car is at a genuine standstill (wheel speed ~0) so
         # the INIT bias calibration only averages stationary samples. Before
         # the first /motor_rpm arrives (_latest_rpm is None) we can't confirm a
         # standstill, so treat the sample as moving — better to default the bias
         # to zero than to soak unknown motion into it (see estimate_bias).
-        stationary = (self._latest_rpm is not None
-                      and abs(self._latest_rpm) <= STATIONARY_SPEED_MS)
+        stationary = (
+            self._latest_rpm is not None
+            and abs(self._latest_rpm) <= STATIONARY_SPEED_MS
+        )
         self._preint.push_sample(
-            ImuSample(t=t, accel=accel, gyro=gyro, stationary=stationary))
+            ImuSample(t=t, accel=accel, gyro=gyro, stationary=stationary)
+        )
 
         if self._state == State.INIT_WAITING_IMU:
             self._calib_started_t = t
             self._state = State.INIT_CALIBRATING
             self.get_logger().info(
                 "first IMU received — INIT_CALIBRATING (stationary, "
-                f"{CALIBRATION_SECONDS:.1f} s)")
+                f"{CALIBRATION_SECONDS:.1f} s)"
+            )
 
         elif self._state == State.INIT_CALIBRATING:
             if self._preint.has_enough_for_calibration(CALIBRATION_SECONDS):
@@ -930,7 +1063,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             f"gyro_bias=({gyro_bias[0]:+.5f},{gyro_bias[1]:+.5f},"
             f"{gyro_bias[2]:+.5f}) rad/s, "
             f"gravity_body=({gravity_body[0]:+.3f},{gravity_body[1]:+.3f},"
-            f"{gravity_body[2]:+.3f}) m/s²")
+            f"{gravity_body[2]:+.3f}) m/s²"
+        )
 
         # Anchor x_0 at world origin, stationary.
         bias = gtsam.imuBias.ConstantBias(accel_bias, gyro_bias)
@@ -941,6 +1075,11 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         )
         self._latest_result = self._graph.latest()
         self._state = State.SLAM_RUNNING
+        # Fresh run: re-arm loop-closure detection (graph is anchored at
+        # origin, so distance-from-origin starts at 0).
+        self._mapping_frozen = False
+        self._loop_max_dist = 0.0
+        self._loc_scan = 0
         self.get_logger().info("SLAM_RUNNING — pose graph anchored at origin")
 
         # Snapshot the GT pose at this instant. SLAM's pose at t=0 is
@@ -959,7 +1098,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         else:
             self.get_logger().warn(
                 "no /testing_only/odom received before SLAM_RUNNING — "
-                "GT-aligned diagnostic disabled this run")
+                "GT-aligned diagnostic disabled this run"
+            )
 
     # ----- Cone observation callback (scan trigger) -------------------------
 
@@ -974,6 +1114,10 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # processing takes — the signal that distinguishes a real-time
         # backlog (proc time climbs into a corner) from a clean solve.
         self._on_cones_t0 = self._time.monotonic()
+        # Per-scan profiling: zero the iSAM2 timers and start a fresh set of
+        # wall-clock marks for the SLAM_PROF breakdown (see _emit_slam_prof).
+        self._graph.reset_prof()
+        self._prof_marks = {"entry": self._on_cones_t0}
 
         # MarkerArray has no top-level header, but every Cone_Detection
         # marker carries the originating LiDAR scan's header.stamp.
@@ -1028,11 +1172,23 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 self._publish_state(stamp, self._latest_result)
                 self._publish_cone_map(stamp)
                 return
-            between_pose = (self._prev_scan_odom_pose.inverse()
-                            .compose(cur_odom_pose))
+            between_pose = self._prev_scan_odom_pose.inverse().compose(cur_odom_pose)
             v_world = self._odom_world_velocity(self._latest_supervisor_odom)
+            # Localization-only fork: once the lap is closed and mapping is
+            # frozen, stop growing the smoothed graph. Solve a fixed-size
+            # pose-only problem against the frozen map instead — no iSAM2
+            # relinearization, so the loop-closure latency burst is gone.
+            # Branch BEFORE stage_odom_motion_step so X/V/B are never
+            # appended to iSAM2 (the graph stays frozen at the closure step).
+            if self._mapping_frozen and bool(self.get_parameter(
+                    "localization_only_after_loop_close").value):
+                self._prev_scan_odom_pose = cur_odom_pose
+                predicted_pose = self._latest_result.pose.compose(between_pose)
+                self._localize_scan(msg, stamp, predicted_pose, v_world)
+                return
             predicted_pose = self._graph.stage_odom_motion_step(
-                between_pose, self._latest_result, v_world)
+                between_pose, self._latest_result, v_world
+            )
             self._prev_scan_odom_pose = cur_odom_pose
         else:
             # Legacy IMU-preintegration motion model (motion_model=imu).
@@ -1050,14 +1206,16 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             # (the cascade root cause). Skipped if RPM is stale or hasn't
             # arrived yet — the prior would be misleading rather than
             # helpful in that regime.
-            rpm_fresh = (self._latest_rpm is not None
-                         and self._latest_rpm_t is not None
-                         and (self._time.monotonic() - self._latest_rpm_t)
-                         <= RPM_STALE_S)
+            rpm_fresh = (
+                self._latest_rpm is not None
+                and self._latest_rpm_t is not None
+                and (self._time.monotonic() - self._latest_rpm_t) <= RPM_STALE_S
+            )
             if rpm_fresh:
                 # Use the same predicted yaw we'll use for DA below.
                 _nav_state = gtsam.NavState(
-                    self._latest_result.pose, self._latest_result.velocity)
+                    self._latest_result.pose, self._latest_result.velocity
+                )
                 _pred_state = pim.predict(_nav_state, self._latest_result.bias)
                 _pred_yaw = _pred_state.pose().rotation().yaw()
                 self._graph.stage_velocity_prior(
@@ -1082,8 +1240,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 )
                 if steering_fresh:
                     _prev_yaw = self._latest_result.pose.rotation().yaw()
-                    _imu_dyaw = (
-                        _pred_yaw - _prev_yaw + np.pi) % (2 * np.pi) - np.pi
+                    _imu_dyaw = (_pred_yaw - _prev_yaw + np.pi) % (2 * np.pi) - np.pi
                     _gate_state = self._graph.stage_steering_between(
                         dt=_dt,
                         v_body_long=self._latest_rpm,
@@ -1121,8 +1278,9 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             if self._latest_supervisor_odom is not None:
                 cur_odom_pose = _odom_to_pose3(self._latest_supervisor_odom)
                 if self._prev_scan_odom_pose is not None:
-                    between_pose = (self._prev_scan_odom_pose.inverse()
-                                    .compose(cur_odom_pose))
+                    between_pose = self._prev_scan_odom_pose.inverse().compose(
+                        cur_odom_pose
+                    )
                     self._graph.stage_odom_between(between_pose)
                 self._prev_scan_odom_pose = cur_odom_pose
 
@@ -1130,9 +1288,9 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             # and the pose-jump sanity check (we've staged X(k) but not
             # committed yet).
             nav_state = gtsam.NavState(
-                self._latest_result.pose, self._latest_result.velocity)
-            predicted_pose = pim.predict(
-                nav_state, self._latest_result.bias).pose()
+                self._latest_result.pose, self._latest_result.velocity
+            )
+            predicted_pose = pim.predict(nav_state, self._latest_result.bias).pose()
 
         # Parse cone observations from /Conos_raw markers. In GT-cone
         # debug mode the perceived positions are discarded and replaced
@@ -1154,6 +1312,10 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         pred_x = predicted_pose.x()
         pred_y = predicted_pose.y()
         pred_yaw = predicted_pose.rotation().yaw()
+
+        # Loop-closure check: once a lap is detected, freeze landmark
+        # spawning for the rest of the run (track is fully mapped).
+        self._update_loop_closure(pred_x, pred_y)
 
         # Mahalanobis DA stays disabled. Three variants tested on
         # 2026-04-29:
@@ -1177,9 +1339,16 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # gates for landmarks that haven't been associated recently —
         # the recovery mechanism for the rejection bursts triggered
         # by improvement A.
+        self._prof_marks["assoc0"] = self._time.monotonic()
         matches = associate(
-            observations, pred_x, pred_y, pred_yaw, self._db,
-            current_step=self._graph.step)
+            observations,
+            pred_x,
+            pred_y,
+            pred_yaw,
+            self._db,
+            current_step=self._graph.step,
+        )
+        self._prof_marks["assoc1"] = self._time.monotonic()
 
         # Pre-stage cascade-trigger detection. The cascade signature
         # observed on trackA_manual_001602 around t≈80 s is: a single
@@ -1206,8 +1375,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # pose dead-reckoning during the skipped window; drift over a
         # few hundred ms of IMU-only update is much smaller than over
         # the same window of pose-freeze.
-        n_new_pre  = sum(1 for m in matches if m.landmark_id == -1)
-        total_pre  = len(matches)
+        n_new_pre = sum(1 for m in matches if m.landmark_id == -1)
+        total_pre = len(matches)
         # Two complementary triggers, both gated on step > 30
         # (post-discovery — the local cone map is mature, every
         # observation should be re-association of a known landmark
@@ -1227,11 +1396,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         #      scans at typical speeds — anything ≥ N=3 in one scan
         #      is anomalous. Default 3, tunable via parameter, 0
         #      disables.
-        n_count_thresh = int(self.get_parameter(
-            "cascade_spike_new_count_threshold").value)
+        n_count_thresh = int(
+            self.get_parameter("cascade_spike_new_count_threshold").value
+        )
         triggered, reasons = cascade_spike_triggered(
-            n_new_pre, total_pre, self._graph.step,
-            count_threshold=n_count_thresh)
+            n_new_pre, total_pre, self._graph.step, count_threshold=n_count_thresh
+        )
 
         # Cascade-skip recovery: if we've been skipping continuously
         # for too long, force-accept this scan. Long-stretch skips
@@ -1241,10 +1411,13 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # and the /slam/pose feed freezes for the controller.
         if triggered:
             self._consecutive_cascade_skips += 1
-            recovery_thresh = int(self.get_parameter(
-                "cascade_skip_recovery_threshold").value)
-            if (recovery_thresh > 0
-                    and self._consecutive_cascade_skips > recovery_thresh):
+            recovery_thresh = int(
+                self.get_parameter("cascade_skip_recovery_threshold").value
+            )
+            if (
+                recovery_thresh > 0
+                and self._consecutive_cascade_skips > recovery_thresh
+            ):
                 self.get_logger().warn(
                     f"CASCADE_SKIP_RECOVERY: force-accepting scan "
                     f"after {self._consecutive_cascade_skips} "
@@ -1257,24 +1430,27 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 triggered = False  # fall through to the spawn path
 
         if triggered:
-            motion_label = ("EKF-odom" if self._motion_model == "odom"
-                            else "IMU")
+            motion_label = "EKF-odom" if self._motion_model == "odom" else "IMU"
             self.get_logger().warn(
                 f"skip cone factors: DA-failure spike "
                 f"[{', '.join(reasons)}] "
                 f"(obs={total_pre} new={n_new_pre} "
-                f"assoc={total_pre - n_new_pre}) — {motion_label}-only update")
+                f"assoc={total_pre - n_new_pre}) — {motion_label}-only update"
+            )
             # Commit the staged motion factor(s) (the only things staged
             # at this point — cone factors are staged only after this
             # check). iSAM2 advances pose by the motion model's
             # prediction; no cone constraints applied this scan.
             result = self._graph.commit()
+            self._prof_marks["commit"] = self._time.monotonic()
             self._latest_result = result
             self._preint.update_bias(result.bias)
             self._db.update_from_estimate(self._graph.landmark_position)
+            self._prof_marks["dbupd"] = self._time.monotonic()
             self._publish_map_to_odom(stamp, result)
             self._publish_state(stamp, result)
             self._publish_cone_map(stamp)
+            self._emit_slam_prof("skip", len(observations))
             per_scan["skipped"] = 1
             self._accumulate_obs_diag(per_scan)
             return
@@ -1289,15 +1465,25 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # veto: refuse to spawn a landmark within
         # `new_landmark_proximity_veto_m` of any existing one (cascade
         # guard — see parameter docstring).
-        veto_m = float(self.get_parameter(
-            "new_landmark_proximity_veto_m").value)
+        veto_m = float(self.get_parameter("new_landmark_proximity_veto_m").value)
         n_new = 0
         n_assoc = 0
         n_vetoed = 0
+        n_frozen_drop = 0
+        self._prof_marks["spawn0"] = self._time.monotonic()
         for o, m in zip(observations, matches):
             if m.landmark_id == -1:
+                # Mapping frozen post-loop-closure: the track is fully
+                # mapped, so an unmatched observation is far more likely a
+                # transient DA miss (stale pose during the relinearization
+                # burst) than a genuinely new cone. Drop it instead of
+                # spawning — no phantom landmark can bloat the map.
+                if self._mapping_frozen:
+                    n_frozen_drop += 1
+                    continue
                 world_xyz = self._body_to_world(
-                    o.body_x, o.body_y, pred_x, pred_y, pred_yaw)
+                    o.body_x, o.body_y, pred_x, pred_y, pred_yaw
+                )
                 if veto_m > 0.0:
                     d_near = self._db.nearest_xy_distance_m(world_xyz)
                     if d_near < veto_m:
@@ -1306,44 +1492,63 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 lm = self._db.create(world_xyz, self._graph.step)
                 self._graph.stage_new_landmark(lm.id, world_xyz)
                 self._graph.stage_cone_observation(
-                    lm.id, o.body_x, o.body_y, o.sigma_xy)
+                    lm.id, o.body_x, o.body_y, o.sigma_xy
+                )
                 n_new += 1
                 if self._lm_capture_fh is not None:
                     try:
-                        import math as _math, json as _json
+                        import json as _json
+                        import math as _math
+
                         rng = _math.hypot(o.body_x, o.body_y)
-                        bearing_deg = _math.degrees(
-                            _math.atan2(o.body_y, o.body_x))
-                        self._lm_capture_fh.write(_json.dumps({
-                            "id": lm.id,
-                            "step": self._graph.step,
-                            "body_x": o.body_x,
-                            "body_y": o.body_y,
-                            "range_m": rng,
-                            "bearing_deg": bearing_deg,
-                            "height": o.height,
-                            "pose_yaw_deg": _math.degrees(pred_yaw),
-                            "world_xyz": [float(world_xyz[0]),
-                                          float(world_xyz[1]),
-                                          float(world_xyz[2])],
-                        }) + "\n")
+                        bearing_deg = _math.degrees(_math.atan2(o.body_y, o.body_x))
+                        self._lm_capture_fh.write(
+                            _json.dumps(
+                                {
+                                    "id": lm.id,
+                                    "step": self._graph.step,
+                                    "body_x": o.body_x,
+                                    "body_y": o.body_y,
+                                    "range_m": rng,
+                                    "bearing_deg": bearing_deg,
+                                    "height": o.height,
+                                    "pose_yaw_deg": _math.degrees(pred_yaw),
+                                    "world_xyz": [
+                                        float(world_xyz[0]),
+                                        float(world_xyz[1]),
+                                        float(world_xyz[2]),
+                                    ],
+                                }
+                            )
+                            + "\n"
+                        )
                         self._lm_capture_fh.flush()
                     except Exception:
                         pass
             else:
                 self._db.mark_observed(m.landmark_id, self._graph.step)
                 self._graph.stage_cone_observation(
-                    m.landmark_id, o.body_x, o.body_y, o.sigma_xy)
+                    m.landmark_id, o.body_x, o.body_y, o.sigma_xy
+                )
                 n_assoc += 1
+        self._prof_marks["spawn1"] = self._time.monotonic()
         per_scan["new"] = n_new
         per_scan["assoc"] = n_assoc
         per_scan["vetoed"] = n_vetoed
+        per_scan["frozen_drop"] = n_frozen_drop
         if n_vetoed > 0:
             self.get_logger().info(
                 f"proximity-veto: dropped {n_vetoed} would-be-new "
                 f"landmark(s) within {veto_m:.2f} m of existing ones "
                 f"(cascade guard; obs={len(observations)} "
-                f"new={n_new} assoc={n_assoc})")
+                f"new={n_new} assoc={n_assoc})"
+            )
+        if n_frozen_drop > 0:
+            self.get_logger().info(
+                f"mapping-frozen: dropped {n_frozen_drop} unmatched "
+                f"observation(s) post-loop-closure "
+                f"(obs={len(observations)} assoc={n_assoc})"
+            )
 
         self._accumulate_obs_diag(per_scan)
 
@@ -1370,25 +1575,30 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         max_yaw_dev_rad = self.get_parameter("pose_jump_max_yaw_rad").value
         if self._graph.step > 30:
             result, was_corrected = self._graph.commit_with_pose_sanity_check(
-                predicted_pose, max_pos_dev_m, max_yaw_dev_rad)
+                predicted_pose, max_pos_dev_m, max_yaw_dev_rad
+            )
             if was_corrected:
                 self.get_logger().warn(
                     f"pose-jump rejected: snapped to IMU prediction at "
                     f"step={self._graph.step} "
                     f"(thresholds: {max_pos_dev_m:.2f} m, "
-                    f"{np.degrees(max_yaw_dev_rad):.1f}°)")
+                    f"{np.degrees(max_yaw_dev_rad):.1f}°)"
+                )
         else:
             result = self._graph.commit()
+        self._prof_marks["commit"] = self._time.monotonic()
         self._latest_result = result
         self._preint.update_bias(result.bias)
 
         # Refresh the working landmark estimates so the next DA step
         # uses iSAM2-corrected positions, not stale initial guesses.
         self._db.update_from_estimate(self._graph.landmark_position)
+        self._prof_marks["dbupd"] = self._time.monotonic()
 
         self._publish_map_to_odom(stamp, result)
         self._publish_state(stamp, result)
         self._publish_cone_map(stamp)
+        self._emit_slam_prof("ok", len(observations))
 
         # Quiet log every 10 scans (~1 Hz at 10 Hz LiDAR).
         if self._graph.step % 10 == 0:
@@ -1397,7 +1607,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 f"obs={len(observations)} new={n_new} assoc={n_assoc} "
                 f"map={len(self._db)} "
                 f"pose=({result.pose.x():+.2f},{result.pose.y():+.2f},"
-                f"yaw={np.degrees(result.pose.rotation().yaw()):+.1f}°)")
+                f"yaw={np.degrees(result.pose.rotation().yaw()):+.1f}°)"
+            )
 
         # Bias trajectory dump every 50 scans (~5 s wall, ~5 % of a lap).
         # Tagged so it greps cleanly out of the SLAM log: "BIAS step=…".
@@ -1407,13 +1618,14 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         if self._graph.step % 50 == 0:
             ab = result.bias.accelerometer()
             gb = result.bias.gyroscope()
-            v  = result.velocity
+            v = result.velocity
             self.get_logger().info(
                 f"BIAS step={self._graph.step} "
                 f"accel=({ab[0]:+.5f},{ab[1]:+.5f},{ab[2]:+.5f}) m/s² "
                 f"gyro=({gb[0]:+.6f},{gb[1]:+.6f},{gb[2]:+.6f}) rad/s "
                 f"vel=({v[0]:+.3f},{v[1]:+.3f},{v[2]:+.3f}) m/s "
-                f"|v|={float(np.linalg.norm(v)):.3f}")
+                f"|v|={float(np.linalg.norm(v)):.3f}"
+            )
 
     # ----- helpers ----------------------------------------------------------
 
@@ -1434,14 +1646,17 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         if n <= 0:
             return
         d = self._obs_diag
+
         def _avg(key: str) -> float:
             return d.get(key, 0) / n
+
         self.get_logger().info(
             f"SLAM_OBS (avg/scan over {n}): "
             f"obs={_avg('obs_total'):4.1f} "
             f"assoc={_avg('assoc'):4.1f} "
             f"new={_avg('new'):3.1f} "
             f"vetoed={_avg('vetoed'):.1f} "
+            f"frozen={_avg('frozen_drop'):.1f} "
             f"skip={_avg('skipped'):.1f}"
         )
         self._obs_diag = {}
@@ -1480,24 +1695,34 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             # legacy 0.1 default flags "no σ reported" and SLAM falls
             # back to its range-only formula for backward compat.
             sigma_xy = m.scale.x if (m.scale.x > 0.0 and m.scale.x != 0.1) else -1.0
-            out.append(Observation(
-                body_x=x, body_y=y, height=height, sigma_xy=sigma_xy,
-            ))
+            out.append(
+                Observation(
+                    body_x=x,
+                    body_y=y,
+                    height=height,
+                    sigma_xy=sigma_xy,
+                )
+            )
         return out
 
     @staticmethod
     def _body_to_world(
-        body_x: float, body_y: float,
-        pose_x: float, pose_y: float, pose_yaw: float,
+        body_x: float,
+        body_y: float,
+        pose_x: float,
+        pose_y: float,
+        pose_yaw: float,
     ) -> np.ndarray:
         """Project a body-frame xy into world-frame xyz (z=0)."""
         c = np.cos(pose_yaw)
         s = np.sin(pose_yaw)
-        return np.array([
-            pose_x + body_x * c - body_y * s,
-            pose_y + body_x * s + body_y * c,
-            0.0,
-        ])
+        return np.array(
+            [
+                pose_x + body_x * c - body_y * s,
+                pose_y + body_x * s + body_y * c,
+                0.0,
+            ]
+        )
 
     @staticmethod
     def _odom_world_velocity(msg: Odometry) -> np.ndarray:
@@ -1514,11 +1739,13 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         yaw = pose.rotation().yaw()
         vb = msg.twist.twist.linear
         c, s = np.cos(yaw), np.sin(yaw)
-        return np.array([
-            c * vb.x - s * vb.y,
-            s * vb.x + c * vb.y,
-            float(vb.z),
-        ])
+        return np.array(
+            [
+                c * vb.x - s * vb.y,
+                s * vb.x + c * vb.y,
+                float(vb.z),
+            ]
+        )
 
     # ----- output ------------------------------------------------------------
 
@@ -1548,9 +1775,11 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         Returns None when there's no cached correction, no supervisor
         odom, or no prior result to clone velocity/bias from.
         """
-        if (self._last_correction is None
-                or self._latest_supervisor_odom is None
-                or self._latest_result is None):
+        if (
+            self._last_correction is None
+            or self._latest_supervisor_odom is None
+            or self._latest_result is None
+        ):
             return None
         dx, dy, dyaw = self._last_correction
         sup = self._latest_supervisor_odom.pose.pose
@@ -1610,8 +1839,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             # negative but yaw stays in (-π, π] from atan2.
             sup_yaw = 2.0 * np.arctan2(sup.orientation.z, sup.orientation.w)
             dx, dy, dyaw = compute_map_to_odom(
-                slam_x, slam_y, slam_yaw,
-                sup_x, sup_y, sup_yaw,
+                slam_x,
+                slam_y,
+                slam_yaw,
+                sup_x,
+                sup_y,
+                sup_yaw,
             )
 
         # Cache the correction so a no-cone scan can hold it constant and
@@ -1659,6 +1892,56 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             f"dt_pub={dt_pub_ms:6.1f}ms "
             f"corr=({dx:+.2f},{dy:+.2f}|{corr_mag:.2f}m,"
             f"{np.degrees(dyaw):+.1f}deg)"
+        )
+
+    def _emit_slam_prof(self, tag: str, n_obs: int) -> None:
+        """Emit the per-scan latency breakdown (SLAM_PROF) so we can see
+        WHICH stage eats the time as the map grows.
+
+        Segments (wall-clock, ms):
+          pre    — motion staging + marker parse (entry → assoc start)
+          assoc  — data association (associate())
+          spawn  — cascade detection + spawn/veto loop (incl. the O(map)
+                   proximity veto run per would-be-new cone)
+          commit — graph commit; broken out into the two iSAM2 primitives
+                   it actually runs: upd=both isam.update() calls,
+                   est=calculateEstimate() back-substitution, x{n} flushes
+                   (2 when the pose-jump sanity check re-solves)
+          db     — update_from_estimate sweep over every landmark
+          pub    — map→odom / state / cone-map publishes
+
+        Grep `SLAM_PROF` and plot against map size to find the slope.
+        """
+        m = getattr(self, "_prof_marks", None)
+        if not m or "entry" not in m:
+            return
+        now = self._time.monotonic()
+
+        def seg(a: str, b: str) -> float:
+            if a in m and b in m:
+                return (m[b] - m[a]) * 1e3
+            return float("nan")
+
+        total = (now - m["entry"]) * 1e3
+        pre = seg("entry", "assoc0")
+        assoc = seg("assoc0", "assoc1")
+        # spawn loop only runs on the "ok" path; absent on cascade skip.
+        spawn = seg("spawn0", "spawn1")
+        # commit segment starts wherever the spawn loop ended ("ok") or
+        # right after association ("skip").
+        commit_start = "spawn1" if "spawn1" in m else "assoc1"
+        commit = seg(commit_start, "commit")
+        db = seg("commit", "dbupd")
+        pub = (now - m["dbupd"]) * 1e3 if "dbupd" in m else float("nan")
+
+        self.get_logger().info(
+            f"SLAM_PROF[{tag}] total={total:6.1f}ms "
+            f"pre={pre:5.1f} assoc={assoc:5.1f} spawn={spawn:5.1f} "
+            f"commit={commit:6.1f}(upd={self._graph.prof_update_ms:6.1f} "
+            f"est={self._graph.prof_calcest_ms:6.1f} "
+            f"x{self._graph.prof_flushes}) "
+            f"db={db:5.1f} pub={pub:5.1f} "
+            f"obs={n_obs} map={len(self._db)}"
         )
 
     def _publish_state(self, stamp, result: ScanResult) -> None:
@@ -1742,6 +2025,138 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         err_msg.data = err
         self._gt_error_pub.publish(err_msg)
 
+    def _localize_scan(self, msg, stamp, predicted_pose, v_world) -> None:
+        """Process one scan in frozen-map localization mode.
+
+        Replaces the growing-graph SLAM update once the lap is closed: it
+        runs the same data association as the SLAM path, then solves a
+        fixed-size pose-only problem against the frozen landmarks
+        (FactorGraph.localize) instead of advancing iSAM2. No graph
+        growth, no relinearization — so the loop-closure latency burst
+        that stalled the pose feed and drove the car off track is gone.
+        Cone factors still correct accumulated drift on top of the
+        EKF-odom motion prediction; unmatched observations are dropped
+        (the map is final). The published /slam/pose, map→odom TF and
+        /Conos crop are byte-identical in shape to the SLAM path, so
+        downstream consumers see no change beyond a steadier feed.
+        """
+        self._graph.reset_prof()
+        self._prof_marks = {"entry": self._on_cones_t0}
+
+        if self._debug_gt_cones:
+            observations = self._gt_observations()
+        else:
+            observations = self._observations_from_markers(msg)
+        per_scan = {"obs_total": len(observations)}
+
+        pred_x = predicted_pose.x()
+        pred_y = predicted_pose.y()
+        pred_yaw = predicted_pose.rotation().yaw()
+
+        # Monotonic step continuing past the frozen graph step so DA's
+        # staleness gating and landmark last-seen bookkeeping keep ticking.
+        self._loc_scan += 1
+        cur_step = self._graph.step + self._loc_scan
+
+        self._prof_marks["assoc0"] = self._time.monotonic()
+        matches = associate(
+            observations, pred_x, pred_y, pred_yaw, self._db,
+            current_step=cur_step,
+        )
+        self._prof_marks["assoc1"] = self._time.monotonic()
+
+        # Collect matched observations + their frozen world positions for
+        # the localization solve. Unmatched obs are dropped (map is final).
+        self._prof_marks["spawn0"] = self._time.monotonic()
+        cone_obs = []
+        n_assoc = 0
+        n_drop = 0
+        for o, m in zip(observations, matches):
+            if m.landmark_id == -1:
+                n_drop += 1
+                continue
+            lm = self._db.get(m.landmark_id)
+            self._db.mark_observed(m.landmark_id, cur_step)
+            cone_obs.append((o.body_x, o.body_y, o.sigma_xy, lm.position))
+            n_assoc += 1
+        self._prof_marks["spawn1"] = self._time.monotonic()
+
+        sigma_xy = float(self.get_parameter("loc_prior_sigma_xy_m").value)
+        sigma_yaw = float(self.get_parameter("loc_prior_sigma_yaw_rad").value)
+        prior_sigmas = np.array([
+            0.05, 0.05, sigma_yaw,   # roll, pitch, yaw
+            sigma_xy, sigma_xy, 0.05,  # x, y, z
+        ])
+        result = self._graph.localize(
+            predicted_pose, cone_obs, v_world, self._latest_result.bias,
+            prior_sigmas,
+        )
+
+        # Safety clamp: a cluster of bad associations could still pull the
+        # solve past the prior. If the solved pose deviates from the motion
+        # prediction beyond the pose-jump thresholds, fall back to pure
+        # dead-reckoning this scan (mirrors commit_with_pose_sanity_check).
+        max_pos = float(self.get_parameter("pose_jump_max_pos_m").value)
+        max_yaw = float(self.get_parameter("pose_jump_max_yaw_rad").value)
+        pos_dev = float(np.linalg.norm(
+            result.pose.translation() - predicted_pose.translation()))
+        yaw_dev = abs(float(
+            predicted_pose.rotation().between(result.pose.rotation()).yaw()))
+        if pos_dev > max_pos or yaw_dev > max_yaw:
+            self.get_logger().warn(
+                f"localize pose-jump rejected: dev=({pos_dev:.2f} m, "
+                f"{np.degrees(yaw_dev):.1f}°) > ({max_pos:.2f} m, "
+                f"{np.degrees(max_yaw):.1f}°) — holding motion prediction"
+            )
+            result = ScanResult(
+                pose=predicted_pose, velocity=v_world,
+                bias=self._latest_result.bias)
+        self._prof_marks["commit"] = self._time.monotonic()
+        self._latest_result = result
+        self._prof_marks["dbupd"] = self._time.monotonic()
+
+        self._publish_map_to_odom(stamp, result)
+        self._publish_state(stamp, result)
+        self._publish_cone_map(stamp)
+
+        per_scan["new"] = 0
+        per_scan["assoc"] = n_assoc
+        per_scan["vetoed"] = 0
+        per_scan["frozen_drop"] = n_drop
+        self._accumulate_obs_diag(per_scan)
+        self._emit_slam_prof("loc", len(observations))
+
+    def _update_loop_closure(self, pose_x: float, pose_y: float) -> None:
+        """Detect lap completion and latch the mapping freeze.
+
+        The SLAM frame origin is the car spawn (≈ start/finish line), so
+        distance from origin traces the lap: it climbs as the car drives
+        out, then falls back toward 0 as it returns. We declare loop
+        closure the first time the pose comes back within
+        loop_close_radius_m of origin AFTER having been at least
+        loop_close_min_radius_m away (so start-line jitter can't trip it).
+        Once latched, _mapping_frozen stays true for the rest of the run.
+        """
+        if self._mapping_frozen:
+            return
+        if not bool(self.get_parameter("freeze_mapping_on_loop_close").value):
+            return
+
+        dist = float(np.hypot(pose_x, pose_y))
+        if dist > self._loop_max_dist:
+            self._loop_max_dist = dist
+
+        min_radius = float(self.get_parameter("loop_close_min_radius_m").value)
+        close_radius = float(self.get_parameter("loop_close_radius_m").value)
+        if self._loop_max_dist >= min_radius and dist <= close_radius:
+            self._mapping_frozen = True
+            self.get_logger().info(
+                f"LOOP_CLOSED — mapping frozen at step={self._graph.step} "
+                f"(pose {dist:.1f} m from origin, peaked at "
+                f"{self._loop_max_dist:.1f} m, map={len(self._db)}). No new "
+                f"landmarks will be spawned; observations re-associate only."
+            )
+
     def _publish_cone_map(self, stamp) -> None:
         """Publish the persistent cone landmark database to /Conos.
 
@@ -1763,6 +2178,18 @@ class ConeGraphSlamNode(BaseLifecycleNode):
 
         min_obs = int(self.get_parameter("min_observations_for_publish").value)
 
+        # Local-crop radius: publish only landmarks within `radius_m` of
+        # the car (squared compare, Z ignored). Keeps the per-scan publish
+        # cost O(local) instead of O(map) — see the parameter docstring.
+        # 0 (or no pose yet) disables the crop.
+        radius_m = float(self.get_parameter("cone_map_publish_radius_m").value)
+        if radius_m > 0.0 and self._latest_result is not None:
+            car = self._latest_result.pose
+            car_x, car_y = car.x(), car.y()
+            radius_sq = radius_m * radius_m
+        else:
+            radius_sq = None
+
         out = MarkerArray()
         # First marker is DELETEALL so visualizers refresh cleanly.
         # Phase 2 (#382): /Conos now lives in map frame, not odom.
@@ -1783,31 +2210,32 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # across scans.
         n_published = 0
         n_filtered = 0
+        n_cropped = 0
         for lm in self._db:
             if lm.n_observations < min_obs:
                 n_filtered += 1
                 continue
-            m = Marker()
-            m.header.stamp = stamp
-            m.header.frame_id = self.map_frame
-            m.id = lm.id
-            m.type = Marker.CYLINDER
-            m.action = Marker.ADD
-            m.pose.position.x = float(lm.position[0])
-            m.pose.position.y = float(lm.position[1])
-            m.pose.position.z = float(lm.position[2])
-            m.pose.orientation.w = 1.0
-            m.scale.x = 0.2
-            m.scale.y = 0.2
-            m.scale.z = 0.3
-            m.color.r = 1.0
-            m.color.g = 1.0
-            m.color.b = 0.0
-            m.color.a = 1.0
-            out.markers.append(m)
+            if radius_sq is not None:
+                ddx = float(lm.position[0]) - car_x
+                ddy = float(lm.position[1]) - car_y
+                if ddx * ddx + ddy * ddy > radius_sq:
+                    n_cropped += 1
+                    continue
+            out.markers.append(self._cone_marker(lm, stamp))
             n_published += 1
 
         self._cones_pub.publish(out)
+
+        # Full uncropped map for visualization on /Conos_full. Published
+        # every scan as a DELTA (only new/moved cones) so the cost is
+        # O(changed); a periodic keyframe (DELETEALL + full map) every
+        # cone_map_full_publish_every_n_scans scans resyncs late-joining
+        # viewers and recovers any dropped VOLATILE frames.
+        keyframe_every = int(
+            self.get_parameter("cone_map_full_publish_every_n_scans").value
+        )
+        keyframe = keyframe_every > 0 and (self._graph.step % keyframe_every == 0)
+        self._publish_full_cone_map(stamp, min_obs, keyframe=keyframe)
 
         # Periodic diagnostic — every ~5 s of /Conos publishes,
         # surface the filter stats so the operator can confirm the
@@ -1818,8 +2246,103 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         if self._conos_log_counter % 50 == 0:
             self.get_logger().info(
                 f"CONOS_FILTER published={n_published} "
-                f"filtered={n_filtered} (min_obs={min_obs})"
+                f"filtered={n_filtered} cropped={n_cropped} "
+                f"(min_obs={min_obs}, radius={radius_m:.0f}m, map={len(self._db)})"
             )
+
+    def _cone_marker(self, lm, stamp) -> Marker:
+        """Build one CYLINDER marker for a landmark. marker.id encodes the
+        persistent SLAM landmark id so consumers can track identity across
+        scans. Single neutral yellow — SLAM has no per-cone colour."""
+        m = Marker()
+        m.header.stamp = stamp
+        m.header.frame_id = self.map_frame
+        m.id = lm.id
+        m.type = Marker.CYLINDER
+        m.action = Marker.ADD
+        m.pose.position.x = float(lm.position[0])
+        m.pose.position.y = float(lm.position[1])
+        m.pose.position.z = float(lm.position[2])
+        m.pose.orientation.w = 1.0
+        m.scale.x = 0.2
+        m.scale.y = 0.2
+        m.scale.z = 0.3
+        m.color.r = 1.0
+        m.color.g = 1.0
+        m.color.b = 0.0
+        m.color.a = 1.0
+        return m
+
+    def _publish_full_cone_map(
+        self, stamp, min_obs: int, keyframe: bool = False
+    ) -> None:
+        """Publish the full cone map to /Conos_full (visualization only).
+
+        Markers are keyed by landmark id and persist in the viewer until
+        replaced or deleted, so we send only what changed since the last
+        publish: new landmarks, ones whose smoothed position moved more
+        than EPS_M, and DELETE markers for ones that dropped out (e.g.
+        fell below min_observations). This keeps the per-scan cost
+        O(changed) instead of O(map) — the O(map) Marker build/serialize
+        that was the loop-closure regression now happens only on a
+        keyframe, and at loop closure the delta naturally covers exactly
+        the landmarks that actually moved.
+
+        keyframe=True forces a DELETEALL + full resend and resets the
+        delta cache, so a late-joining viewer (VOLATILE QoS, no history)
+        gets a complete map within one keyframe interval.
+        """
+        if self._cones_full_pub is None or len(self._db) == 0:
+            return
+
+        # Position-change threshold below which a cone is "unchanged" and
+        # not re-sent. 5 cm — well under the 0.2 m marker size, so any
+        # visually meaningful shift still propagates.
+        EPS_M = 0.05
+        eps_sq = EPS_M * EPS_M
+
+        out = MarkerArray()
+        if keyframe:
+            self._full_pub_last = {}
+            delete_all = Marker()
+            delete_all.header.stamp = stamp
+            delete_all.header.frame_id = self.map_frame
+            delete_all.action = Marker.DELETEALL
+            out.markers.append(delete_all)
+
+        current_ids = set()
+        for lm in self._db:
+            if lm.n_observations < min_obs:
+                continue
+            current_ids.add(lm.id)
+            pos = (float(lm.position[0]), float(lm.position[1]), float(lm.position[2]))
+            last = self._full_pub_last.get(lm.id)
+            if last is None:
+                out.markers.append(self._cone_marker(lm, stamp))
+                self._full_pub_last[lm.id] = pos
+            else:
+                dx, dy, dz = pos[0] - last[0], pos[1] - last[1], pos[2] - last[2]
+                if dx * dx + dy * dy + dz * dz > eps_sq:
+                    out.markers.append(self._cone_marker(lm, stamp))
+                    self._full_pub_last[lm.id] = pos
+
+        # Landmarks we previously published that are now gone (or fell
+        # below min_obs): DELETE them so the viewer drops them. Skipped on
+        # keyframes — the DELETEALL above already cleared everything.
+        if not keyframe:
+            for rid in list(self._full_pub_last.keys()):
+                if rid not in current_ids:
+                    d = Marker()
+                    d.header.stamp = stamp
+                    d.header.frame_id = self.map_frame
+                    d.id = rid
+                    d.action = Marker.DELETE
+                    out.markers.append(d)
+                    del self._full_pub_last[rid]
+
+        # Nothing changed this scan → skip the publish entirely.
+        if out.markers:
+            self._cones_full_pub.publish(out)
 
 
 def main(args=None):

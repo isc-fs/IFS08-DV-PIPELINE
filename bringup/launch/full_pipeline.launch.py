@@ -49,7 +49,7 @@ except ValueError:
 # new a dashboard needs has to land here too.
 _FOXGLOVE_TOPIC_WHITELIST = [
     # Cone perception + map
-    "/Conos", "/Conos_Orange", "/Conos_raw",
+    "/Conos", "/Conos_full", "/Conos_Orange", "/Conos_raw",
     # Planner output + debug
     "/Path", "/path_planning/debug",
     # SLAM

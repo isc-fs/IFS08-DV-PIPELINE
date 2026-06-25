@@ -19,6 +19,7 @@ TF (zero out z, roll, pitch).
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -57,6 +58,37 @@ BIAS_RW_SIGMAS = np.concatenate([
     np.full(3, 1e-4),    # accel bias m/s² per scan
     np.full(3, 1e-5),    # gyro bias rad/s per scan
 ])
+
+
+def _cone_bearing_range(body_x: float, body_y: float, sigma_xy: float):
+    """Build the (bearing, range, robust-noise) triple for one cone
+    BearingRange observation.
+
+    Shared by the incremental SLAM path (stage_cone_observation) and the
+    frozen-map localization path (localize) so both use a byte-identical
+    measurement model. Observation noise scales linearly with range
+    (cluster point count ∝ 1/d², MUR §3.2) and is wrapped in a Huber
+    robust loss (k=1.345, 95 % Gaussian efficiency) so a single bad data
+    association can't drag the optimizer to a wrong global rotation. When
+    the detector reports a positive σ_xy it's treated as the radial-
+    equivalent uncertainty and converted to a bearing sigma via small-
+    angle ≈ lateral_m / range_m; the ≤0 sentinel falls back to the legacy
+    linear-in-range formula.
+    """
+    bearing = gtsam.Unit3(np.array([body_x, body_y, 0.0]))
+    range_m = float(np.hypot(body_x, body_y))
+    if sigma_xy > 0.0:
+        range_sigma = sigma_xy
+        bearing_sigma = sigma_xy / range_m if range_m > 0.5 else 0.2
+    else:
+        range_sigma = 0.05 + 0.005 * range_m
+        bearing_sigma = 0.02 + 0.001 * range_m
+    # Tangent-space sigmas: (bearing_x, bearing_y, range).
+    gaussian = gtsam.noiseModel.Diagonal.Sigmas(
+        np.array([bearing_sigma, bearing_sigma, range_sigma]))
+    huber = gtsam.noiseModel.mEstimator.Huber.Create(1.345)
+    robust = gtsam.noiseModel.Robust.Create(huber, gaussian)
+    return bearing, range_m, robust
 
 
 @dataclass
@@ -110,6 +142,21 @@ class FactorGraph:
         # scan (O(landmarks × graph-size) — the proc-time blowup). One
         # solve/scan instead. None until the first commit.
         self._latest_estimate: Optional[gtsam.Values] = None
+
+        # --- per-scan profiling (SLAM_PROF diagnostic) ----------------------
+        # Wall time (ms) spent inside the two hot iSAM2 primitives, summed
+        # over however many _flush_update calls a scan makes (1 normally, 2
+        # when the pose-jump sanity check re-solves). Reset by reset_prof()
+        # at scan entry; read by the node when it emits SLAM_PROF.
+        self.prof_update_ms: float = 0.0    # both isam.update() calls
+        self.prof_calcest_ms: float = 0.0   # calculateEstimate() back-sub
+        self.prof_flushes: int = 0          # # of _flush_update this scan
+
+    def reset_prof(self) -> None:
+        """Zero the per-scan profiling accumulators. Call at scan entry."""
+        self.prof_update_ms = 0.0
+        self.prof_calcest_ms = 0.0
+        self.prof_flushes = 0
 
     # ----- INIT (called once) ------------------------------------------------
 
@@ -519,35 +566,11 @@ class FactorGraph:
         it deserves, which is what was driving the late-drive yaw
         snap on the cone_slam runs (2026-04-27).
         """
-        bearing = gtsam.Unit3(np.array([body_x, body_y, 0.0]))
-        range_m = float(np.hypot(body_x, body_y))
-
-        # Prefer the detector's per-cone σ_xy (Hesai 128 ch centroid SE
-        # ≈ σ_ray / sqrt(N), so cluster size matters as much as range).
-        # When the detector reports a positive σ, treat it as the
-        # radial-equivalent uncertainty and convert to a bearing sigma
-        # via small-angle ≈ lateral_m / range_m. When the sentinel
-        # (≤0) is passed, fall back to the legacy linear-in-range
-        # formula — same behavior as before this wiring.
-        if sigma_xy > 0.0:
-            range_sigma = sigma_xy
-            # Avoid div-by-zero on cones at ~0 m (shouldn't happen but
-            # the math demands a guard); fall back to a generous bound.
-            bearing_sigma = sigma_xy / range_m if range_m > 0.5 else 0.2
-        else:
-            range_sigma = 0.05 + 0.005 * range_m
-            bearing_sigma = 0.02 + 0.001 * range_m
-
-        # 3D bearing is parameterized as Unit3 (2 DoF tangent space) +
-        # 1 DoF range = 3-vector residual. Sigmas are (bearing_x,
-        # bearing_y, range) in tangent space units.
-        sigmas = np.array([bearing_sigma, bearing_sigma, range_sigma])
-        gaussian = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
-        # k=1.345 is the classic Huber tuning that gives 95% efficiency
-        # under a Gaussian model — i.e. you pay almost nothing in the
-        # nominal case but stop a wild outlier at 1.345σ.
-        huber = gtsam.noiseModel.mEstimator.Huber.Create(1.345)
-        robust = gtsam.noiseModel.Robust.Create(huber, gaussian)
+        # Detector's per-cone σ_xy → range-scaled, Huber-robust noise
+        # (Hesai 128 ch centroid SE ≈ σ_ray / sqrt(N), so cluster size
+        # matters as much as range). Shared with the localization path —
+        # see _cone_bearing_range for the full rationale.
+        bearing, range_m, robust = _cone_bearing_range(body_x, body_y, sigma_xy)
 
         # GTSAM 4.2 Python: BearingRangeFactor3D takes bearing and range
         # as separate args (not a wrapped BearingRange3D).
@@ -615,6 +638,91 @@ class FactorGraph:
 
         corrected = self._flush_update()
         return corrected, True
+
+    def localize(
+        self,
+        predicted_pose: gtsam.Pose3,
+        cone_obs: "list[tuple[float, float, float, np.ndarray]]",
+        velocity: np.ndarray,
+        bias: gtsam.imuBias.ConstantBias,
+        prior_sigmas: np.ndarray,
+        max_iterations: int = 10,
+    ) -> ScanResult:
+        """Frozen-map localization: solve for the current pose with a
+        small, fixed-size graph that NEVER touches the incremental iSAM2
+        instance.
+
+        Once the lap is closed and mapping is frozen (see the node's
+        _update_loop_closure), the landmark map is final, so we no longer
+        need full SLAM — we need localization against a known map. Growing
+        the smoothed graph by X/V/B every scan would keep forcing iSAM2 to
+        relinearize an ever-lengthening trajectory; re-observing the
+        start/finish cones connects today's pose back to step-0 variables
+        and re-eliminates the whole loop (the 150–250 ms loop-closure
+        latency burst). This method sidesteps that entirely: a one-shot
+        Levenberg–Marquardt solve over a single pose, anchored by a prior
+        at the motion-model prediction and corrected by cone BearingRange
+        factors to the FROZEN landmark positions. Cost is O(observed
+        cones) and constant — no relinearization, no graph growth, ever.
+
+        Args:
+            predicted_pose: motion-model prediction (prev pose ∘ odom
+                delta) — the prior anchor and linearization point.
+            cone_obs: matched observations as
+                (body_x, body_y, sigma_xy, landmark_world_xyz) tuples.
+                landmark_world_xyz is the frozen iSAM2 estimate.
+            velocity, bias: carried through to the ScanResult unchanged
+                (the EKF owns velocity in odom mode; bias is inert here).
+            prior_sigmas: 6-vector (r, p, yaw, x, y, z) for the pose
+                prior. Loose enough that cones correct accumulated drift,
+                tight enough to dead-reckon on the prediction when cones
+                are sparse or rejected.
+            max_iterations: LM iteration cap for bounded latency.
+
+        The landmarks are inserted as variables pinned by a tight 3-axis
+        prior (rather than baked into a custom fixed-point factor) so the
+        cone factor is byte-identical to the SLAM path's
+        BearingRangeFactor3D + Huber model. The tight prior also removes
+        the z-rank deficiency that a position-only graph would otherwise
+        hit (see stage_new_landmark).
+        """
+        _t = time.perf_counter()
+        graph = gtsam.NonlinearFactorGraph()
+        values = gtsam.Values()
+
+        # Local single-pose key, independent of the frozen iSAM2 graph's
+        # X(self._k). Landmarks get local L(i) keys in observation order.
+        pose_key = X(0)
+        values.insert(pose_key, predicted_pose)
+        graph.add(gtsam.PriorFactorPose3(
+            pose_key, predicted_pose,
+            gtsam.noiseModel.Diagonal.Sigmas(prior_sigmas)))
+
+        pin_noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([1e-4, 1e-4, 1e-4]))
+        for i, (body_x, body_y, sigma_xy, lm_xyz) in enumerate(cone_obs):
+            lkey = L(i)
+            pt = gtsam.Point3(
+                float(lm_xyz[0]), float(lm_xyz[1]), float(lm_xyz[2]))
+            values.insert(lkey, pt)
+            graph.add(gtsam.PriorFactorPoint3(lkey, pt, pin_noise))
+            bearing, range_m, robust = _cone_bearing_range(
+                body_x, body_y, sigma_xy)
+            graph.add(gtsam.BearingRangeFactor3D(
+                pose_key, lkey, bearing, range_m, robust))
+
+        params = gtsam.LevenbergMarquardtParams()
+        params.setMaxIterations(max_iterations)
+        optimizer = gtsam.LevenbergMarquardtOptimizer(graph, values, params)
+        solved = optimizer.optimize()
+        pose = solved.atPose3(pose_key)
+
+        # Bill the solve to the same accumulator the SLAM path uses for
+        # isam.update() so SLAM_PROF's commit/upd column keeps meaning
+        # "time spent solving for this scan's pose".
+        self.prof_update_ms += (time.perf_counter() - _t) * 1e3
+        self.prof_flushes += 1
+        return ScanResult(pose=pose, velocity=velocity, bias=bias)
 
     def discard_staged(self) -> None:
         """Drop everything staged since the last commit and rewind
@@ -744,10 +852,12 @@ class FactorGraph:
         """Hand new_factors + new_values to iSAM2, read back the latest
         estimate at the current step.
         """
+        _t = time.perf_counter()
         self._isam.update(self._new_factors, self._new_values)
         # Optional second update for tighter convergence on big residuals.
         # GTSAM convention: 1-2 extra calls per step is normal.
         self._isam.update()
+        self.prof_update_ms += (time.perf_counter() - _t) * 1e3
 
         # Reset accumulators.
         self._new_factors.resize(0)
@@ -758,7 +868,10 @@ class FactorGraph:
         # this single back-substitution instead of each triggering a fresh
         # full solve (was ~N+1 solves/scan of the whole graph). Same
         # numbers as before — only the cost changes.
+        _t = time.perf_counter()
         self._latest_estimate = self._isam.calculateEstimate()
+        self.prof_calcest_ms += (time.perf_counter() - _t) * 1e3
+        self.prof_flushes += 1
         estimate = self._latest_estimate
         return ScanResult(
             pose=estimate.atPose3(X(self._k)),
