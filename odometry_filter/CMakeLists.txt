@@ -61,6 +61,47 @@ ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(Eigen3)
 
 # -----------------------------------------------------------------------------
+# Optional Python bindings (pybind11) — lets the offline SLAM benchmark
+# drive the REAL filter instead of a hand-maintained re-implementation
+# that can drift out of sync. Gated on pybind11 being available so the
+# core library / firmware build never depends on it.
+# -----------------------------------------------------------------------------
+# pybind11's newer tooling (pybind11_add_module) calls python3_add_library
+# from CMake's FindPython3, so the Development component must be found
+# BEFORE pybind11 is loaded.
+find_package(Python3 QUIET COMPONENTS Interpreter Development)
+find_package(pybind11_vendor QUIET)
+find_package(pybind11 QUIET)
+if(pybind11_FOUND AND Python3_Development_FOUND)
+  # Compile the filter source straight into the module (rather than
+  # linking libodometry_filter.so) so the resulting .so is SELF-CONTAINED.
+  # The benchmark stages just this one file into a container whose image
+  # may carry a different libodometry_filter.so; a runtime dependency on
+  # that lib would then fail to resolve the bindings' symbols.
+  pybind11_add_module(odometry_filter_py
+    src/python_bindings.cpp
+    src/odometry_filter.cpp)
+  target_include_directories(odometry_filter_py
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(odometry_filter_py PRIVATE Eigen3::Eigen)
+
+  # Install the compiled module where a sourced workspace puts it on
+  # PYTHONPATH (the distro's site-packages, relative to the install root).
+  if(NOT DEFINED PYTHON_INSTALL_DIR)
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}" -c
+        "import sysconfig, os; print(os.path.relpath(sysconfig.get_path('platlib'), sysconfig.get_path('data')))"
+      OUTPUT_VARIABLE PYTHON_INSTALL_DIR
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+  endif()
+  install(TARGETS odometry_filter_py DESTINATION "${PYTHON_INSTALL_DIR}")
+else()
+  message(STATUS
+    "pybind11 not found — skipping odometry_filter_py bindings "
+    "(SLAM benchmark falls back to its Python reference port).")
+endif()
+
+# -----------------------------------------------------------------------------
 # Tests — gtest fixtures cover the EKF math (predict + correct +
 # bias estimation + Coriolis cornering regression).
 # -----------------------------------------------------------------------------

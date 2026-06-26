@@ -297,6 +297,16 @@ class OdometryFilter {
   const OdometryState & state() const noexcept { return state_; }
   const FilterDiagnostics & diagnostics() const noexcept { return diag_; }
   bool is_calibrated() const noexcept { return calib_.completed; }
+  const EkfParams & params() const noexcept { return params_; }
+
+  // Seed the post-calibration forward velocity. The accel-bias
+  // calibration zeroes the whole state, which is only correct when the
+  // car is truly stationary at calibration. When replay (or a real
+  // start) begins mid-motion, an unaided accel integrator started from
+  // v=0 can never recover absolute speed (constant cruise has no
+  // forward accel to integrate). One wheel/GT speed sample fixes the
+  // initial condition. No-op before calibration completes.
+  void seed_forward_velocity(double vx);
 
   // 9×9 covariance copy. Cheap (576 bytes); called once per /odom
   // publish (100 Hz) to populate nav_msgs/Odometry covariance fields.

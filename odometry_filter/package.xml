@@ -21,6 +21,11 @@
 
   <depend>eigen</depend>
 
+  <!-- Optional: Python bindings for the offline SLAM benchmark. The
+       build stays functional without these (CMake gates on pybind11). -->
+  <build_depend>pybind11_vendor</build_depend>
+  <build_depend>python3-dev</build_depend>
+
   <test_depend>ament_cmake_gtest</test_depend>
 
   <export>

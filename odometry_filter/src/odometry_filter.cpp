@@ -474,6 +474,15 @@ void OdometryFilter::accumulate_calibration(
 }
 
 
+void OdometryFilter::seed_forward_velocity(double vx) {
+  if (!calib_.completed) {
+    return;
+  }
+  x_(VX) = vx;
+  publish_state_view();
+}
+
+
 void OdometryFilter::publish_state_view() {
   state_.x        = x_(X);
   state_.y        = x_(Y);
