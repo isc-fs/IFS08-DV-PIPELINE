@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>car_supervisor</name>
+  <version>0.0.0</version>
+  <description>
+    On-vehicle mission/actuation adapter — the real-car replacement for
+    sim_supervisor.
+
+    Translates the uDV AS state machine (/assi/state) and selected
+    mission (/ami/mission) into mission_control_node's SetMission →
+    RuntimeControl action protocol, and relays the control output to the
+    uDV actuation surface (/steering/cmd in degrees, /force_ebs service)
+    — only while AS Driving.
+
+    The supervision policy (AS-state machine, AMI→mission mapping) and
+    actuation scaling are pure, unit-tested modules (policy.py,
+    actuation.py). See docs/CAR_ADAPTATION.md for the open firmware gaps.
+  </description>
+  <maintainer email="driverless@isc-fs.com">ISC Driverless</maintainer>
+  <license>GPL-3.0-or-later</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>dv_msgs</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

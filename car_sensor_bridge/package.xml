@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>car_sensor_bridge</name>
+  <version>0.0.0</version>
+  <description>
+    On-vehicle sensor input adapter for the DV pipeline.
+
+    Provides the two EKF inputs a plain topic remap cannot:
+      * /steering_angle (rad) converted from the uDV
+        /steering/angle_sensor (deg).
+      * /motor_rpm republished from the inverter feed (the uDV exposes
+        no wheel-speed topic). Inverter source is provisional and fully
+        parameterised — see docs/CAR_ADAPTATION.md.
+
+    Pure conversion math lives in conversions.py and is unit-tested with
+    no ROS dependency.
+  </description>
+  <maintainer email="driverless@isc-fs.com">ISC Driverless</maintainer>
+  <license>GPL-3.0-or-later</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

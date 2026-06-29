@@ -49,6 +49,9 @@
   <exec_depend>control</exec_depend>
   <exec_depend>odometry_filter_node</exec_depend>
   <exec_depend>bag_recorder_node</exec_depend>
+  <!-- Real-car adapters, launched only by car_pipeline.launch.py -->
+  <exec_depend>car_sensor_bridge</exec_depend>
+  <exec_depend>car_supervisor</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

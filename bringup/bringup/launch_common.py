@@ -52,6 +52,15 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 from lifecycle_msgs.msg import Transition
 
+from bringup.topic_contract import (
+    REMAP_IMU,
+    REMAP_RPM,
+    REMAP_STEERING,
+    REMAP_BRAKE,
+    REMAP_CMD,
+    autonomy_remaps,
+)
+
 
 def use_sim_time_params() -> list:
     """`parameters=` fragment that binds use_sim_time to the launch arg.
@@ -73,24 +82,11 @@ def use_sim_time_params() -> list:
     }]
 
 
-# ---------------------------------------------------------------------
-# Topic remappings (IFSSIM /fsds/* surface → pipeline-side names).
-# Single source of truth — every node that consumes one of these pulls
-# the tuple from here so a remap change can't drift between nodes.
-# Mirrors the pre-refactor table that lived in
-# docker/dv_pipeline_stack/pipeline.launch.py.
-# ---------------------------------------------------------------------
-REMAP_LIDAR    = ("/fsds/lidar/Lidar1", "/lidar/Lidar1")
-REMAP_GSS      = ("/fsds/gss",          "/gss")
-REMAP_IMU      = ("/fsds/imu",          "/imu")
-REMAP_GT       = ("/fsds/testing_only/odom", "/testing_only/odom")
-# GT track layout — only consumed by slam's debug_gt_cones diagnostic.
-# Harmless when that mode is off (no subscription is created).
-REMAP_TRACK    = ("/fsds/testing_only/track", "/testing_only/track")
-REMAP_RPM      = ("/fsds/motor_rpm",    "/motor_rpm")
-REMAP_CMD      = ("/fsds/control_command", "/control_command")
-REMAP_STEERING = ("/fsds/steering_angle", "/steering_angle")
-REMAP_BRAKE    = ("/fsds/brake_pressure", "/brake_pressure")
+# Topic remap constants live in bringup.topic_contract (a dependency-free
+# module so the contract is unit-testable without a ROS install). The
+# names used directly below by management_actions are imported at the top
+# of this file; autonomy_actions pulls its per-node table from
+# topic_contract.autonomy_remaps().
 
 
 def auto_active(
@@ -154,29 +150,44 @@ def autonomy_lifecycle(
     )
 
 
-def autonomy_actions() -> list:
+def autonomy_actions(profile: str = "sim") -> list:
     """Pre-baked autonomy lifecycle-node list with their remaps.
 
     Order in the LaunchDescription doesn't constrain bring-up order;
     mode_manager.AUTONOMY_NODE_ORDER owns that. Listed here in the
     same order for readable `ros2 node list` output.
+
+    Args:
+        profile: "sim" wires the autonomy onto the IFSSIM /fsds/* bridge
+            surface (the historical default). "car" wires it onto the
+            real-vehicle surface: IMU+LiDAR are pure remaps onto the uDV
+            / Hesai topics (REMAP_*_CAR), while /steering_angle and
+            /motor_rpm arrive on their canonical names from
+            car_sensor_bridge (unit conversion / inverter source), so
+            they need no remap. The sim-only ground-truth debug taps
+            (REMAP_GT / REMAP_TRACK on slam) are dropped on the car —
+            nothing publishes /fsds/testing_only/* there.
     """
+    # Per-node remap table (pure data; raises on unknown profile).
+    remaps = autonomy_remaps(profile)
+
     return [
         autonomy_lifecycle(
             "odometry_filter_node", "odometry_filter_node",
             "odometry_filter_node",
-            remappings=[REMAP_IMU, REMAP_RPM, REMAP_STEERING, REMAP_BRAKE],
+            remappings=remaps["odometry_filter_node"],
         ),
         autonomy_lifecycle(
             "cone_detection", "cone_detection_node", "cone_detection_node",
-            remappings=[REMAP_LIDAR],
+            remappings=remaps["cone_detection_node"],
         ),
         autonomy_lifecycle(
             "cone_slam", "slam_node", "slam_node",
-            remappings=[REMAP_IMU, REMAP_RPM, REMAP_GT, REMAP_TRACK],
+            remappings=remaps["slam_node"],
         ),
         autonomy_lifecycle(
             "path_planning", "path_planning_node", "path_planning_node",
+            remappings=remaps["path_planning_node"],
         ),
         autonomy_lifecycle(
             "control", "control_node", "control_node",
@@ -185,8 +196,9 @@ def autonomy_actions() -> list:
             # /ctrl/cmd_internal to mission_control_node, which
             # surfaces it via the RuntimeControl action's Feedback
             # frames for the supervisor (or the uDV on the real car)
-            # to relay onto the bridge. No bridge-facing remap needed.
-            remappings=[],
+            # to relay onto the bridge. No bridge-facing remap needed
+            # (empty list for both profiles).
+            remappings=remaps["control_node"],
         ),
     ]
 
