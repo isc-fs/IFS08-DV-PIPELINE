@@ -21,8 +21,12 @@
         externally-launched simulator or bag replay.
 
       car_pipeline.launch.py — mode_manager + mission_control +
-        autonomy. No sim_supervisor (the on-vehicle uDV replaces it),
-        no bridge.
+        autonomy wired onto the real-vehicle surface
+        (autonomy_actions(profile="car")), plus the two on-car adapters
+        car_sensor_bridge (steering deg→rad, inverter→/motor_rpm) and
+        car_supervisor (replaces sim_supervisor: drives mission_control
+        from the uDV /assi/state + /ami/mission and relays actuation).
+        No sim_supervisor, no bridge. See docs/CAR_ADAPTATION.md.
 
     The shared lifecycle-launch helpers (`_auto_active`,
     `_autonomy_lifecycle`) and the IFSSIM /fsds/* topic remap
