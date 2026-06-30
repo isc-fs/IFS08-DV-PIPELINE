@@ -1,181 +1,162 @@
 # Car adaptation — running the DV pipeline on the real vehicle
 
-**Branch:** `feat/6-car-adaptation` (from `feat/5-sim-clock-imu-slam`)
-**Status:** software adapters landed · firmware/inverter gaps flagged below
+**Status:** stock-typed uDV ↔ mission_control interface landed · firmware
+gaps flagged below
 **Last verified against:** `IFS08-DV-uDV @ feat/14-bridge-parse-fixes`
 
-This document is the source of truth for what was changed to make the
-autonomy pipeline run on the car instead of the IFSSIM simulator, and —
-critically — the **open gaps** that must be closed before an on-track
-run. It supersedes the topic-name assumptions in
-`08/DV_procedures/07_pipeline_car_adaptation.md` and
-`00_dv_pipeline_roadmap.md`, which were written before the uDV firmware
-contract was pinned (those docs assumed an `/isc/*` topic surface that
-the firmware does **not** publish).
+This document is the source of truth for the interface between the
+autonomy pipeline (the DVPC) and the car, and the **open gaps** that must
+be closed before an on-track run.
+
+## 0. The big picture — one pipeline, two "uDV"s
+
+The autonomy stack (mode_manager, mission_control, odometry_filter,
+cone_detection, slam, path_planning, control) runs **identical code in
+sim and on the car**. The only thing that differs is *who plays the uDV*:
+
+* **Real car:** the IFS-08 uDV (a micro-ROS endpoint) + the Hesai driver.
+* **Sim:** `sim_supervisor` emulates the uDV; the IFSSIM bridge provides
+  the sensors.
+
+`mission_control` is the seam. It exchanges **only standard ROS 2
+interface types** with the uDV, so the micro-ROS firmware needs **no
+custom messages and no library recompile**, and the sim emulator can
+speak the exact same surface. There are **no DVPC-side car adapter
+nodes** — the old `car_sensor_bridge` and `car_supervisor` are gone;
+their unit conversions, mission/AS logic and actuation scaling now live
+in the uDV firmware (and, mirrored, in the sim emulator).
 
 ---
 
-## 1. The real contract (verified against firmware, not assumed)
+## 1. The stock-typed interface (uDV ↔ mission_control)
 
-The car sensor/actuator surface is the **uDV micro-ROS node**
-(`cubemx_node`, empty namespace) plus the **Hesai LiDAR driver** — not
-the sim's `/fsds/*` bridge. Verified from `IFS08-DV-uDV` `freertos.c`
-and `docs/PHYSICAL_TESTS.md`:
+Single source of truth: `mission_control/interface_contract.py`. Every
+type here is in the standard micro-ROS interface set.
 
-### uDV publishes
+### uDV → mission_control (uplink)
 | Topic | Type | Notes |
 |---|---|---|
-| `/imu/data_raw` | `sensor_msgs/Imu` | 400 Hz |
-| `/steering/angle_sensor` | `std_msgs/Float32` | **degrees**, ~10 Hz |
-| `/assi/state` | `std_msgs/UInt8` | AS state 0/1/2/3/4 (T14.9) |
-| `/ami/mission` | `std_msgs/Int32` | AMI mission index 0..9 |
-| `/res/go`, `/res/status` | `std_msgs/Int32` | RES go-signal / status |
-| `/steering/angle_actual`, `/steering/angle_target` | `std_msgs/Float32` | controller feedback |
-| `/imu/status`, `/debug` | — | diagnostics |
+| `/assi/state` | `std_msgs/UInt8` | AS state machine byte (FS-Rules T14.9). **Publish ≥2 Hz** — it is mission_control's liveness heartbeat. |
+| `/ami/mission` | `std_msgs/Int32` | selected AMI mission **index** (0..9). |
+| `/imu/data_raw` | `sensor_msgs/Imu` | 400 Hz → autonomy `/imu` (pure remap). |
+| `/steering_angle` | `std_msgs/Float32` | **radians** — converted on-board from the deg sensor. |
+| `/motor_rpm` | `std_msgs/Float32` | motor-shaft RPM from the inverter. |
+| `/lidar_points` | `sensor_msgs/PointCloud2` | Hesai → autonomy `/fsds/lidar/Lidar1` (pure remap). |
 
-### uDV subscribes / serves
+### mission_control → uDV (downlink)
 | Name | Type | Notes |
 |---|---|---|
-| `/steering/cmd` | `std_msgs/Float32` | **degrees** → CAN `0x020` |
-| `/assi/cmd` | `std_msgs/UInt8` | bench AS-state override |
-| `/force_ebs` | `std_srvs/SetBool` (service) | EBS trigger |
-| `/activate_steering` | `std_srvs/SetBool` (service) | steering motor enable |
+| `/dv/status` | `std_msgs/UInt8` | pipeline lifecycle byte (IDLE/PREPARING/READY/RUNNING/FINISHED/EMERGENCY/FAILED). The prepare/run **handshake** — the uDV gates "go" on `READY`. **Publish ≥2 Hz** (the uDV's liveness watchdog on the DVPC). |
+| `/ctrl/cmd` | `geometry_msgs/Twist` | normalised command: `linear.x`=throttle, `angular.z`=steering, both [-1,1]. The uDV scales to physical units + clamps + actuates **only while AS Driving**. |
+| `/force_ebs` | `std_srvs/SetBool` (service, **served by the uDV**) | mission_control requests EBS here on emergency. |
 
-### What the pipeline autonomy nodes consume (in source)
-| In-code topic | Node(s) | Type / units |
-|---|---|---|
-| `/imu` | odometry_filter, slam | `sensor_msgs/Imu` |
-| `/steering_angle` | odometry_filter, slam | `std_msgs/Float32`, **radians** |
-| `/motor_rpm` | odometry_filter, slam | `std_msgs/Float32`, motor RPM |
-| `/fsds/lidar/Lidar1` | cone_detection | `sensor_msgs/PointCloud2` |
-| `/ctrl/cmd_internal` (out) | control → mission_control | `fs_msgs/ControlCommand` |
+The two `UInt8` byte topics are each other's heartbeats: a stale
+`/assi/state` makes mission_control reconcile to torn-down; a stale
+`/dv/status` holds the uDV in a safe state. This bidirectional liveness
+replaces the old action goal's implicit connection.
+
+### How a mission runs (the handshake)
+1. AMI selects a mission → uDV publishes `/ami/mission`.
+2. Operator arms → uDV asserts **AS Ready** → mission_control configures
+   the autonomy → publishes `/dv/status = PREPARING → READY`.
+3. **The uDV gates the RES go on `/dv/status == READY`** — it won't enter
+   AS Driving until autonomy is genuinely prepared.
+4. RES go → uDV → **AS Driving** → mission_control activates → publishes
+   `/dv/status = RUNNING` and streams `/ctrl/cmd`.
+5. `slam` finished → mission_control `/dv/status = FINISHED`; emergency →
+   `/dv/status = EMERGENCY` + `/force_ebs` call.
+
+mission_control is a **reconciler**: it reads `/assi/state` +
+`/ami/mission` level-triggered and drives `mode_manager` so the autonomy
+lifecycle converges to what the AS state demands. Decision logic is the
+pure, unit-tested `mission_control/reconcile.py`.
 
 ---
 
-## 2. What was changed (this branch)
+## 2. What replaced car_sensor_bridge / car_supervisor
 
-### a. Car remap table — `bringup/bringup/topic_contract.py`
-A new dependency-free module holds the remap contract for both profiles
-and a pure `autonomy_remaps(profile)` selector (unit-tested in
-`bringup/test/test_topic_contract.py`, no ROS needed).
-`autonomy_actions(profile="car")` and `car_pipeline.launch.py` use it.
+| Old DVPC adapter responsibility | Now lives in |
+|---|---|
+| steering deg→rad | uDV firmware (publishes `/steering_angle` in rad) |
+| inverter→`/motor_rpm` | uDV firmware (reads inverter CAN) |
+| AS-state → mission/actuation | uDV firmware AS state machine + `/ctrl/cmd` subscriber |
+| `[-1,1]`→deg steering scaling + clamp | uDV firmware |
+| "actuate only while Driving" gate | uDV firmware (it owns AS state) |
+| AMI index→registry mission_id | mission_control (`interface_contract`, Python, testable) |
+| EBS request | mission_control calls the uDV's `/force_ebs` |
 
-Only **IMU** and **LiDAR** are pure remaps (type + units already match):
-
-```
-REMAP_IMU_CAR   = ("/imu",               "/imu/data_raw")
-REMAP_LIDAR_CAR = ("/fsds/lidar/Lidar1", "/lidar_points")
-```
-
-> **Remap direction matters.** The first element is the topic the node
-> uses *in its own source*. `cone_detection_node` hardcodes
-> `/fsds/lidar/Lidar1`; `odometry_filter_node` hardcodes `/imu`. Getting
-> this backwards silently subscribes to a topic nobody publishes — which
-> is why the table is pinned by tests.
-
-`/steering_angle` and `/motor_rpm` are **not** in the remap table: they
-need conversion / have no direct source, so `car_sensor_bridge`
-publishes them on their canonical names instead.
-
-### b. `car_sensor_bridge` — input adapter
-- `/steering/angle_sensor` (deg) → `/steering_angle` (rad). The EKF's
-  `push_steering` is documented `angle_rad`; the uDV publishes degrees.
-- inverter feed → `/motor_rpm` (motor-shaft RPM). The EKF applies its
-  own `ekf.rpm_to_ms` scaling, so this topic must carry motor RPM.
-- Pure conversions in `conversions.py` (unit-tested); node validates and
-  drops non-finite samples.
-
-### c. `car_supervisor` — mission/actuation adapter (replaces sim_supervisor)
-- Subscribes `/assi/state` + `/ami/mission`; drives
-  `mission_control_node` via `SetMission` (configure) → `RuntimeControl`
-  (activate + run).
-- Relays `RuntimeControl` feedback (throttle/steering in [-1,1]) to the
-  uDV — **only while AS Driving** (`should_actuate`).
-- Steering [-1,1] → degrees on `/steering/cmd`, hard-clamped to a safety
-  limit kept under STEERING's 70° emergency cutoff.
-- AS Emergency → `/force_ebs` service.
-- Pure policy (`policy.py`) + scaling (`actuation.py`) are unit-tested.
+In sim, `sim_supervisor` performs the firmware half in Python (AS state
+machine in `sim_supervisor/as_state_machine.py`, `/ctrl/cmd`→bridge
+relay, `/force_ebs` server), driven by the backend/CLI over the sim
+operator-panel topics (`/sim/mission`, `/sim/intent`, `/sim/estop`).
 
 ---
 
 ## 3. ⚠️ OPEN GAPS — must close before on-track running
 
-These are **not** pipeline-repo work; they are flagged here so they are
-not missed. Each is parameterised in code so wiring is a one-line change.
+These are **firmware** items (IFS08-DV-uDV), flagged here so they aren't
+missed. Each is a bounded change.
 
 ### G1 — Inverter `/motor_rpm` source `[BLOCKER for odometry quality]`
-The uDV exposes **no wheel-speed / motor-RPM topic**. The EKF needs
-`/motor_rpm`; without it odometry is IMU-only dead-reckoning and drifts.
-**The LattePanda has no SocketCAN interface**, so the inverter feed must
-arrive as a ROS topic (relayed through the uDV, or via a future USB-CAN
-bridge). Action items:
-- Decide the transport (uDV CAN→ROS publisher, or Panda USB-CAN).
-- Confirm the inverter reporting: **eRPM vs mechanical RPM**, units/LSB,
-  sign, topic name, message type.
-- Set `car_sensor_bridge` params: `inverter_in_topic`, `inverter_is_erpm`,
-  `pole_pairs`, `inverter_scale`.
-- Set `ekf.rpm_to_ms` on `odometry_filter_node` for the real wheel
-  radius / gear ratio (the sim default `0.00821` is almost certainly wrong).
+The uDV exposes **no wheel-speed / motor-RPM topic** yet. The EKF needs
+`/motor_rpm`; without it odometry is IMU+steering dead-reckoning and
+drifts. The uDV is on the vehicle CAN bus, so it is the natural publisher.
+Action: read the inverter CAN, confirm **eRPM vs mechanical RPM** /
+units / sign / pole-pairs, publish `/motor_rpm` (motor-shaft RPM). Set
+`ekf.rpm_to_ms` on `odometry_filter_node` for the real wheel radius /
+gear ratio (the sim default `0.00821` is almost certainly wrong).
 
-### G2 — Throttle / brake actuation sink
-`RuntimeControl` feedback carries **throttle + steering only** (no
-brake). The uDV currently has **no throttle/brake ROS subscriber** (only
-`/steering/cmd`). `car_supervisor` publishes throttle on the placeholder
-topic `/ctrl/throttle_cmd` so the command isn't lost. Action items:
-- Add a uDV throttle subscriber (→ inverter torque/accel CAN, e.g. the
-  `0x507` accel frame referenced in the uDV CLAUDE.md).
-- Point `car_supervisor` `throttle_cmd_topic` at it.
-- Proportional braking is out of the action contract; only emergency EBS
-  is wired (`/force_ebs`).
+### G2 — Throttle actuation sink
+`/ctrl/cmd` carries throttle (`linear.x`) + steering (`angular.z`); the
+uDV currently has **no throttle ROS subscriber** (only steering). Add the
+inverter torque/accel path (e.g. the `0x507` accel frame). Proportional
+braking is out of scope; only emergency EBS is wired (`/force_ebs`).
 
 ### G3 — Steering scaling + units `[SAFETY]`
-- `car_supervisor` `max_steering_deg` (default **20.0**) and
-  `steering_safety_limit_deg` (default **25.0**) are PLACEHOLDERS.
-  Measure the real full-lock command and set them (safety limit must
-  stay under STEERING's 70° cutoff).
-- `car_sensor_bridge` `steering_ratio` (default 1.0), `steering_sign`,
-  `steering_offset_deg`: confirm whether `/steering/angle_sensor`
-  measures road-wheel vs steering-column angle, and that the sign
-  matches the EKF convention (positive δ ⇒ positive yaw rate).
+`/ctrl/cmd.angular.z` is normalised [-1,1]; the uDV scales it to degrees,
+clamps to a safety limit **under STEERING's 70° cutoff**, and applies
+only while AS Driving. Measure the real full-lock command and the sign
+(positive δ ⇒ positive yaw rate) and bake them into firmware. Likewise
+confirm the `/steering_angle` deg→rad conversion measures road-wheel vs
+column angle.
 
 ### G4 — Mission-finished path to the uDV
-The uDV has **no `/isc/mission_finished` (or equivalent) subscriber**.
-On `slam/finished`, `RuntimeControl` closes and `car_supervisor` centres
-the wheel, but nothing tells the uDV "mission complete" over ROS — the
-uDV transitions DRIVING→FINISHED via its own RES/standstill logic.
-Confirm this is acceptable, or add a uDV mission-finished subscriber.
+On `slam/finished`, mission_control publishes `/dv/status = FINISHED`.
+The uDV should react (DRIVING→FINISHED) — confirm it does, either via
+`/dv/status` or its own RES/standstill logic.
 
 ### G5 — AMI → mission mapping
-`car_supervisor` `policy.DEFAULT_AMI_TO_MISSION_ID` maps the AMI index
-(uDV `ws2812.c`: 4=Track drive) to the pipeline registry
-(trackdrive=1, autocross=2, accel=3, skidpad=4, scruti=5). Confirm
-against AMI firmware. Two soft spots: AMI 5 "EVS/EBS test" and AMI 6
-"Inspection" both map to `scruti`; and the uDV bench doc once said
-"mission 5 = track drive" while the firmware table says index 4 — the
-**firmware table is authoritative**.
+`interface_contract.DEFAULT_AMI_TO_MISSION_ID` maps the AMI index (uDV
+`ws2812.c`: 4=Track drive) to the registry (trackdrive=1, autocross=2,
+accel=3, skidpad=4, scruti=5). Confirm against AMI firmware. Soft spots:
+AMI 5 "EVS/EBS test" + AMI 6 "Inspection" both map to `scruti`; the
+firmware table (index 4 = Track drive) is authoritative.
 
 ### G6 — IMU / LiDAR frames + TF
-`cone_detection` reads `header.frame_id`; the uDV stamps IMU with
-`imu_link`, the Hesai cloud with its sensor frame. Provide the static
-TFs (`base_link → hesai_lidar`, `base_link → imu_link`) — the values in
-the DVPC `startup.launch.py` are currently placeholders. Re-tune the
-RANSAC ground / DBSCAN clustering params on real ATX data.
+`cone_detection` reads `header.frame_id`; provide the static TFs
+(`base_link → hesai_lidar`, `base_link → imu_link`) and re-tune the
+RANSAC ground / DBSCAN params on real ATX data.
+
+### G7 — micro-ROS entity budget
+The new uDV-facing topics (`/ctrl/cmd` sub, `/dv/status` sub,
+`/motor_rpm` + `/steering_angle` pubs) add entities. Confirm they fit the
+firmware's `RMW_UXRCE_MAX_*` budget; if not, bump `colcon.meta` and
+rebuild (a config rebuild, **not** a custom-type integration).
 
 ---
 
-## 4. Launching on the car
+## 4. Launching
 
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/local_setup.bash   # RMW CycloneDDS + Hesai
-source ~/dv_ws/install/setup.bash
-ros2 launch bringup car_pipeline.launch.py    # NEVER with use_sim_time:=true
+# Car (NEVER use_sim_time:=true; the uDV is the mission_control peer):
+ros2 launch bringup car_pipeline.launch.py
+
+# Sim (sim_supervisor is the uDV emulator; backend/CLI drive the panel):
+ros2 launch bringup full_pipeline.launch.py use_sim_time:=true
+ros2 run sim_supervisor supervisor_cli run 1     # e.g. trackdrive
 ```
 
-Per the repo workflow, only validated code on `main` runs on the car
-(the `dv-pipeline-update` service fast-forwards `~/dv_ws` to
-`origin/main`). This branch must reach `dev` → `main` before the
-auto-update picks it up.
+Per the repo workflow, only validated code on `main` runs on the car.
 
 ---
 
@@ -184,7 +165,12 @@ auto-update picks it up.
 Pure-logic suites (no ROS install required):
 
 ```bash
-python -m pytest bringup/test/test_topic_contract.py \
-                 car_sensor_bridge/test/ \
-                 car_supervisor/test/ -q
+python -m pytest pipeline/bringup/test/test_topic_contract.py \
+                 pipeline/mission_control/test/ \
+                 ros2/src/sim_supervisor/test/test_as_state_machine.py -q
 ```
+
+Covers: the remap table, the AS/DV byte contract + AMI map, the
+mission_control reconciler decision table, and the sim emulator AS state
+machine (which shares the canonical bytes with `interface_contract`, so
+the test also guards that the two packages agree).

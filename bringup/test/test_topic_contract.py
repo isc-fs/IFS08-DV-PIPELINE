@@ -69,9 +69,10 @@ def test_car_only_imu_and_lidar_are_remapped():
 
 
 def test_car_does_not_remap_steering_or_rpm():
-    # car_sensor_bridge publishes /steering_angle (rad) and /motor_rpm
-    # directly, so neither may be remapped — a remap here would mean the
-    # node subscribes to a name the bridge does not publish.
+    # The uDV publishes /steering_angle (rad, converted on-board) and
+    # /motor_rpm (from the inverter) directly, so neither may be remapped
+    # — a remap here would mean the node subscribes to a name nobody
+    # publishes.
     flat = [t for remaps in autonomy_remaps("car").values() for t in remaps]
     targets = {to for _from, to in flat}
     froms = {frm for frm, _to in flat}

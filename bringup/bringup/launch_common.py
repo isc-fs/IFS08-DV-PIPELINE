@@ -162,9 +162,9 @@ def autonomy_actions(profile: str = "sim") -> list:
             surface (the historical default). "car" wires it onto the
             real-vehicle surface: IMU+LiDAR are pure remaps onto the uDV
             / Hesai topics (REMAP_*_CAR), while /steering_angle and
-            /motor_rpm arrive on their canonical names from
-            car_sensor_bridge (unit conversion / inverter source), so
-            they need no remap. The sim-only ground-truth debug taps
+            /motor_rpm arrive on their canonical names from the uDV
+            directly (steering converted to rad on-board, /motor_rpm from
+            the inverter), so they need no remap. The sim-only ground-truth debug taps
             (REMAP_GT / REMAP_TRACK on slam) are dropped on the car —
             nothing publishes /fsds/testing_only/* there.
     """
@@ -191,13 +191,12 @@ def autonomy_actions(profile: str = "sim") -> list:
         ),
         autonomy_lifecycle(
             "control", "control_node", "control_node",
-            # Post-#384 control_node no longer publishes
-            # /fsds/control_command directly — its output flows on
-            # /ctrl/cmd_internal to mission_control_node, which
-            # surfaces it via the RuntimeControl action's Feedback
-            # frames for the supervisor (or the uDV on the real car)
-            # to relay onto the bridge. No bridge-facing remap needed
-            # (empty list for both profiles).
+            # control_node no longer publishes /fsds/control_command
+            # directly — its output flows on /ctrl/cmd_internal to
+            # mission_control_node, which (while RUNNING) republishes it
+            # as a normalised geometry_msgs/Twist on /ctrl/cmd for the
+            # uDV / sim_supervisor emulator to scale and actuate. No
+            # bridge-facing remap needed (empty list for both profiles).
             remappings=remaps["control_node"],
         ),
     ]

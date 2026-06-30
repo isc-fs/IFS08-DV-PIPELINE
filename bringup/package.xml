@@ -22,11 +22,11 @@
 
       car_pipeline.launch.py — mode_manager + mission_control +
         autonomy wired onto the real-vehicle surface
-        (autonomy_actions(profile="car")), plus the two on-car adapters
-        car_sensor_bridge (steering deg→rad, inverter→/motor_rpm) and
-        car_supervisor (replaces sim_supervisor: drives mission_control
-        from the uDV /assi/state + /ami/mission and relays actuation).
-        No sim_supervisor, no bridge. See docs/CAR_ADAPTATION.md.
+        (autonomy_actions(profile="car")). The uDV (a micro-ROS endpoint)
+        is the mission_control peer directly, over the stock-typed
+        interface in topic_contract.py (/assi/state + /ami/mission in,
+        /dv/status + /ctrl/cmd + /force_ebs out) — no car-side adapter
+        nodes, no sim_supervisor, no bridge. See docs/CAR_ADAPTATION.md.
 
     The shared lifecycle-launch helpers (`_auto_active`,
     `_autonomy_lifecycle`) and the IFSSIM /fsds/* topic remap
@@ -53,9 +53,6 @@
   <exec_depend>control</exec_depend>
   <exec_depend>odometry_filter_node</exec_depend>
   <exec_depend>bag_recorder_node</exec_depend>
-  <!-- Real-car adapters, launched only by car_pipeline.launch.py -->
-  <exec_depend>car_sensor_bridge</exec_depend>
-  <exec_depend>car_supervisor</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
