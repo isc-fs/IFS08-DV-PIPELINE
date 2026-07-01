@@ -66,6 +66,7 @@ from mission_control.interface_contract import (
     TOPIC_DV_STATUS,
     ami_index_to_mission_id,
 )
+from mission_control.interface_qos import UPLINK_QOS
 from mission_control.reconcile import (
     ReconcileAction,
     is_runnable_mission,
@@ -247,12 +248,17 @@ class MissionControlNode(LifecycleNode):
         self._dv_status_msg_pub = self.create_lifecycle_publisher(
             String, TOPIC_DV_STATUS + "_msg", 10)
 
-        # Uplink from the uDV/emulator.
+        # Uplink from the uDV/emulator. BEST_EFFORT/VOLATILE (UPLINK_QOS)
+        # to match the firmware's micro-ROS heartbeat idiom — a RELIABLE /
+        # TRANSIENT_LOCAL ("latched") reader silently fails to match the
+        # uDV's BEST_EFFORT / VOLATILE writer, leaving the reconciler stuck
+        # at AS_OFF. Late-join is covered by the steady heartbeat, not by
+        # durability. See interface_qos.py.
         self._sub_assi = self.create_subscription(
-            UInt8, TOPIC_ASSI_STATE, self._on_as_state, _LATCHED_QOS,
+            UInt8, TOPIC_ASSI_STATE, self._on_as_state, UPLINK_QOS,
             callback_group=self._cb_group)
         self._sub_ami = self.create_subscription(
-            Int32, TOPIC_AMI_MISSION, self._on_ami_mission, _LATCHED_QOS,
+            Int32, TOPIC_AMI_MISSION, self._on_ami_mission, UPLINK_QOS,
             callback_group=self._cb_group)
 
         # Control aggregation inputs (latched flags so a late join sees
