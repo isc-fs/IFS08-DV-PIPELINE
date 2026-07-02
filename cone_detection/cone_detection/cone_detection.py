@@ -33,7 +33,10 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 
 from cone_detection.cone_fit import (
+    _CONE_BIG_C,
     _CONE_BIG_D,
+    _CONE_SMALL_C,
+    _CONE_SMALL_D,
     _LINEARITY_THRESHOLD,
     cluster_linearity,
     cone_fit_2params,
@@ -82,8 +85,10 @@ class ConeDetectionConfig:
     dbscan_eps: float = 0.3
     dbscan_min_samples: int = 2
 
-    # Passed to scipy / template fits where applicable
-    cone_fit_solver: str = "L-BFGS-B"
+    # Template (a, b) solver: "gn" = in-process Numba Gauss-Newton/LM
+    # (production default); any scipy.optimize.minimize method name
+    # (e.g. "L-BFGS-B", the previous default) selects the scipy path for A/B.
+    cone_fit_solver: str = "gn"
     template_fit_maxiter: int = 12
 
     # Near-collinear clusters: closed-form collinear fit (no scipy).
@@ -164,11 +169,18 @@ def clustering_separation_rt(
     clustering_class: type = DBSCAN,
     stage_timings: dict[str, float] | None = None,
     ransac_iter_subsample_max: int = 5000,
+    initial_plane: np.ndarray | None = None,
 ):
     """Ground removal + rotation correction + DBSCAN, single scan.
 
     RANSAC fits the ground plane (``ransac2`` on augmented ``[1,x,y,z]``), outliers
     are rotated so the plane normal aligns with +z, then DBSCAN clusters them.
+
+    Args:
+        initial_plane: optional previous-scan plane coefficients
+            ``[bias, n_x, n_y, n_z]`` used to warm-start RANSAC (see
+            ``ransac2``). Stale planes are harmless — they lose the support
+            comparison and the full random search runs.
 
     Returns:
         ``(labels, rotated_outliers, plane_coefs)`` — per-point cluster labels,
@@ -176,12 +188,18 @@ def clustering_separation_rt(
     """
     cfg = config or ConeDetectionConfig()
     A = np.c_[np.ones(data.shape[0]), data]
+    warm = (
+        np.asarray(initial_plane, dtype=np.float64)
+        if initial_plane is not None
+        else np.zeros(0)
+    )
     t_ransac = time.perf_counter()
     inliers, def_coefs = ransac2(
         A,
         prob=cfg.ransac_prob,
         threshold=cfg.ransac_threshold,
         iter_subsample_max=ransac_iter_subsample_max,
+        initial_coefs=warm,
     )
     if stage_timings is not None:
         stage_timings["ransac_ms"] = (time.perf_counter() - t_ransac) * 1000.0
@@ -190,10 +208,12 @@ def clustering_separation_rt(
     outliers = np.ones(data.shape[0], dtype=bool)
     outliers[inliers] = False
     t_rotate = time.perf_counter()
-    data = (
-        data
-        @ vectors2matrix(k, def_coefs[1:] / np.linalg.norm(def_coefs[1:]))
-    )[outliers]
+    # Select outliers BEFORE rotating: row selection commutes with the
+    # right-multiplied rotation, and rotating only the ~1% above-ground
+    # points instead of the full cloud removes the dominant cost here.
+    data = data[outliers] @ vectors2matrix(
+        k, def_coefs[1:] / np.linalg.norm(def_coefs[1:])
+    )
     if stage_timings is not None:
         stage_timings["rotate_ms"] = (time.perf_counter() - t_rotate) * 1000.0
         stage_timings["n_outliers"] = float(len(data))
@@ -214,10 +234,14 @@ def clustering_separation_rt(
 class RealtimeConeDetector:
     """Configurable single-scan cone detector (see :class:`ConeDetectionConfig`)."""
 
-    __slots__ = ("config",)
+    __slots__ = ("config", "_prev_plane")
 
     def __init__(self, config: ConeDetectionConfig | None = None) -> None:
         self.config = config or ConeDetectionConfig()
+        # Previous scan's ground plane, used to warm-start RANSAC. At 10 Hz
+        # the plane barely moves frame to frame, so the warm candidate
+        # usually wins immediately and collapses the iteration budget.
+        self._prev_plane: np.ndarray | None = None
 
     def detect(
         self,
@@ -241,7 +265,9 @@ class RealtimeConeDetector:
             clustering_class=clustering_class,
             stage_timings=stage_timings,
             ransac_iter_subsample_max=ransac_iter_subsample_max,
+            initial_plane=self._prev_plane,
         )
+        self._prev_plane = def_coefs
         if len(labels) == 0:
             return []
         t_cluster_prep = time.perf_counter()
@@ -405,24 +431,37 @@ def rect2polars(x, y):
     return np.sqrt(x**2 + y**2), np.arctan2(y, x)
 
 
-def warmup_numba_functions(*, also_warm_two_param: bool = False) -> None:
-    """Warm RANSAC + cone fit once at configure.
+def warmup_numba_functions(
+    config: ConeDetectionConfig | None = None,
+    *,
+    also_warm_two_param: bool = False,
+) -> None:
+    """Warm every Numba kernel on the live hot path at configure time.
 
-    Same call paths as live scans so the first real frame doesn't pay the
-    scipy/numba JIT compile cost. Optionally warms ``cone_fit_2params`` when
-    you set ``ConeDetectionConfig(fit_backend="two_param")``.
+    All perception kernels compile with ``cache=True``, so the compiled
+    machine code persists in ``__pycache__`` next to the sources (or in
+    ``NUMBA_CACHE_DIR`` when set). Warmup still runs on every configure: the
+    first call per process is what loads the disk cache, and it transparently
+    recompiles on a cache miss (numba/Python upgrade, source change, cold
+    volume). Cached start ≈ 1–2 s; first-ever start pays the full 10–20 s JIT.
+
+    Coverage matters more than volume here. Numba specializes per *call
+    pattern*: an argument left to its default compiles a different
+    specialization (``Omitted`` type) than the same value passed explicitly,
+    so hand-written kernel calls alone can miss the signature the node
+    actually uses. The end-to-end block below therefore replays the real
+    call chain — ``RealtimeConeDetector.detect`` on a synthetic scan, with
+    the caller's ``config`` — twice, covering both the no-previous-plane and
+    warm-plane RANSAC entries exactly as the live node hits them.
+
+    Args:
+        config: The production config the node will run with (solver choice,
+            fit backend, RANSAC parameters). ``None`` = module defaults.
+        also_warm_two_param: Force-warm ``cone_fit_2params`` even when the
+            config does not select ``fit_backend="two_param"``.
     """
+    cfg = config or ConeDetectionConfig()
     rng = np.random.default_rng(0)
-    gx, gy = np.meshgrid(np.linspace(-1.0, 1.0, 8), np.linspace(-1.0, 1.0, 8))
-    dummy_plane = np.column_stack(
-        [
-            gx.ravel(),
-            gy.ravel(),
-            rng.normal(0.0, 1e-4, size=gx.size),
-        ]
-    ).astype(np.float64)
-    A_plane = np.c_[np.ones(dummy_plane.shape[0]), dummy_plane]
-    ransac2(A_plane, prob=0.9999, threshold=0.05)
 
     def _synthetic_cone_cloud(
         n: int, noise_m: float, c_true: float, d_true: float
@@ -438,9 +477,34 @@ def warmup_numba_functions(*, also_warm_two_param: bool = False) -> None:
         )
         return np.column_stack([x, y, z])
 
+    def _near_face_cluster(
+        cx: float, cy: float, c_true: float, d_true: float, n: int
+    ) -> np.ndarray:
+        """One-sided near-face cluster like a vertical-beam LiDAR sees."""
+        z = rng.uniform(0.06, d_true - 0.03, size=n)
+        gamma = (d_true - z) / c_true
+        norm = math.hypot(cx, cy)
+        ux, uy = cx / norm, cy / norm
+        psi = rng.uniform(-1.0, 1.0, size=n)
+        px = cx - gamma * (np.cos(psi) * ux - np.sin(psi) * uy)
+        py = cy - gamma * (np.cos(psi) * uy + np.sin(psi) * ux)
+        px += rng.normal(0.0, 0.003, size=n)
+        py += rng.normal(0.0, 0.003, size=n)
+        z = z + rng.normal(0.0, 0.008, size=n)
+        return np.column_stack([px, py, z])
+
+    # --- direct kernel warms: both solver paths (gn = Numba kernel, scipy
+    # kept for A/B) plus whatever non-default method the config selects, and
+    # the collinear closed-form dispatch branch.
+    solvers = {"gn", "L-BFGS-B", cfg.cone_fit_solver}
     for n in (8, 24, 48):
-        cone_fit_template_dispatch(_synthetic_cone_cloud(n, 0.012, 5.0, 0.35))
-        cone_fit_template_dispatch(_synthetic_cone_cloud(n, 0.012, 5.5, 0.55))
+        for solver in solvers:
+            cone_fit_template_dispatch(
+                _synthetic_cone_cloud(n, 0.012, 5.0, 0.35), solver=solver
+            )
+            cone_fit_template_dispatch(
+                _synthetic_cone_cloud(n, 0.012, 5.5, 0.55), solver=solver
+            )
 
     line_cluster = _synthetic_cone_cloud(6, 0.012, 5.0, 0.35)
     line_cluster[:, :2] = np.linspace(
@@ -448,9 +512,28 @@ def warmup_numba_functions(*, also_warm_two_param: bool = False) -> None:
     )
     cone_fit_template_dispatch(line_cluster)
 
-    if also_warm_two_param:
+    if also_warm_two_param or cfg.fit_backend == "two_param":
         for n in (8, 24, 48):
             cone_fit_2params(_synthetic_cone_cloud(n, 0.012, 5.0, 0.35))
+
+    # --- end-to-end warm: replay the live call chain (decode-shaped float32
+    # cloud -> RANSAC -> rotate -> DBSCAN -> floor cull -> gates -> fit) with
+    # the production config. A tilted ground plane at z ~ 0 plus one cluster
+    # per template keeps every gate passable so the fit stage really runs.
+    n_ground = 2000
+    gx = rng.uniform(1.0, 14.0, n_ground)
+    gy = rng.uniform(-4.0, 4.0, n_ground)
+    gz = 0.02 * gx + rng.normal(0.0, 0.01, size=n_ground)
+    small = _near_face_cluster(5.0, 1.0, _CONE_SMALL_C, _CONE_SMALL_D, 24)
+    big = _near_face_cluster(8.0, -2.0, _CONE_BIG_C, _CONE_BIG_D, 24)
+    small[:, 2] += 0.02 * small[:, 0]
+    big[:, 2] += 0.02 * big[:, 0]
+    scan = np.vstack(
+        [np.column_stack([gx, gy, gz]), small, big]
+    ).astype(np.float32)
+    detector = RealtimeConeDetector(cfg)
+    detector.detect(scan)  # first scan: no previous plane
+    detector.detect(scan)  # second scan: warm-plane RANSAC branch
 
 
 if __name__ == "__main__":

@@ -47,12 +47,13 @@ class BaseConeDetection(ConeDetectionStrategy):
 
     def configure(self) -> None:
         if not self._numba_warmup_done:
-            two = (
-                self.CONE_DETECTION_CONFIG is not None
-                and self.CONE_DETECTION_CONFIG.fit_backend == "two_param"
+            # Passing the config lets warmup replay the live detect() call
+            # chain with the production solver/backend, and (with cache=True
+            # on the kernels) load the on-disk JIT cache instead of compiling.
+            self._log.info(
+                "warming up Numba kernels (~1-2 s cached, 10-20 s first ever)"
             )
-            self._log.info("warming up Numba kernels (10-20 s)")
-            warmup_numba_functions(also_warm_two_param=two)
+            warmup_numba_functions(config=self.CONE_DETECTION_CONFIG)
             self._numba_warmup_done = True
             self._log.info("Numba warmup complete")
 

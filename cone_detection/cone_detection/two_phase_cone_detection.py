@@ -11,14 +11,14 @@ import numba
 import numpy as np
 
 
-@numba.njit
+@numba.njit(cache=True)
 def cone_model(params, x, y):
     """Generalised cone surface: z(x, y) = d - c·sqrt((x-a)² + (y-b)²)."""
     a, b, c, d = params
     return d - c * np.sqrt((x - a) ** 2 + (y - b) ** 2)
 
 
-@numba.njit
+@numba.njit(cache=True)
 def objective_function_v2(params, x, y, z):
     """Phase-1 cost. Searches over (a, b) at fixed c, d."""
     a, b = params
@@ -36,12 +36,12 @@ def objective_function_v2(params, x, y, z):
     return np.mean((z - z_pred) ** 2)
 
 
-@numba.njit
+@numba.njit(cache=True)
 def get_gammas(x, y, a, b):
     return np.sqrt((x - a) ** 2 + (y - b) ** 2)
 
 
-@numba.njit
+@numba.njit(cache=True)
 def lst_sqrs_fit(X, y):
     # X.T is a non-contiguous transpose view of a C-contiguous X; using
     # it directly in `@` triggers Numba's slow path and emits a

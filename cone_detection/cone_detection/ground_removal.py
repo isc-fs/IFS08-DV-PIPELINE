@@ -22,7 +22,7 @@ import numpy as np
 import numba
 
 
-@numba.njit
+@numba.njit(cache=True)
 def cone_model(params, x, y):
     """Generalized cone surface z(x, y).
 
@@ -37,7 +37,7 @@ def cone_model(params, x, y):
     return d - c * np.sqrt((x - a) ** 2 + (y - b) ** 2)
 
 
-@numba.njit
+@numba.njit(cache=True)
 def objective_function(params, x, y, z):
     """Mean squared residual between observed z and `cone_model`(params, x, y).
 

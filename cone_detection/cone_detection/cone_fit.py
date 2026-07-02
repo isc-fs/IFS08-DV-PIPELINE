@@ -38,14 +38,14 @@ import numpy as np
 from scipy.optimize import minimize
 
 
-@numba.njit
+@numba.njit(cache=True)
 def cone_model(params, x, y):
     """Cone surface: z = d - c * sqrt((x-a)^2 + (y-b)^2)."""
     a, b, c, d = params
     return d - c * np.sqrt((x - a) ** 2 + (y - b) ** 2)
 
 
-@numba.njit
+@numba.njit(cache=True)
 def objective_function_v2(params, x, y, z):
     """MSE for optimizing (a, b) with fixed nominal (c, d) during the nonlinear stage."""
     a, b = params
@@ -55,12 +55,12 @@ def objective_function_v2(params, x, y, z):
     return np.mean((z - z_pred) ** 2)
 
 
-@numba.njit
+@numba.njit(cache=True)
 def get_gammas(x, y, a, b):
     return np.sqrt((x - a) ** 2 + (y - b) ** 2)
 
 
-@numba.njit
+@numba.njit(cache=True)
 def lst_sqrs_fit(X, y_vec):
     # Closed-form normal equations for the (N, 2) design matrix used by
     # ``cone_fit_2params``. Equivalent to ``pinv(X) @ y_vec`` for full-rank
@@ -552,6 +552,88 @@ def template_loss_and_grad(ab, x, y, z, c, d):
     return loss, np.array([grad_a, grad_b])
 
 
+@numba.njit(cache=True)
+def _template_fit_gn(x, y, z, c, d, a0, b0, a_lo, a_hi, b_lo, b_hi, max_iter):
+    """Gauss-Newton with Levenberg-Marquardt damping for the fixed-(c, d) fit.
+
+    Same objective as :func:`template_loss_and_grad` (MSE of
+    ``z = d - c*||(x,y)-(a,b)||``), but solved as the nonlinear least-squares
+    problem it is: exact 2x2 normal equations per step instead of L-BFGS-B's
+    quasi-Newton line search through scipy's Python-level machinery. Steps are
+    projected into the ``[a_lo, a_hi] x [b_lo, b_hi]`` box (same bounds the
+    scipy path uses). LM damping covers near-singular JtJ on degenerate
+    clusters — those normally never get here (collinear dispatch runs first).
+
+    Returns ``(a, b, mse)`` with ``mse`` matching scipy's ``result.fun``.
+    """
+    n = x.shape[0]
+    a = a0
+    b = b0
+    loss = 0.0
+    for i in range(n):
+        dx = x[i] - a
+        dy = y[i] - b
+        r = math.sqrt(dx * dx + dy * dy)
+        e = z[i] - (d - c * r)
+        loss += e * e
+    lam = 1e-8
+    for _ in range(max_iter):
+        h00 = 0.0
+        h01 = 0.0
+        h11 = 0.0
+        g0 = 0.0
+        g1 = 0.0
+        for i in range(n):
+            dx = x[i] - a
+            dy = y[i] - b
+            r = math.sqrt(dx * dx + dy * dy)
+            if r < 1e-12:
+                r = 1e-12
+            e = z[i] - (d - c * r)
+            ja = -c * dx / r
+            jb = -c * dy / r
+            h00 += ja * ja
+            h01 += ja * jb
+            h11 += jb * jb
+            g0 += ja * e
+            g1 += jb * e
+        step_a = 0.0
+        step_b = 0.0
+        improved = False
+        for _try in range(8):
+            d00 = h00 * (1.0 + lam)
+            d11 = h11 * (1.0 + lam)
+            det = d00 * d11 - h01 * h01
+            if det <= 1e-300:
+                break
+            da = -(d11 * g0 - h01 * g1) / det
+            db = -(d00 * g1 - h01 * g0) / det
+            a_new = min(max(a + da, a_lo), a_hi)
+            b_new = min(max(b + db, b_lo), b_hi)
+            loss_new = 0.0
+            for i in range(n):
+                dx = x[i] - a_new
+                dy = y[i] - b_new
+                r = math.sqrt(dx * dx + dy * dy)
+                e = z[i] - (d - c * r)
+                loss_new += e * e
+            if loss_new < loss:
+                step_a = a_new - a
+                step_b = b_new - b
+                a = a_new
+                b = b_new
+                loss = loss_new
+                lam = max(lam / 10.0, 1e-12)
+                improved = True
+                break
+            lam *= 10.0
+        if not improved:
+            break
+        if abs(step_a) < 1e-7 and abs(step_b) < 1e-7:
+            break
+    return a, b, loss / n
+
+
 def cone_fit_template(
     data,
     c_fix,
@@ -579,8 +661,10 @@ def cone_fit_template(
         c_fix: Cone slope to hold fixed (e.g. :data:`_CONE_SMALL_C`).
         d_fix: Apex height to hold fixed (e.g. :data:`_CONE_SMALL_D`).
         lidar_xy: Sensor xy origin in the same frame; defaults to ``(0, 0)``.
-        solver: ``minimize`` method supporting ``jac=True`` and ``bounds=``
-            (default L-BFGS-B).
+        solver: ``"gn"`` for the in-process Numba Gauss-Newton/LM solver
+            (production default via ``ConeDetectionConfig``), or any
+            ``minimize`` method supporting ``jac=True`` and ``bounds=``
+            (e.g. the previous default ``"L-BFGS-B"``) for the scipy path.
 
     Returns:
         Tuple ``(a, b, c_fix, d_fix, residual_mse)``. ``residual_mse`` is the
@@ -602,6 +686,22 @@ def cone_fit_template(
     )
     a0 = min(max(a0, bounds[0][0]), bounds[0][1])
     b0 = min(max(b0, bounds[1][0]), bounds[1][1])
+    if solver == "gn":
+        a, b, residual_mse = _template_fit_gn(
+            x,
+            y,
+            z,
+            float(c_fix),
+            float(d_fix),
+            float(a0),
+            float(b0),
+            bounds[0][0],
+            bounds[0][1],
+            bounds[1][0],
+            bounds[1][1],
+            maxiter,
+        )
+        return float(a), float(b), float(c_fix), float(d_fix), float(residual_mse)
     try:
         result = minimize(
             template_loss_and_grad,
