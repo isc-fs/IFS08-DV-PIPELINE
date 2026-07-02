@@ -59,6 +59,7 @@ from mission_control.interface_contract import (
     DV_FAILED,
     DV_FINISHED,
     DV_PREPARING,
+    HEARTBEAT_STALE_S,
     SERVICE_FORCE_EBS,
     TOPIC_AMI_MISSION,
     TOPIC_ASSI_STATE,
@@ -156,13 +157,22 @@ _RECONCILE_HZ = 10.0
 
 # /assi/state liveness. If no AS-state heartbeat arrives within this
 # window the uDV/emulator (or the link) is considered dead and the
-# pipeline reconciles to torn-down. The uDV publishes /assi/state at
-# ~10 Hz (100 ms), so 0.4 s = 4 missed cycles: jitter-safe, and under the
-# FS-Rules T11.9.4 500 ms cap for detecting a lost safety-critical message.
-# Coordinated with the uDV's matching window on /dv/status
-# (DV_STATUS_STALE_MS = 400 ms in the firmware's dv_interface.h), so on a
-# link loss both sides independently drop to a safe state within the bound.
-_ASSI_STALE_S = 0.4
+# pipeline reconciles to torn-down. Sourced from the interface contract
+# (HEARTBEAT_STALE_S) so this window and the firmware's DV_STATUS_STALE_MS
+# stay a single value; see interface_contract for the rationale.
+#
+# NOTE (timing margin — see also firmware dv_interface.h): the watchdog is
+# only evaluated once per reconcile tick (_RECONCILE_HZ = 10 Hz, ~100 ms)
+# and the staleness test is a strict `>`. Worst case, the last good sample
+# lands just before a tick, so detection is up to _ASSI_STALE_S + one tick
+# ≈ 0.4 + 0.1 = 0.5 s — i.e. the pipeline may not even *begin* teardown
+# until the FS-Rules T11.9.4 500 ms cap, leaving ~0 margin for the reaction
+# itself. The safety-critical direction (firmware watching /dv/status →
+# Emergency/EBS) is fast (AppTask loops ~1 ms) and independent, so this is a
+# teardown-latency concern, not an EBS-latency one. If margin is ever needed,
+# tighten this window (e.g. 0.3 s) rather than relying on the cap, and/or
+# raise _RECONCILE_HZ so the tick granularity stops eating the budget.
+_ASSI_STALE_S = HEARTBEAT_STALE_S
 
 
 _LATCHED_QOS = QoSProfile(

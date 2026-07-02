@@ -62,6 +62,22 @@ TOPIC_DV_STATUS   = "/dv/status"
 TOPIC_CTRL_CMD    = "/ctrl/cmd"
 SERVICE_FORCE_EBS = "/force_ebs"
 
+# Heartbeat liveness bound (seconds) — the canonical value shared by both
+# directions. Each byte topic above is the other side's liveness heartbeat;
+# a side reconciles/trips to its safe state when the other's heartbeat has
+# been silent for longer than this. At the >= 10 Hz publish cadence that is
+# 4 missed cycles (jitter-safe), and it sits strictly under
+# HEARTBEAT_STALE_CAP_S — the FS-Rules T11.9.4 bound for detecting a lost
+# safety-critical message and entering the safe state.
+#
+# This is the single source of truth. The uDV firmware MUST mirror it as
+# DV_STATUS_STALE_MS in dv_interface.h (currently 400 ms) — the two repos
+# have no build-time link, so keep them in lockstep by hand. The pipeline
+# test suite pins HEARTBEAT_STALE_S <= HEARTBEAT_STALE_CAP_S; the firmware
+# static_asserts DV_STATUS_STALE_MS < DV_STATUS_STALE_CAP_MS.
+HEARTBEAT_STALE_CAP_S = 0.5    # FS-Rules T11.9.4 detect-and-safe cap
+HEARTBEAT_STALE_S     = 0.4    # == firmware DV_STATUS_STALE_MS (400 ms)
+
 # Sim operator panel — the AMI board + RES buttons stand-in. SIM-ONLY
 # (Linux↔Linux): the backend/CLI drive sim_supervisor's emulated AS state
 # machine through these; the real car has no equivalent (the AMI board /

@@ -8,6 +8,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 # Put the package dir (parent of test/) on the path so
 # `import mission_control.interface_contract` resolves without ROS.
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -26,6 +28,8 @@ from mission_control.interface_contract import (  # noqa: E402
     DV_FINISHED,
     DV_EMERGENCY,
     DV_FAILED,
+    HEARTBEAT_STALE_S,
+    HEARTBEAT_STALE_CAP_S,
     ami_index_to_mission_id,
     mission_id_to_ami_index,
 )
@@ -42,6 +46,28 @@ def test_dv_status_bytes_are_distinct_and_ordered():
               DV_FINISHED, DV_EMERGENCY, DV_FAILED]
     assert bytes_ == [0, 1, 2, 3, 4, 5, 6]
     assert len(set(bytes_)) == len(bytes_)
+
+
+def test_heartbeat_stale_window_is_under_fs_rules_cap():
+    # FS-Rules T11.9.4: a lost safety-critical message must be detected and
+    # the safe state entered within 500 ms. The liveness window must stay
+    # strictly under that cap (strict, since the pipeline still needs a tick
+    # to act after detection). Mirrored firmware-side by the
+    # DV_STATUS_STALE_MS < DV_STATUS_STALE_CAP_MS static_assert.
+    assert HEARTBEAT_STALE_CAP_S == 0.5
+    assert HEARTBEAT_STALE_S <= 0.5
+    assert HEARTBEAT_STALE_S < HEARTBEAT_STALE_CAP_S
+
+
+def test_node_uses_shared_heartbeat_window():
+    # The reconciler's _ASSI_STALE_S must be the shared contract value, so
+    # the pipeline uplink window and the firmware's DV_STATUS_STALE_MS can
+    # never drift apart silently. mission_control_node pulls in rclpy; skip
+    # (don't fail) when ROS isn't on the path, matching the pure-contract
+    # tests above which never import it.
+    pytest.importorskip("rclpy")
+    from mission_control.mission_control_node import _ASSI_STALE_S
+    assert _ASSI_STALE_S == HEARTBEAT_STALE_S
 
 
 def test_ami_index_maps_to_registry_mission_ids():
