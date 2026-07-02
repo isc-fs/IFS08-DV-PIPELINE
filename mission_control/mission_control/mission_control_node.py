@@ -156,9 +156,13 @@ _RECONCILE_HZ = 10.0
 
 # /assi/state liveness. If no AS-state heartbeat arrives within this
 # window the uDV/emulator (or the link) is considered dead and the
-# pipeline reconciles to torn-down. Must be comfortably longer than the
-# uDV's publish period (>=2 Hz → 0.5 s) to tolerate jitter.
-_ASSI_STALE_S = 1.5
+# pipeline reconciles to torn-down. The uDV publishes /assi/state at
+# ~10 Hz (100 ms), so 0.4 s = 4 missed cycles: jitter-safe, and under the
+# FS-Rules T11.9.4 500 ms cap for detecting a lost safety-critical message.
+# Coordinated with the uDV's matching window on /dv/status
+# (DV_STATUS_STALE_MS = 400 ms in the firmware's dv_interface.h), so on a
+# link loss both sides independently drop to a safe state within the bound.
+_ASSI_STALE_S = 0.4
 
 
 _LATCHED_QOS = QoSProfile(
