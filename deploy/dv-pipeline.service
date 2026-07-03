@@ -1,0 +1,28 @@
+# dv-pipeline.service — ISC DVPC race-mode unit: the REAL autonomy stack.
+# Replaces isc-startup.service (the old isc_ws stub stack) as what race mode
+# / `dv race` starts. Deliberately NOT enabled: dv-mode.service (race boot)
+# or the operator (`dv race`) starts it; `dv stop` stops it.
+#
+# Versioned in IFS08-DV-PIPELINE/deploy/ — install with
+#   sudo ~/dv_ws/src/IFS08-DV-PIPELINE/deploy/install_dv_pipeline_service.sh
+
+[Unit]
+Description=ISC DV pipeline (sensors + mission_control + autonomy nodes)
+Documentation=https://github.com/isc-fs/IFS08-DV-PIPELINE
+# The uDV link is the mission_control peer — no agent, no pipeline.
+After=network.target microros-agent.service
+Requires=microros-agent.service
+
+[Service]
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+User=isc
+# ros2_ws first (hesai_ros_driver), then dv_ws (the pipeline).
+ExecStart=/bin/bash -c "source /opt/ros/humble/setup.bash && \
+    source /home/isc/ros2_ws/install/local_setup.bash && \
+    source /home/isc/dv_ws/install/local_setup.bash && \
+    exec ros2 launch bringup car_bringup.launch.py"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
