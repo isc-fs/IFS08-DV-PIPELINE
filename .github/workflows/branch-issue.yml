@@ -5,6 +5,7 @@ on:
     branches:
       - 'feat/**'
       - 'fix/**'
+  workflow_dispatch:
 
 jobs:
   open-issue:
@@ -64,7 +65,9 @@ jobs:
               direction: 'desc',
               per_page: 100,
             });
-            const regex = new RegExp(`^\\[${type}/(\\d+)\\]`);
+            /* Accept both bare `[feat/N]` and titled `[feat/N-short-title]`
+               issue prefixes when scanning for the highest used number. */
+            const regex = new RegExp(`^\\[${type}/(\\d+)(?:-[^\\]]*)?\\]`);
             let maxNumber = 0;
             for (const issue of issues.data) {
               const match = issue.title.match(regex);

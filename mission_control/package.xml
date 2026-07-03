@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>mission_control</name>
+  <version>0.0.1</version>
+  <description>
+    mission_control_node — lifecycle orchestrator for the DV pipeline's
+    autonomy stack. Receives SetMission from sim_supervisor (or, on
+    the real car, from the physical uDV's microROS endpoint), drives
+    mode_manager_node to bring up the autonomy lifecycle nodes with
+    the correct mission strategy flag, and forwards control commands
+    from control_node back to the supervisor (sim) or uDV (real car).
+
+    NOT to be confused with tools/mission_control/{frontend,backend} —
+    that's the IFSSIM-side web stack. This package is the DV-pipeline
+    ROS node that the web backend ultimately drives through the
+    supervisor.
+
+    See docs/autonomy_pipeline.md §"Roles inside mission management".
+  </description>
+  <maintainer email="raul@isc-fs.com">Raul Moran</maintainer>
+  <license>GPL-3.0-or-later</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>lifecycle_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>fs_msgs</depend>
+  <depend>dv_msgs</depend>
+  <!-- Imports mode_manager.mode_registry (the MODE_REGISTRY + mission
+       id maps that mission_control uses to resolve incoming mission
+       strings) and mode_manager.mode_manager_node.TRANSITION_SETUP
+       (sentinel transition ID rendered in SetMission feedback). -->
+  <depend>mode_manager</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

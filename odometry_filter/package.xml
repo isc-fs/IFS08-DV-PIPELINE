@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>odometry_filter</name>
+  <version>0.2.0</version>
+  <description>
+    Hand-rolled 9-state EKF for body-frame odometry on the IFS-08 DV
+    pipeline. State = [x, y, θ, vx, vy, ω, ba_x, ba_y, bg_z]. Predict
+    step is Coriolis-correct (v̇x = ax + ω·vy, v̇y = ay − ω·vx) — fixes
+    the cornering vy drift that was the trackdrive ceiling pre-rewrite.
+    Measurements: motor-RPM → vx; steering-angle kinematic-bicycle →
+    ω (gated under slip). No ROS dependency in the library itself —
+    the lifecycle wrapper lives in odometry_filter_node. The same
+    library is intended to compile against the real-car uDV firmware.
+  </description>
+  <maintainer email="moranguerra18@gmail.com">Raúl Morán</maintainer>
+  <license>GPL-3.0-or-later</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>eigen3_cmake_module</buildtool_depend>
+
+  <depend>eigen</depend>
+
+  <!-- Optional: Python bindings for the offline SLAM benchmark. The
+       build stays functional without these (CMake gates on pybind11). -->
+  <build_depend>pybind11_vendor</build_depend>
+  <build_depend>python3-dev</build_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

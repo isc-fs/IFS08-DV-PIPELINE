@@ -50,3 +50,17 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# Python / ament_python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.cpython-*
+*.pyd
+*.egg-info/
+.pytest_cache/
+
+# colcon workspace (host-side or in-container builds synced to src/)
+build/
+install/
+log/
