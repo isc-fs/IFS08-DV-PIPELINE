@@ -149,11 +149,25 @@ _ACTIVATE_MODE_TIMEOUT_S = 240.0
 # /activate_mode is discoverable.
 _ACTIVATE_MODE_SRV_WAIT_S = 60.0
 
-# Reconcile + /dv/status heartbeat cadence. 10 Hz: well above the >=2 Hz
-# the interface contract requires for the heartbeat, and fast enough that
-# a go (AS Driving) is acted on within ~100 ms — negligible against the
-# multi-second activate it triggers.
-_RECONCILE_HZ = 10.0
+# Reconcile / watchdog tick. The /assi/state staleness watchdog is only
+# evaluated once per tick, so the tick period is part of the T11.9.4
+# detection budget: worst case, the last good heartbeat lands just before
+# a tick and the loss is noticed _ASSI_STALE_S + one tick later. 20 Hz
+# keeps that at 0.4 + 0.05 = 0.45 s — 50 ms of reaction margin under the
+# 0.5 s cap (pinned by test_detection_budget_leaves_reaction_margin) —
+# and a go (AS Driving) is acted on within ~50 ms. The margin comes from
+# the tick rate, NOT from thinning the 0.4 s window: at the uDV's 10 Hz
+# publish cadence the window must stay 4 missed cycles so a couple of
+# dropped best-effort samples can't cause a false teardown.
+_RECONCILE_HZ = 20.0
+
+# /dv/status heartbeat cadence ON THE WIRE. Deliberately slower than the
+# tick: the firmware sizes its DV_STATUS_STALE_MS = 400 ms window as
+# "4 missed cycles at 10 Hz" (dv_interface.h), so the wire rate stays
+# 10 Hz — _tick publishes every _DV_STATUS_EVERY_N-th tick. Must divide
+# _RECONCILE_HZ exactly (test-pinned).
+_DV_STATUS_PUB_HZ = 10.0
+_DV_STATUS_EVERY_N = int(_RECONCILE_HZ / _DV_STATUS_PUB_HZ)
 
 # /assi/state liveness. If no AS-state heartbeat arrives within this
 # window the uDV/emulator (or the link) is considered dead and the
@@ -161,17 +175,11 @@ _RECONCILE_HZ = 10.0
 # (HEARTBEAT_STALE_S) so this window and the firmware's DV_STATUS_STALE_MS
 # stay a single value; see interface_contract for the rationale.
 #
-# NOTE (timing margin — see also firmware dv_interface.h): the watchdog is
-# only evaluated once per reconcile tick (_RECONCILE_HZ = 10 Hz, ~100 ms)
-# and the staleness test is a strict `>`. Worst case, the last good sample
-# lands just before a tick, so detection is up to _ASSI_STALE_S + one tick
-# ≈ 0.4 + 0.1 = 0.5 s — i.e. the pipeline may not even *begin* teardown
-# until the FS-Rules T11.9.4 500 ms cap, leaving ~0 margin for the reaction
-# itself. The safety-critical direction (firmware watching /dv/status →
-# Emergency/EBS) is fast (AppTask loops ~1 ms) and independent, so this is a
-# teardown-latency concern, not an EBS-latency one. If margin is ever needed,
-# tighten this window (e.g. 0.3 s) rather than relying on the cap, and/or
-# raise _RECONCILE_HZ so the tick granularity stops eating the budget.
+# Detection budget (T11.9.4): worst-case detection = _ASSI_STALE_S + one
+# reconcile tick = 0.4 + 0.05 = 0.45 s < 0.5 s cap — see _RECONCILE_HZ
+# above. The safety-critical direction (firmware watching /dv/status →
+# Emergency/EBS) is independent and faster (~1 ms loop), so that path
+# never depended on this budget.
 _ASSI_STALE_S = HEARTBEAT_STALE_S
 
 
@@ -226,6 +234,7 @@ class MissionControlNode(LifecycleNode):
         self._activated: bool = False
         self._busy: bool = False            # an activate_mode call in flight
         self._pending_action: ReconcileAction | None = None
+        self._tick_no: int = 0              # throttles /dv/status to 10 Hz
 
         # Sticky terminal/override flags (cleared when torn down / idle).
         self._failed: bool = False
@@ -388,7 +397,13 @@ class MissionControlNode(LifecycleNode):
     # reconcile loop
     # ==================================================================
     def _tick(self) -> None:
-        """Periodic: watchdog, reconcile one step, publish /dv/status."""
+        """Periodic: watchdog, reconcile one step, publish /dv/status.
+
+        Runs at _RECONCILE_HZ (watchdog detection granularity); the
+        /dv/status wire heartbeat is throttled to _DV_STATUS_PUB_HZ so the
+        firmware-observed cadence is unchanged by the faster tick.
+        """
+        self._tick_no += 1
         as_state = self._effective_as_state()
 
         # AS-state-driven EBS (Emergency). The /ctrl/emergency path is
@@ -400,7 +415,8 @@ class MissionControlNode(LifecycleNode):
         if not self._busy:
             self._reconcile(as_state)
 
-        self._publish_dv_status(self._current_dv_status())
+        if self._tick_no % _DV_STATUS_EVERY_N == 0:
+            self._publish_dv_status(self._current_dv_status())
 
     def _effective_as_state(self) -> int:
         """Latest AS state, or AS_OFF if the heartbeat is stale/absent."""

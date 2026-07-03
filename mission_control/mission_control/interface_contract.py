@@ -75,6 +75,14 @@ SERVICE_FORCE_EBS = "/force_ebs"
 # have no build-time link, so keep them in lockstep by hand. The pipeline
 # test suite pins HEARTBEAT_STALE_S <= HEARTBEAT_STALE_CAP_S; the firmware
 # static_asserts DV_STATUS_STALE_MS < DV_STATUS_STALE_CAP_MS.
+#
+# Detection budget: each watcher only evaluates staleness on its own tick,
+# so its worst-case detection latency is HEARTBEAT_STALE_S + one tick
+# period — and THAT sum, not the bare window, must stay under the cap.
+# Firmware side: AppTask loops ~1 ms, trivially fine. Pipeline side: the
+# reconcile tick (_RECONCILE_HZ in mission_control_node) is sized so
+# window + tick leaves real reaction margin, pinned by
+# test_detection_budget_leaves_reaction_margin.
 HEARTBEAT_STALE_CAP_S = 0.5    # FS-Rules T11.9.4 detect-and-safe cap
 HEARTBEAT_STALE_S     = 0.4    # == firmware DV_STATUS_STALE_MS (400 ms)
 

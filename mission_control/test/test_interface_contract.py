@@ -70,6 +70,39 @@ def test_node_uses_shared_heartbeat_window():
     assert _ASSI_STALE_S == HEARTBEAT_STALE_S
 
 
+def test_detection_budget_leaves_reaction_margin():
+    # T11.9.4 detection budget: the staleness watchdog only runs once per
+    # reconcile tick, so worst-case detection = window + one tick period.
+    # Demand >= 40 ms of reaction margin under the cap so tick granularity
+    # can never silently eat the whole budget again (at the old 10 Hz tick
+    # it was 0.4 + 0.1 = 0.5 s -> zero margin, right at the cap).
+    pytest.importorskip("rclpy")
+    from mission_control.mission_control_node import (
+        _ASSI_STALE_S,
+        _RECONCILE_HZ,
+    )
+    tick_s = 1.0 / _RECONCILE_HZ
+    assert _ASSI_STALE_S + tick_s <= HEARTBEAT_STALE_CAP_S - 0.04
+
+
+def test_dv_status_wire_cadence_matches_contract():
+    # The firmware sizes DV_STATUS_STALE_MS (400 ms) as 4 missed cycles of
+    # a 10 Hz /dv/status (dv_interface.h). The reconcile tick may run
+    # faster for watchdog granularity, but the wire cadence must stay
+    # 10 Hz and the throttle divisor exact, or the published period drifts
+    # away from what the firmware window was sized against.
+    pytest.importorskip("rclpy")
+    from mission_control.mission_control_node import (
+        _DV_STATUS_EVERY_N,
+        _DV_STATUS_PUB_HZ,
+        _RECONCILE_HZ,
+    )
+    assert _DV_STATUS_PUB_HZ == 10.0
+    assert _RECONCILE_HZ % _DV_STATUS_PUB_HZ == 0
+    assert _DV_STATUS_EVERY_N >= 1
+    assert _DV_STATUS_EVERY_N * _DV_STATUS_PUB_HZ == _RECONCILE_HZ
+
+
 def test_ami_index_maps_to_registry_mission_ids():
     # AMI ws2812.c index → mode_registry mission_id.
     assert ami_index_to_mission_id(4) == 1   # Track drive  → trackdrive
