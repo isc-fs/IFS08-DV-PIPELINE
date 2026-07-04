@@ -43,16 +43,18 @@ REMAP_BRAKE    = ("/fsds/brake_pressure", "/brake_pressure")
 # ---------------------------------------------------------------------
 # Car surface (real-vehicle sources → pipeline-side names).
 #
-# Verified against the live firmware (IFS08-DV-uDV @ feat/14, node
-# `cubemx_node`, empty namespace) and the Hesai driver:
+# Verified against the live firmware (IFS08-DV-uDV, node `cubemx_node`,
+# empty namespace) and the Hesai driver:
 #
-#   uDV   /imu/data_raw   sensor_msgs/Imu          400 Hz  → pure remap
-#   Hesai /lidar_points   sensor_msgs/PointCloud2  ~10 Hz  → pure remap
+#   uDV   /imu           sensor_msgs/Imu          400 Hz  → direct (no remap)
+#   Hesai /lidar_points  sensor_msgs/PointCloud2  ~10 Hz  → pure remap
 #
-# Only IMU and LiDAR are pure remaps (type + units already match). The
-# other two EKF inputs are published by the uDV directly on their
-# canonical names (the unit conversions moved into firmware), so they are
-# NOT in this table:
+# IMU is canonical `/imu` on BOTH sides: the firmware publishes `/imu` and
+# odometry_filter_node / slam_node subscribe to `/imu` in code, so the car
+# needs NO IMU remap (settled 2026-07-04 — standardised on `/imu`, dropping
+# the old `/imu/data_raw` name). Only the LiDAR needs a car remap. The other
+# EKF inputs are published by the uDV directly on their canonical names (the
+# unit conversions moved into firmware):
 #
 #   /steering_angle  uDV converts its steering sensor DEG→RAD on-board
 #                    and publishes /steering_angle (RADIANS) directly.
@@ -61,7 +63,6 @@ REMAP_BRAKE    = ("/fsds/brake_pressure", "/brake_pressure")
 #
 # See docs/CAR_ADAPTATION.md for the full contract and the flagged gaps.
 # ---------------------------------------------------------------------
-REMAP_IMU_CAR   = ("/imu",               "/imu/data_raw")
 REMAP_LIDAR_CAR = ("/fsds/lidar/Lidar1", "/lidar_points")
 
 # NOTE: the *runtime* stock-typed uDV ↔ mission_control interface (the
@@ -105,10 +106,12 @@ def autonomy_remaps(profile: str = "sim") -> dict[str, list[tuple[str, str]]]:
             f"(expected 'sim' or 'car')")
 
     if profile == "car":
+        # IMU is canonical /imu on both sides (firmware publishes /imu; the
+        # nodes subscribe to /imu in code) → NO IMU remap. Only LiDAR remaps.
         return {
-            "odometry_filter_node": [REMAP_IMU_CAR],
+            "odometry_filter_node": [],
             "cone_detection_node": [REMAP_LIDAR_CAR],
-            "slam_node": [REMAP_IMU_CAR],
+            "slam_node": [],
             "path_planning_node": [],
             "control_node": [],
         }

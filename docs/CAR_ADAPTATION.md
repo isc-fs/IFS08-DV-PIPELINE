@@ -38,7 +38,7 @@ type here is in the standard micro-ROS interface set.
 |---|---|---|
 | `/assi/state` | `std_msgs/UInt8` | AS state machine byte (FS-Rules T14.9). **Publish ≥2 Hz** — it is mission_control's liveness heartbeat. |
 | `/ami/mission` | `std_msgs/Int32` | selected AMI mission **index** (0..9). |
-| `/imu/data_raw` | `sensor_msgs/Imu` | 400 Hz → autonomy `/imu` (pure remap). |
+| `/imu` | `sensor_msgs/Imu` | 400 Hz → consumed directly by autonomy `/imu` (no remap; canonical on both sides). |
 | `/steering_angle` | `std_msgs/Float32` | **radians** — converted on-board from the deg sensor. |
 | `/motor_rpm` | `std_msgs/Float32` | motor-shaft RPM from the inverter. |
 | `/lidar_points` | `sensor_msgs/PointCloud2` | Hesai → autonomy `/fsds/lidar/Lidar1` (pure remap). |

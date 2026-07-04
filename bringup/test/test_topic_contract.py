@@ -23,7 +23,6 @@ sys.path.insert(0, ROOT)
 
 from bringup.topic_contract import (  # noqa: E402
     AUTONOMY_EXECUTABLES,
-    REMAP_IMU_CAR,
     REMAP_LIDAR_CAR,
     autonomy_remaps,
 )
@@ -33,10 +32,16 @@ from bringup.topic_contract import (  # noqa: E402
 # Car remap direction — the bit that silently bricks the car if wrong.
 # --------------------------------------------------------------------
 
-def test_car_imu_remap_direction():
-    # odometry_filter_node + slam_node subscribe to "/imu" IN CODE; on
-    # the car that must be rewritten onto the uDV's /imu/data_raw.
-    assert REMAP_IMU_CAR == ("/imu", "/imu/data_raw")
+def test_car_imu_is_not_remapped():
+    # IMU is canonical /imu on BOTH sides: the firmware publishes /imu and
+    # odometry_filter_node / slam_node subscribe to /imu in code, so the car
+    # must NOT remap the IMU (a remap would point the nodes at a name nobody
+    # publishes). Standardised on /imu 2026-07-04.
+    flat = [t for remaps in autonomy_remaps("car").values() for t in remaps]
+    froms = {frm for frm, _to in flat}
+    targets = {to for _from, to in flat}
+    assert "/imu" not in froms and "/imu" not in targets
+    assert "/imu/data_raw" not in froms and "/imu/data_raw" not in targets
 
 
 def test_car_lidar_remap_direction():
@@ -55,15 +60,16 @@ def test_car_remaps_never_target_isc_namespace():
 
 
 # --------------------------------------------------------------------
-# Car table shape — IMU + LiDAR pure remaps; steering/rpm come from the
-# bridge on canonical names (so they must NOT appear as remaps).
+# Car table shape — ONLY LiDAR is remapped; IMU is canonical /imu on both
+# sides, and steering/rpm come from the uDV on canonical names (so none of
+# those may appear as remaps).
 # --------------------------------------------------------------------
 
-def test_car_only_imu_and_lidar_are_remapped():
+def test_car_only_lidar_is_remapped():
     car = autonomy_remaps("car")
-    assert car["odometry_filter_node"] == [REMAP_IMU_CAR]
+    assert car["odometry_filter_node"] == []
     assert car["cone_detection_node"] == [REMAP_LIDAR_CAR]
-    assert car["slam_node"] == [REMAP_IMU_CAR]
+    assert car["slam_node"] == []
     assert car["path_planning_node"] == []
     assert car["control_node"] == []
 
