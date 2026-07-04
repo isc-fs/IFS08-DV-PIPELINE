@@ -160,11 +160,13 @@ def autonomy_actions(profile: str = "sim") -> list:
     Args:
         profile: "sim" wires the autonomy onto the IFSSIM /fsds/* bridge
             surface (the historical default). "car" wires it onto the
-            real-vehicle surface: IMU+LiDAR are pure remaps onto the uDV
-            / Hesai topics (REMAP_*_CAR), while /steering_angle and
+            real-vehicle surface: only the LiDAR is a pure remap onto the
+            Hesai topic (REMAP_LIDAR_CAR). IMU is canonical /imu on both
+            sides (the uDV publishes /imu and the nodes subscribe to /imu
+            in code), so it is NOT remapped; likewise /steering_angle and
             /motor_rpm arrive on their canonical names from the uDV
             directly (steering converted to rad on-board, /motor_rpm from
-            the inverter), so they need no remap. The sim-only ground-truth debug taps
+            the inverter). The sim-only ground-truth debug taps
             (REMAP_GT / REMAP_TRACK on slam) are dropped on the car —
             nothing publishes /fsds/testing_only/* there.
     """
