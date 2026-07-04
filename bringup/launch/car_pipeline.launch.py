@@ -6,13 +6,13 @@ wired onto the REAL car sensor/actuator surface instead of the IFSSIM
 
 What makes this the "car" build (vs sim_pipeline / full_pipeline):
 
-  * autonomy_actions(profile="car") — IMU and LiDAR are remapped onto
-    the uDV (/imu/data_raw) and Hesai (/lidar_points) topics; the
-    sim-only ground-truth taps are dropped.
+  * autonomy_actions(profile="car") — only the LiDAR is remapped onto the
+    Hesai (/lidar_points) topic; IMU is canonical /imu on both sides (no
+    remap); the sim-only ground-truth taps are dropped.
   * NO car-side adapter nodes. The uDV (a micro-ROS endpoint) is the
     mission_control peer directly, over the stock-typed interface in
     topic_contract.py: it publishes /assi/state + /ami/mission and its
-    sensors (/imu/data_raw, /steering_angle in rad, /motor_rpm from the
+    sensors (/imu, /steering_angle in rad, /motor_rpm from the
     inverter), and consumes /dv/status + /ctrl/cmd (geometry_msgs/Twist)
     + /force_ebs (std_srvs/SetBool). mission_control reconciles the same
     surface here that sim_supervisor (the sim uDV emulator) provides in
