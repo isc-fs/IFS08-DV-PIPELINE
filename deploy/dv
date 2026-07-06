@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # dv — DVPC racing-operation control + status
-# Usage: dv {race|stop|restart|update|mode|status}
+# Usage: dv {race|stop|restart|update|mode [race|umbilical|auto]|status}
 #
 # Versioned in IFS08-DV-PIPELINE/deploy/ (installed to /usr/local/bin by
 # install_dv_pipeline_service.sh). Racing operation = dv-pipeline.service
@@ -13,13 +13,30 @@ case "${1:-status}" in
   stop)    sudo -n systemctl stop    dv-pipeline.service && echo "[dv] racing operation stopped"   ; _mark ;;
   restart) sudo -n systemctl restart dv-pipeline.service && echo "[dv] racing operation restarted" ;;
   update)  /home/isc/dv_pipeline_update.sh ;;
-  mode)    cat /run/dv_mode 2>/dev/null || echo unknown ;;
+  mode)
+    # No arg: report the mode picked at boot. Arg: set/clear the boot-mode
+    # override read by dv_detect_mode.sh (effective next boot; /etc/dv is
+    # isc-owned by the installer so no sudo is needed here).
+    case "${2:-}" in
+      "")             cat /run/dv_mode 2>/dev/null || echo unknown ;;
+      race|umbilical)
+        if ( printf '%s\n' "$2" > /etc/dv/mode ) 2>/dev/null; then
+          echo "[dv] boot-mode override set to '$2' (effective next boot; use 'dv race' to act now)"
+        else
+          echo "[dv] cannot write /etc/dv/mode — run the installer, or: sudo install -d -o isc /etc/dv"; exit 1
+        fi ;;
+      auto|clear)
+        rm -f /etc/dv/mode 2>/dev/null || true
+        echo "[dv] boot-mode override cleared (autodetect from enp2s0 carrier)" ;;
+      *) echo "usage: dv mode [race|umbilical|auto]"; exit 1 ;;
+    esac ;;
   status)
-    echo "mode:         $(cat /run/dv_mode 2>/dev/null || echo unknown)  (enp2s0 carrier=$(cat /sys/class/net/enp2s0/carrier 2>/dev/null || echo ?))"
+    echo "mode:         $(cat /run/dv_mode 2>/dev/null || echo unknown)  (enp2s0 carrier=$(cat /sys/class/net/enp2s0/carrier 2>/dev/null || echo ?), override=$(cat /etc/dv/mode 2>/dev/null || echo auto))"
+    echo "pipeline:     health=$(cat /run/dv_pipeline_health 2>/dev/null || echo unknown)"
     for s in dv-pipeline microros-agent ptp4l dv-mode isc-startup; do
       printf "%-16s %s\n" "$s:" "$(systemctl is-active "$s" 2>/dev/null)"
     done
     echo "last update:  $(tail -1 /home/isc/dv_ws/update_status.txt 2>/dev/null || echo none)"
     ;;
-  *) echo "usage: dv {race|stop|restart|update|mode|status}"; exit 1 ;;
+  *) echo "usage: dv {race|stop|restart|update|mode [race|umbilical|auto]|status}"; exit 1 ;;
 esac
