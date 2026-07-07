@@ -1,0 +1,8 @@
+# /etc/sudoers.d/dv-race  (install mode 0440)
+# Let the isc user start/stop/restart ONLY the racing-operation unit without a
+# password, so the umbilical login prompt ([r] RACE) and the `dv` CLI can
+# control it. The racing unit is dv-pipeline.service — it was isc-startup.service
+# before the real-pipeline switch, and that rename missed THIS file, so
+# `sudo -n systemctl start dv-pipeline.service` needed a password and both
+# `[r]` and `dv race` failed with "Could not start automatically".
+isc ALL=(root) NOPASSWD: /usr/bin/systemctl start dv-pipeline.service, /usr/bin/systemctl stop dv-pipeline.service, /usr/bin/systemctl restart dv-pipeline.service
