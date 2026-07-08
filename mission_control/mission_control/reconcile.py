@@ -60,6 +60,14 @@ class ReconcileAction(Enum):
     TEARDOWN = "teardown"   # activate_mode("", ...) — deactivate + cleanup
 
 
+class EbsAction(Enum):
+    """What the /force_ebs request loop should do this reconcile tick."""
+
+    NONE = "none"          # not in emergency, or the request is already acked
+    WAIT = "wait"          # want EBS but retry later (in flight / not ready)
+    DISPATCH = "dispatch"  # call /force_ebs now
+
+
 def is_runnable_mission(mission_id: int) -> bool:
     """True if mission_id selects an actual autonomy mission (>0)."""
     return int(mission_id) > 0
@@ -72,6 +80,35 @@ def should_request_ebs(as_state: int) -> bool:
     the node; this covers the AS-state-driven request.)
     """
     return int(as_state) == AS_EMERGENCY
+
+
+def next_ebs_action(
+    *,
+    emergency: bool,
+    acked: bool,
+    call_in_flight: bool,
+    service_ready: bool,
+) -> EbsAction:
+    """Decide the EBS request step so a dropped call is retried, not lost.
+
+    The request is considered done ONLY once the uDV acks it (`acked`).
+    Until then every reconcile tick re-evaluates: dispatch when the
+    service is ready and no call is already in flight, otherwise wait and
+    try again next tick. Crucially, an unready service or a failed call
+    never latches `acked`, so a single dropped /force_ebs can't silently
+    kill the EBS path for the rest of the session.
+
+    Args:
+        emergency: whether the node currently wants EBS asserted.
+        acked: whether a prior /force_ebs call returned success.
+        call_in_flight: whether a /force_ebs call is awaiting its response.
+        service_ready: whether the /force_ebs client has a live server.
+    """
+    if not emergency or acked:
+        return EbsAction.NONE
+    if call_in_flight or not service_ready:
+        return EbsAction.WAIT
+    return EbsAction.DISPATCH
 
 
 def target_for(as_state: int, desired_mission_id: int) -> Target:

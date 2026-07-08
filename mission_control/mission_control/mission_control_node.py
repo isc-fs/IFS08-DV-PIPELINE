@@ -69,9 +69,10 @@ from mission_control.interface_contract import (
 )
 from mission_control.interface_qos import UPLINK_QOS
 from mission_control.reconcile import (
+    EbsAction,
     ReconcileAction,
-    is_runnable_mission,
     next_action,
+    next_ebs_action,
     should_request_ebs,
     steady_dv_status,
     target_for,
@@ -240,7 +241,8 @@ class MissionControlNode(LifecycleNode):
         self._failed: bool = False
         self._finished: bool = False
         self._emergency: bool = False
-        self._ebs_requested: bool = False
+        self._ebs_requested: bool = False   # set only when /force_ebs acks
+        self._ebs_future = None             # in-flight /force_ebs call, if any
 
         # --- control relay cache ---
         self._latest_ctrl_cmd: ControlCommand = ControlCommand()
@@ -406,10 +408,12 @@ class MissionControlNode(LifecycleNode):
         self._tick_no += 1
         as_state = self._effective_as_state()
 
-        # AS-state-driven EBS (Emergency). The /ctrl/emergency path is
-        # handled in its callback; this covers the uDV asserting Emergency.
+        # AS-state-driven EBS (Emergency). The /ctrl/emergency callback also
+        # raises _emergency; either way we (re)issue /force_ebs here every
+        # tick until the uDV acks it, so a dropped call is retried, not lost.
         if should_request_ebs(as_state):
             self._emergency = True
+        if self._emergency:
             self._request_ebs()
 
         if not self._busy:
@@ -439,6 +443,7 @@ class MissionControlNode(LifecycleNode):
             self._failed = self._finished = False
             self._emergency = False
             self._ebs_requested = False
+            self._ebs_future = None
 
         if action is ReconcileAction.NONE:
             return
@@ -539,19 +544,56 @@ class MissionControlNode(LifecycleNode):
         self._ctrl_cmd_pub.publish(twist)
 
     def _request_ebs(self) -> None:
-        if self._ebs_requested:
+        """(Re)issue /force_ebs, retrying until the uDV acknowledges it.
+
+        Driven every reconcile tick while in emergency (see _tick). The
+        request is latched done (`_ebs_requested`) ONLY on a positive ack,
+        via `_on_ebs_response` — an unavailable service or a failed/negative
+        call leaves the path open so the next tick retries. A single dropped
+        call can no longer silently kill the EBS request for the session.
+        """
+        service_ready = (self._force_ebs_client is not None
+                         and self._force_ebs_client.service_is_ready())
+        call_in_flight = (self._ebs_future is not None
+                          and not self._ebs_future.done())
+        action = next_ebs_action(
+            emergency=self._emergency,
+            acked=self._ebs_requested,
+            call_in_flight=call_in_flight,
+            service_ready=service_ready,
+        )
+        if action is not EbsAction.DISPATCH:
+            if action is EbsAction.WAIT and not service_ready:
+                # Throttled: the tick calls us at _RECONCILE_HZ (20 Hz).
+                self.get_logger().error(
+                    f"{SERVICE_FORCE_EBS} unavailable — cannot request EBS "
+                    "over ROS yet, will retry (the uDV should trigger EBS "
+                    "autonomously too)", throttle_duration_sec=1.0)
             return
-        self._ebs_requested = True
-        if self._force_ebs_client is None or \
-                not self._force_ebs_client.service_is_ready():
-            self.get_logger().error(
-                f"{SERVICE_FORCE_EBS} unavailable — cannot request EBS over "
-                "ROS (the uDV should trigger EBS autonomously too)")
-            return
+
         req = SetBool.Request()
         req.data = True
         self.get_logger().warn(f"requesting EBS via {SERVICE_FORCE_EBS}")
-        self._force_ebs_client.call_async(req)
+        self._ebs_future = self._force_ebs_client.call_async(req)
+        self._ebs_future.add_done_callback(self._on_ebs_response)
+
+    def _on_ebs_response(self, future) -> None:
+        """Latch the EBS request done only on a positive ack; else retry."""
+        try:
+            resp = future.result()
+        except Exception as ex:  # noqa: BLE001
+            self.get_logger().error(
+                f"{SERVICE_FORCE_EBS} call failed: {ex!r} — will retry")
+            resp = None
+        if resp is not None and resp.success:
+            self._ebs_requested = True
+            self.get_logger().warn(f"{SERVICE_FORCE_EBS} acknowledged EBS")
+        elif resp is not None:
+            self.get_logger().error(
+                f"{SERVICE_FORCE_EBS} returned not-ok ({resp.message}) — "
+                "will retry")
+        # Clear the in-flight handle so the next tick can retry if unacked.
+        self._ebs_future = None
 
 
 def main(args=None) -> None:
