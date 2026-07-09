@@ -109,8 +109,11 @@ gear ratio (the sim default `0.00821` is almost certainly wrong).
 ### G2 — Throttle actuation sink
 `/ctrl/cmd` carries throttle (`linear.x`) + steering (`angular.z`); the
 uDV currently has **no throttle ROS subscriber** (only steering). Add the
-inverter torque/accel path (e.g. the `0x507` accel frame). Proportional
-braking is out of scope; only emergency EBS is wired (`/force_ebs`).
+inverter torque/accel path (e.g. the `0x507` accel frame). Note the uDV
+clamps negative torque to 0, so there is **no proportional/regen braking**
+over `/ctrl/cmd`: braking is either the finish service brake
+(`/service_brake`, EBS actuators with the SDC held closed) or the
+emergency EBS (`/force_ebs`, which opens the SDC).
 
 ### G3 — Steering scaling + units `[SAFETY]`
 `/ctrl/cmd.angular.z` is normalised [-1,1]; the uDV scales it to degrees,
@@ -121,9 +124,19 @@ confirm the `/steering_angle` deg→rad conversion measures road-wheel vs
 column angle.
 
 ### G4 — Mission-finished path to the uDV
-On `slam/finished`, mission_control publishes `/dv/status = FINISHED`.
-The uDV should react (DRIVING→FINISHED) — confirm it does, either via
-`/dv/status` or its own RES/standstill logic.
+Two stages, both owned by mission_control:
+
+1. On `slam/mission_complete` (slam's "driving objective met" edge — laps
+   for autocross/trackdrive, the big-orange finish gate for accel),
+   mission_control publishes `/service_brake = true`. The uDV engages the
+   EBS actuators **without opening the SDC**, so the car makes a heavy
+   controlled stop and stays in **AS Driving**.
+2. Watching `/slam/pose` for standstill, mission_control then publishes
+   `/dv/status = FINISHED`, and the uDV transitions DRIVING→FINISHED.
+
+Confirm the uDV reacts to both. The finish path must never call
+`/force_ebs` — that opens the SDC and lands in AS Emergency (penalty/DQ)
+instead of AS Finished.
 
 ### G5 — AMI → mission mapping
 `interface_contract.DEFAULT_AMI_TO_MISSION_ID` maps the AMI index (uDV

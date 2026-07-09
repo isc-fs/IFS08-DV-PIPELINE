@@ -374,6 +374,35 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self.declare_parameter("loop_close_radius_m", 6.0)
         self.declare_parameter("loop_close_min_radius_m", 15.0)
 
+        # --- Mission-completion detection (/slam/mission_complete) ------
+        # slam raises /slam/mission_complete when the mission's DRIVING
+        # objective is met, keyed off self.behavior (pushed by mode_manager).
+        # mission_control then commands the finish service brake (EBS actuators,
+        # SDC stays closed).
+        #   autocross  — one lap of the track (pose returns to the start region
+        #                after having gone at least loop_close_min_radius_m out;
+        #                reuses the loop-closure radii).
+        #   trackdrive — trackdrive_laps laps (FS: 10), same pose-based counter.
+        #   accel      — the big-orange FINISH gate: >=2 big-orange cones on
+        #                /Conos_Orange seen after the pose is at least
+        #                accel_finish_min_dist_m from the origin (so the START
+        #                gate can't trip it). The 75 m accel track is a straight,
+        #                so distance-from-origin gates the start/finish ambiguity.
+        #   skidpad    — NOT YET IMPLEMENTED (it is the harder case): the
+        #                figure-8 orbits the two circle centres, not the spawn,
+        #                so the out-and-back distance-from-origin lap trace does
+        #                not apply. It needs its own detector (e.g. via
+        #                path_planning's fastube). slam stays silent for it.
+        #   scruti     — never reaches slam: scrutineering (inspection / EBS
+        #                test) is a uDV-standalone mission, so the pipeline
+        #                stays idle with no mission running.
+        #   default / unknown — no self-signal.
+        # Lap counting is pose-based (not cone-sighting) so a missed gate can
+        # never lose a lap — critical for the trackdrive 10-lap count (a wrong
+        # count is a DQ).
+        self.declare_parameter("trackdrive_laps", 10)
+        self.declare_parameter("accel_finish_min_dist_m", 40.0)
+
         # --- Localization-only after loop closure ----------------------
         # Once mapping is frozen the map is final, so we stop growing the
         # smoothed iSAM2 graph and switch each scan to a fixed-size
@@ -502,11 +531,21 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._full_pub_last: dict[int, tuple] = {}
         self._gt_aligned_pub = None
         self._gt_error_pub = None
-        # /slam/finished publisher (#384). Always emits default-false
-        # on activate; will go true on real mission-completion detection
-        # in a follow-up. Stays latched so a late mission_control
-        # subscriber inherits the current value.
-        self._finished_pub = None
+        # /slam/mission_complete publisher (#384). Latches true when the
+        # mission's DRIVING objective is met (per self.behavior — see the
+        # mission-completion params). mission_control consumes it to command
+        # the finish service brake; it then confirms standstill off /slam/pose
+        # and reports DV_FINISHED. Latched + default-false so a late-joining
+        # mission_control inherits a defined value. (Supersedes the old
+        # always-false /slam/finished stub, which had no real detector and is
+        # no longer consumed — standstill now lives in mission_control.)
+        self._mission_complete_pub = None
+        # Orange-gate finish detection (accel only). Set true when >=2 big-orange
+        # cones are seen on /Conos_Orange past accel_finish_min_dist_m; read by
+        # _mission_driving_complete for the accel behavior. Subscription lives in
+        # on_activate. Reset per run.
+        self._sub_orange = None
+        self._orange_finish_seen = False
 
     # ------------------------------------------------------------------
     # Run-memory reset
@@ -552,6 +591,18 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # (DA staleness gating / diagnostics). Continues from the frozen
         # graph step since iSAM2's own step stops advancing once frozen.
         self._loc_scan = 0
+        # Mission-completion detection (/slam/mission_complete). _lap_count is
+        # the pose-based out-and-back lap counter; _lap_away arms it once the
+        # pose has left the start region this lap (so one lap can't be counted
+        # twice). _mission_complete_latched guards the one-shot rising edge.
+        # _orange_finish_seen latches the accel finish gate. All per-run.
+        self._lap_count = 0
+        self._lap_away = False
+        self._mission_complete_latched = False
+        self._orange_finish_seen = False
+        # Latest pose distance from origin, cached so the /Conos_Orange
+        # callback can apply the accel start-vs-finish gate without a pose.
+        self._latest_origin_dist = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle transitions
@@ -657,24 +708,25 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             Float32, "/cone_slam/gt_error_m", 10
         )
 
-        # /slam/finished — mission-completion signal consumed by
-        # mission_control_node (#384). Latched + default-false so a
-        # late-joining mission_control sees an unambiguous starting
-        # state. Pre-#384 slam had no way to signal mission-end
-        # directly (control_node's stop-latch handled it via braking
-        # to zero); post-#384 mission_control needs an explicit
-        # rising-edge signal to close the RuntimeControl action with
-        # outcome="finished". Currently a stub — slam still uses its
-        # internal stop-anchor logic in control_node for braking;
-        # this publisher just emits the default false until a future
-        # PR wires the lap-min-distance + big-orange detector to it.
-        finished_qos = QoSProfile(
+        # /slam/mission_complete — the mission's DRIVING objective is met
+        # (#384). Consumed by mission_control_node, which then commands the
+        # finish service brake (/service_brake: the uDV engages the EBS
+        # actuators WITHOUT opening the SDC, so the car stays AS Driving) and
+        # afterwards confirms standstill off /slam/pose before reporting
+        # DV_FINISHED. Latched + default-false so a late-joining
+        # mission_control sees an unambiguous starting state.
+        #
+        # This replaces the old /slam/finished stub, which never had a real
+        # detector (it only ever emitted false) and is no longer consumed:
+        # "finished" is now the standstill decision, and that lives in
+        # mission_control. slam's job is purely "driving done".
+        mission_complete_qos = QoSProfile(
             depth=1,
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self._finished_pub = self.create_lifecycle_publisher(
-            Bool, "/slam/finished", finished_qos
+        self._mission_complete_pub = self.create_lifecycle_publisher(
+            Bool, "/slam/mission_complete", mission_complete_qos
         )
 
         # TF broadcaster — non-lifecycle (tf2 doesn't ship lifecycle
@@ -804,12 +856,20 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 Track, "/testing_only/track", self._on_track, track_qos
             )
 
-        # Latch /slam/finished=false on activate (#384 stub). The
-        # publisher exists from on_configure; this fires the default
-        # value so a subscriber that joins between configure and
+        # /Conos_Orange — big-orange (start/finish) gate detections, used ONLY
+        # by the accel behavior to recognise the 75 m finish gate. Subscribed
+        # for every behavior (cheap; the callback just latches a flag that only
+        # accel reads) so a mid-run behavior change can't leave us deaf.
+        self._sub_orange = self.create_subscription(
+            MarkerArray, "/Conos_Orange", self._on_orange, 10
+        )
+
+        # Latch /slam/mission_complete=false on activate. _reset_run_memory
+        # (above) already cleared the latch / lap counter; this fires the
+        # default value so a mission_control that joins between configure and
         # activate sees a defined latched state.
-        if self._finished_pub is not None:
-            self._finished_pub.publish(Bool(data=False))
+        if self._mission_complete_pub is not None:
+            self._mission_complete_pub.publish(Bool(data=False))
 
         return super().on_activate(state)
 
@@ -823,6 +883,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             self._sub_gt,
             self._sub_supervisor_odom,
             self._sub_track,
+            self._sub_orange,
         ):
             if sub is not None:
                 self.destroy_subscription(sub)
@@ -833,6 +894,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._sub_gt = None
         self._sub_supervisor_odom = None
         self._sub_track = None
+        self._sub_orange = None
 
         # Wipe all memory of the run we just stopped. The components
         # (factor graph, landmark DB, IMU preintegrator) and the cached
@@ -854,6 +916,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             self._sub_gt,
             self._sub_supervisor_odom,
             self._sub_track,
+            self._sub_orange,
         ):
             if sub is not None:
                 self.destroy_subscription(sub)
@@ -864,6 +927,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._sub_gt = None
         self._sub_supervisor_odom = None
         self._sub_track = None
+        self._sub_orange = None
 
         for pub in (
             self._state_pub,
@@ -871,7 +935,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             self._cones_full_pub,
             self._gt_aligned_pub,
             self._gt_error_pub,
-            self._finished_pub,
+            self._mission_complete_pub,
         ):
             if pub is not None:
                 self.destroy_publisher(pub)
@@ -881,7 +945,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._full_pub_last = {}
         self._gt_aligned_pub = None
         self._gt_error_pub = None
-        self._finished_pub = None
+        self._mission_complete_pub = None
 
         # tf2 broadcasters are not lifecycle-aware; drop the ref.
         # The static map→odom broadcaster was retired in #382 (map→odom
@@ -1975,6 +2039,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         msg.twist.twist.linear.z = float(v_world[2])
         self._state_pub.publish(msg)
 
+        # Mission-completion detection. Driven from here (not the growing-graph
+        # SLAM path) so it ticks in EVERY motion mode — notably the
+        # localization-only path that trackdrive runs for laps 2..N, where
+        # _update_loop_closure is never called again.
+        self._update_mission_complete(result)
+
         # GT-aligned diagnostic: publish where the ground truth says
         # the car is, expressed in SLAM's anchored body-frame world,
         # plus the position-error magnitude. Both are zero at t=0 by
@@ -2156,6 +2226,108 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 f"{self._loop_max_dist:.1f} m, map={len(self._db)}). No new "
                 f"landmarks will be spawned; observations re-associate only."
             )
+
+    # ------------------------------------------------------------------
+    # Mission-completion detection (/slam/mission_complete)
+    # ------------------------------------------------------------------
+    def _on_orange(self, msg: MarkerArray) -> None:
+        """Latch the accel FINISH gate from big-orange cone detections.
+
+        The FS accel track is a 75 m straight with big-orange gates at BOTH
+        ends, so a sighting alone cannot tell start from finish. We therefore
+        only accept a gate (>= 2 big-orange cones) once the pose is at least
+        `accel_finish_min_dist_m` from the origin — the start gate is behind us
+        and well inside that radius by then. Once latched it stays latched.
+
+        Only the accel behavior reads this flag (see _mission_driving_complete);
+        for the lap-based missions the pose counter is authoritative because a
+        missed sighting must never lose a lap.
+        """
+        if self._orange_finish_seen or len(msg.markers) < 2:
+            return
+        min_dist = float(self.get_parameter("accel_finish_min_dist_m").value)
+        if self._latest_origin_dist >= min_dist:
+            self._orange_finish_seen = True
+            self.get_logger().info(
+                f"ACCEL FINISH GATE — {len(msg.markers)} big-orange cones at "
+                f"{self._latest_origin_dist:.1f} m from origin"
+            )
+
+    def _advance_lap_counter(self, x: float, y: float) -> None:
+        """Count laps from the pose's distance-from-origin trace.
+
+        A lap is one out-and-back excursion: the pose must travel at least
+        ``loop_close_min_radius_m`` from the origin (arming ``_lap_away``) and
+        then return within ``loop_close_radius_m``, which counts the lap and
+        re-arms for the next one. Reuses the loop-closure radii so lap counting
+        and the mapping freeze agree on what "a lap" is.
+
+        Driven from :meth:`_publish_state`, unlike :meth:`_update_loop_closure`
+        (growing-graph SLAM path only) — so laps 2..N still count after the map
+        freezes and trackdrive switches to localization-only.
+        """
+        dist = float(np.hypot(x, y))
+        min_radius = float(self.get_parameter("loop_close_min_radius_m").value)
+        close_radius = float(self.get_parameter("loop_close_radius_m").value)
+        if dist >= min_radius:
+            self._lap_away = True
+        if self._lap_away and dist <= close_radius:
+            self._lap_count += 1
+            self._lap_away = False
+            self.get_logger().info(
+                f"LAP {self._lap_count} complete "
+                f"(behavior={self.behavior}, {dist:.1f} m from origin)"
+            )
+
+    def _mission_driving_complete(self) -> bool:
+        """Whether this mission's DRIVING objective is met (pre-stop).
+
+        Keyed off self.behavior; False for everything else. skidpad is not yet
+        implemented (its figure-8 defeats the pose out-and-back lap trace, so it
+        needs its own detector), and scruti never reaches slam at all — it is a
+        uDV-standalone mission, so the pipeline stays idle with no mission
+        running. See the mission-completion parameter block in __init__.
+        """
+        behavior = self.behavior
+        if behavior == "autocross":
+            return self._lap_count >= 1
+        if behavior == "trackdrive":
+            return self._lap_count >= int(
+                self.get_parameter("trackdrive_laps").value
+            )
+        if behavior == "accel":
+            return self._orange_finish_seen
+        return False
+
+    def _update_mission_complete(self, result: ScanResult) -> None:
+        """Latch /slam/mission_complete on the rising edge (one-shot).
+
+        Signals only that the DRIVING objective is met. mission_control then
+        commands the finish service brake and, once /slam/pose shows standstill,
+        reports DV_FINISHED — slam never decides "stopped". A fresh run re-arms
+        via _reset_run_memory.
+        """
+        if self._mission_complete_pub is None or self._mission_complete_latched:
+            return
+
+        x, y = result.pose.x(), result.pose.y()
+        # Cache for the /Conos_Orange callback's accel start-vs-finish gate.
+        self._latest_origin_dist = float(np.hypot(x, y))
+
+        # Advance the counter every scan so no lap boundary is missed.
+        if self.behavior in ("autocross", "trackdrive"):
+            self._advance_lap_counter(x, y)
+
+        if not self._mission_driving_complete():
+            return
+
+        self._mission_complete_latched = True
+        self._mission_complete_pub.publish(Bool(data=True))
+        self.get_logger().info(
+            f"MISSION DRIVING COMPLETE (behavior={self.behavior}, "
+            f"laps={self._lap_count}) — /slam/mission_complete=true; "
+            f"mission_control now commands the finish service brake"
+        )
 
     def _publish_cone_map(self, stamp) -> None:
         """Publish the persistent cone landmark database to /Conos.

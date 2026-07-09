@@ -177,7 +177,8 @@ def steady_dv_status(prepared_mission_id: int, activated: bool) -> int:
     Covers the steady states only. The node overrides with the transient
     / terminal bytes it alone knows: DV_PREPARING (an activate_mode
     configure is in flight), DV_FAILED (a call failed), DV_FINISHED
-    (/slam/finished), DV_EMERGENCY (/ctrl/emergency or AS Emergency).
+    (standstill reached after /slam/mission_complete triggered the finish
+    service brake), DV_EMERGENCY (/ctrl/emergency or AS Emergency).
     """
     if activated:
         return DV_RUNNING
