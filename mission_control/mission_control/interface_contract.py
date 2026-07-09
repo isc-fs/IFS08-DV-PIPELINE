@@ -18,6 +18,11 @@ plays the uDV.
     /ctrl/cmd     geometry_msgs/Twist  normalised command:
                                    linear.x = throttle [-1, 1],
                                    angular.z = steering [-1, 1]
+    /service_brake std_msgs/Bool   finish service-brake request: the uDV
+                                   engages the EBS actuators WITHOUT opening the
+                                   SDC (heavy controlled stop, stays AS Driving
+                                   until standstill). A latched topic, not a
+                                   service (the uDV's service slots are full).
     /force_ebs    std_srvs/SetBool (service)  emergency-brake request
 
 Both byte topics MUST be published at a steady cadence (>= ~2 Hz, not
@@ -56,11 +61,12 @@ DV_FAILED    = 6   # prepare/activate error (was Result success=false/error)
 
 # Interface topic / service names — single source of truth so the
 # reconciler, the emulator and any tooling never drift.
-TOPIC_ASSI_STATE  = "/assi/state"
-TOPIC_AMI_MISSION = "/ami/mission"
-TOPIC_DV_STATUS   = "/dv/status"
-TOPIC_CTRL_CMD    = "/ctrl/cmd"
-SERVICE_FORCE_EBS = "/force_ebs"
+TOPIC_ASSI_STATE   = "/assi/state"
+TOPIC_AMI_MISSION  = "/ami/mission"
+TOPIC_DV_STATUS    = "/dv/status"
+TOPIC_CTRL_CMD     = "/ctrl/cmd"
+TOPIC_SERVICE_BRAKE = "/service_brake"
+SERVICE_FORCE_EBS  = "/force_ebs"
 
 # Heartbeat liveness bound (seconds) — the canonical value shared by both
 # directions. Each byte topic above is the other side's liveness heartbeat;
