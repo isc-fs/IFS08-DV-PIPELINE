@@ -29,7 +29,7 @@ Two responsibilities:
      relay is what makes the sim path mirror the real-car DVPC→uDV chain.
 
   3. **Finish orchestration.** On `/slam/mission_complete` (slam's
-     driving-objective-met edge) it publishes `/service_brake` so the uDV
+     driving-objective-met edge) it publishes `/finish_brake` so the uDV
      makes a heavy controlled stop WITHOUT opening the SDC (stays AS
      Driving); then, watching `/slam/pose` for standstill, it reports
      DV_FINISHED so the uDV latches AS_FINISHED. This never touches
@@ -73,7 +73,7 @@ from mission_control.interface_contract import (
     TOPIC_ASSI_STATE,
     TOPIC_CTRL_CMD,
     TOPIC_DV_STATUS,
-    TOPIC_SERVICE_BRAKE,
+    TOPIC_FINISH_BRAKE,
     ami_index_to_mission_id,
 )
 from mission_control.interface_qos import UPLINK_QOS
@@ -231,7 +231,7 @@ class MissionControlNode(LifecycleNode):
         self._dv_status_pub = None
         self._dv_status_msg_pub = None
         self._ctrl_cmd_pub = None
-        self._service_brake_pub = None
+        self._finish_brake_pub = None
         self._reconcile_timer = None
         self._sub_assi = None
         self._sub_ami = None
@@ -291,14 +291,14 @@ class MissionControlNode(LifecycleNode):
             UInt8, TOPIC_DV_STATUS, _STATUS_QOS)
         self._ctrl_cmd_pub = self.create_lifecycle_publisher(
             Twist, TOPIC_CTRL_CMD, _CMD_QOS)
-        # /service_brake — latched finish service-brake command. The uDV engages
+        # /finish_brake — latched finish service-brake command. The uDV engages
         # the EBS actuators WITHOUT opening the SDC while this is true during AS
         # Driving (heavy controlled stop, stays AS Driving). Latched so a
         # late-joining uDV inherits the current value; RELIABLE so the edge is
         # never dropped. We never assert it on the emergency path (that is
         # /force_ebs, which DOES open the SDC).
-        self._service_brake_pub = self.create_lifecycle_publisher(
-            Bool, TOPIC_SERVICE_BRAKE, _LATCHED_QOS)
+        self._finish_brake_pub = self.create_lifecycle_publisher(
+            Bool, TOPIC_FINISH_BRAKE, _LATCHED_QOS)
         # Linux-side diagnostic for the web spinner (the old SetMission
         # feedback `stage`). The uDV ignores this.
         self._dv_status_msg_pub = self.create_lifecycle_publisher(
@@ -349,9 +349,9 @@ class MissionControlNode(LifecycleNode):
         self._reconcile_timer = self.create_timer(
             1.0 / _RECONCILE_HZ, self._tick, callback_group=self._cb_group)
         result = super().on_activate(state)
-        # Latch /service_brake=false so a late-joining uDV inherits a defined
+        # Latch /finish_brake=false so a late-joining uDV inherits a defined
         # (not-braking) state before any mission runs.
-        self._publish_service_brake(False)
+        self._publish_finish_brake(False)
         return result
 
     def on_deactivate(self, state: State) -> TransitionCallbackReturn:
@@ -378,7 +378,7 @@ class MissionControlNode(LifecycleNode):
         self._dv_status_pub = None
         self._dv_status_msg_pub = None
         self._ctrl_cmd_pub = None
-        self._service_brake_pub = None
+        self._finish_brake_pub = None
         self._activate_mode_client = None
         self._force_ebs_client = None
         return TransitionCallbackReturn.SUCCESS
@@ -437,18 +437,18 @@ class MissionControlNode(LifecycleNode):
     def _on_mission_complete(self, msg: Bool) -> None:
         """slam's driving objective is met — assert the service brake.
 
-        Publish /service_brake=true (latched): while AS Driving the uDV engages
+        Publish /finish_brake=true (latched): while AS Driving the uDV engages
         the EBS actuators WITHOUT opening the SDC, bringing the car to a heavy
         controlled stop that stays in AS Driving. DV_FINISHED is reported later,
         once /slam/pose shows the car has actually come to rest (_on_slam_pose).
         """
         if msg.data and not self._finishing:
             self.get_logger().info(
-                "/slam/mission_complete rising — asserting /service_brake "
+                "/slam/mission_complete rising — asserting /finish_brake "
                 "(EBS heavy stop, SDC stays closed), awaiting standstill")
             self._finishing = True
             self._finish_stop_since = None
-            self._publish_service_brake(True)
+            self._publish_finish_brake(True)
 
     def _on_slam_pose(self, msg: Odometry) -> None:
         """While finishing, watch for standstill → report DV_FINISHED.
@@ -526,7 +526,7 @@ class MissionControlNode(LifecycleNode):
             # transition out of finishing (guarded so we don't republish every
             # idle tick), then clear the finishing state.
             if self._finishing:
-                self._publish_service_brake(False)
+                self._publish_finish_brake(False)
                 self._finishing = False
             self._finish_stop_since = None
             self._emergency = False
@@ -621,10 +621,10 @@ class MissionControlNode(LifecycleNode):
         if self._dv_status_pub is not None:
             self._dv_status_pub.publish(UInt8(data=int(status)))
 
-    def _publish_service_brake(self, on: bool) -> None:
-        """Publish the latched /service_brake command (finish stop / re-arm)."""
-        if self._service_brake_pub is not None:
-            self._service_brake_pub.publish(Bool(data=bool(on)))
+    def _publish_finish_brake(self, on: bool) -> None:
+        """Publish the latched /finish_brake command (finish stop / re-arm)."""
+        if self._finish_brake_pub is not None:
+            self._finish_brake_pub.publish(Bool(data=bool(on)))
 
     def _publish_ctrl_cmd(self) -> None:
         """Emit one normalised Twist from the cached ControlCommand."""

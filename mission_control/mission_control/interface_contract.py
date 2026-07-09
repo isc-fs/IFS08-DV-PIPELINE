@@ -18,7 +18,7 @@ plays the uDV.
     /ctrl/cmd     geometry_msgs/Twist  normalised command:
                                    linear.x = throttle [-1, 1],
                                    angular.z = steering [-1, 1]
-    /service_brake std_msgs/Bool   finish service-brake request: the uDV
+    /finish_brake std_msgs/Bool   finish service-brake request: the uDV
                                    engages the EBS actuators WITHOUT opening the
                                    SDC (heavy controlled stop, stays AS Driving
                                    until standstill). A latched topic, not a
@@ -65,7 +65,7 @@ TOPIC_ASSI_STATE   = "/assi/state"
 TOPIC_AMI_MISSION  = "/ami/mission"
 TOPIC_DV_STATUS    = "/dv/status"
 TOPIC_CTRL_CMD     = "/ctrl/cmd"
-TOPIC_SERVICE_BRAKE = "/service_brake"
+TOPIC_FINISH_BRAKE = "/finish_brake"
 SERVICE_FORCE_EBS  = "/force_ebs"
 
 # Heartbeat liveness bound (seconds) — the canonical value shared by both

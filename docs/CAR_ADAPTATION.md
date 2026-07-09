@@ -112,7 +112,7 @@ uDV currently has **no throttle ROS subscriber** (only steering). Add the
 inverter torque/accel path (e.g. the `0x507` accel frame). Note the uDV
 clamps negative torque to 0, so there is **no proportional/regen braking**
 over `/ctrl/cmd`: braking is either the finish service brake
-(`/service_brake`, EBS actuators with the SDC held closed) or the
+(`/finish_brake`, EBS actuators with the SDC held closed) or the
 emergency EBS (`/force_ebs`, which opens the SDC).
 
 ### G3 — Steering scaling + units `[SAFETY]`
@@ -128,7 +128,7 @@ Two stages, both owned by mission_control:
 
 1. On `slam/mission_complete` (slam's "driving objective met" edge — laps
    for autocross/trackdrive, the big-orange finish gate for accel),
-   mission_control publishes `/service_brake = true`. The uDV engages the
+   mission_control publishes `/finish_brake = true`. The uDV engages the
    EBS actuators **without opening the SDC**, so the car makes a heavy
    controlled stop and stays in **AS Driving**.
 2. Watching `/slam/pose` for standstill, mission_control then publishes

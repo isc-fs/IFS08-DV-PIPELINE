@@ -437,7 +437,7 @@ class ControlNode(BaseLifecycleNode):
     # NOTE: the big-orange stop-anchor (/Conos_Orange → latch a stop point →
     # brake to it) was removed. The finish stop is now owned end-to-end by
     # mission_control + the uDV's EBS service brake: slam raises
-    # /slam/mission_complete, mission_control asserts /service_brake, and the
+    # /slam/mission_complete, mission_control asserts /finish_brake, and the
     # uDV engages the brake actuators with the SDC held closed. The anchor was
     # not just redundant but harmful:
     #   * it could never actually brake on the car — control's only longitudinal

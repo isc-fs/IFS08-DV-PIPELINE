@@ -710,7 +710,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
 
         # /slam/mission_complete — the mission's DRIVING objective is met
         # (#384). Consumed by mission_control_node, which then commands the
-        # finish service brake (/service_brake: the uDV engages the EBS
+        # finish service brake (/finish_brake: the uDV engages the EBS
         # actuators WITHOUT opening the SDC, so the car stays AS Driving) and
         # afterwards confirms standstill off /slam/pose before reporting
         # DV_FINISHED. Latched + default-false so a late-joining
