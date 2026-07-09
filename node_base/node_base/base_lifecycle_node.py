@@ -37,20 +37,12 @@ class SkidpadStrategy(ExecutionStrategy):
         pass
 
 
-class ScrutiStrategy(ExecutionStrategy):
-    """Scrutineering — low speed, careful maneuvering."""
-
-    def execute(self) -> None:
-        pass
-
-
 # Mission-name behaviors pushed by mode_manager for perception/SLAM nodes.
 STRATEGY_MAP: dict[str, type[ExecutionStrategy]] = {
     "trackdrive": TrackdriveStrategy,
     "autocross": AutocrossStrategy,
     "accel": AccelStrategy,
     "skidpad": SkidpadStrategy,
-    "scruti": ScrutiStrategy,
 }
 
 

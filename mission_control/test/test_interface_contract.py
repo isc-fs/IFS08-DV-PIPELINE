@@ -112,7 +112,8 @@ def test_ami_index_maps_to_registry_mission_ids():
 
 
 def test_ami_non_autonomy_and_unknown_indices_are_no_mission():
-    for idx in (0, 7, 8, 9):          # Manual, Shutdown, Aux1, Aux2
+    # Manual, EBS test + Inspection (standalone uDV missions), Shutdown, Aux.
+    for idx in (0, 5, 6, 7, 8, 9):
         assert ami_index_to_mission_id(idx) == 0
     for idx in (-1, 10, 99):          # out of range → never raise, no run
         assert ami_index_to_mission_id(idx) == 0
@@ -124,7 +125,7 @@ def test_ami_mapping_is_overridable():
 
 def test_mission_id_to_ami_index_round_trips():
     # Every runnable registry mission → an AMI index that maps back to it.
-    for mission_id in (1, 2, 3, 4, 5):
+    for mission_id in (1, 2, 3, 4):
         ami = mission_id_to_ami_index(mission_id)
         assert ami != 0
         assert ami_index_to_mission_id(ami) == mission_id

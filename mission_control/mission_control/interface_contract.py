@@ -103,19 +103,23 @@ SIM_INTENT_GO     = 2   # RES go — run
 
 # AMI mission INDEX (uDV ws2812.c mission_colors) → pipeline registry
 # mission_id (mode_registry: trackdrive=1, autocross=2, accel=3,
-# skidpad=4, scruti=5). 0 = no autonomy mission / tear down. mission_control
+# skidpad=4). 0 = no autonomy mission / tear down. mission_control
 # maps the raw /ami/mission index through this so the uDV stays dumb (no
 # registry numbering baked into firmware). Moved here from the deleted
-# car_supervisor/policy.py; CONFIRM against AMI firmware (AMI 5 "EVS/EBS
-# test" + AMI 6 "Inspection" both map to scruti for now).
+# car_supervisor/policy.py; CONFIRM against AMI firmware.
+#
+# EBS test (5) and Inspection (6) are STANDALONE uDV missions — the uDV
+# handles everything on-board, so the pipeline must do nothing. They map
+# to 0 (no mission) so mission_control keeps the autonomy stack torn down
+# and idle (never emits /ctrl/cmd) while the uDV runs them.
 DEFAULT_AMI_TO_MISSION_ID: dict[int, int] = {
     0: 0,   # Manual        → no autonomy mission
     1: 3,   # Acceleration  → accel
     2: 4,   # Skidpad       → skidpad
     3: 2,   # Autocross     → autocross
     4: 1,   # Track drive   → trackdrive
-    5: 5,   # EVS/EBS test  → scruti   (CONFIRM)
-    6: 5,   # Inspection    → scruti   (CONFIRM)
+    5: 0,   # EVS/EBS test  → no mission (uDV standalone)
+    6: 0,   # Inspection    → no mission (uDV standalone)
     7: 0,   # Shutdown      → no mission
     8: 0,   # Aux1          → no mission
     9: 0,   # Aux2          → no mission

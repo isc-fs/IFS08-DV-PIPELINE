@@ -11,7 +11,6 @@
 #   2 = autocross
 #   3 = accel
 #   4 = skidpad
-#   5 = scruti
 #   0 = tear down (same as activate_mode with empty mission)
 #
 # Prepares autonomy only (configure, not activate). Once success=true,

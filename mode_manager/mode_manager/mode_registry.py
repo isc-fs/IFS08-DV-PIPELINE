@@ -84,17 +84,6 @@ MODE_REGISTRY: Mapping[str, ModeDefinition] = MappingProxyType({
             _node("control_node", "stanley"),
         ),
     ),
-    "scruti": ModeDefinition(
-        mode_name="scruti",
-        mission_id=5,
-        nodes=(
-            _node("odometry_filter_node", "base"),
-            _node("cone_detection_node", "base"),
-            _node("slam_node", "scruti"),
-            _node("path_planning_node", "scruti"),
-            _node("control_node", "stanley"),
-        ),
-    ),
 })
 
 
