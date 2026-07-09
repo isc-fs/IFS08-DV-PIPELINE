@@ -21,13 +21,19 @@ Two responsibilities:
 
   2. **Control-command aggregation + relay.** Aggregates control_node's
      `/ctrl/cmd_internal` (40 Hz fs_msgs/ControlCommand) plus
-     `/ctrl/emergency` + `/slam/finished`, and — only while the mission
-     is RUNNING — republishes throttle/steering as a normalised
-     `geometry_msgs/Twist` on /ctrl/cmd for the uDV/emulator to scale and
-     actuate. Emergencies are requested via the uDV's /force_ebs
-     (std_srvs/SetBool) service. The autonomy never publishes
-     /fsds/control_command directly; this relay is what makes the sim
-     path mirror the real-car DVPC→uDV chain.
+     `/ctrl/emergency`, and — only while the mission is RUNNING —
+     republishes throttle/steering as a normalised `geometry_msgs/Twist`
+     on /ctrl/cmd for the uDV/emulator to scale and actuate. Emergencies
+     are requested via the uDV's /force_ebs (std_srvs/SetBool) service.
+     The autonomy never publishes /fsds/control_command directly; this
+     relay is what makes the sim path mirror the real-car DVPC→uDV chain.
+
+  3. **Finish orchestration.** On `/slam/mission_complete` (slam's
+     driving-objective-met edge) it publishes `/service_brake` so the uDV
+     makes a heavy controlled stop WITHOUT opening the SDC (stays AS
+     Driving); then, watching `/slam/pose` for standstill, it reports
+     DV_FINISHED so the uDV latches AS_FINISHED. This never touches
+     /force_ebs — that path opens the SDC (AS Emergency).
 
 Liveness: /assi/state is treated as the uDV heartbeat. If it goes stale
 (see _ASSI_STALE_S) the pipeline reconciles to torn-down — the watchdog
@@ -36,6 +42,7 @@ that replaces the old action goal's implicit connection.
 
 from __future__ import annotations
 
+import math
 import time
 
 import rclpy
@@ -47,6 +54,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from fs_msgs.msg import ControlCommand
 from geometry_msgs.msg import Twist
 from lifecycle_msgs.msg import Transition
+from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, Int32, String, UInt8
 from std_srvs.srv import SetBool
 
@@ -65,6 +73,7 @@ from mission_control.interface_contract import (
     TOPIC_ASSI_STATE,
     TOPIC_CTRL_CMD,
     TOPIC_DV_STATUS,
+    TOPIC_SERVICE_BRAKE,
     ami_index_to_mission_id,
 )
 from mission_control.interface_qos import UPLINK_QOS
@@ -194,6 +203,13 @@ _LATCHED_QOS = QoSProfile(
 _STATUS_QOS = _LATCHED_QOS
 _CMD_QOS = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
+# Finish standstill detection (from /slam/pose twist). After /slam/mission_complete
+# has triggered the service brake, DV_FINISHED is reported once the car has been
+# below _FINISH_STOP_SPEED_MS for _FINISH_STOP_DWELL_S — i.e. it has actually
+# come to rest (the AS-Finished precondition), not merely dipped slow mid-corner.
+_FINISH_STOP_SPEED_MS = 0.5
+_FINISH_STOP_DWELL_S = 1.0
+
 
 class MissionControlNode(LifecycleNode):
     """DV pipeline lifecycle orchestrator (reconciler). See module docstring."""
@@ -215,12 +231,14 @@ class MissionControlNode(LifecycleNode):
         self._dv_status_pub = None
         self._dv_status_msg_pub = None
         self._ctrl_cmd_pub = None
+        self._service_brake_pub = None
         self._reconcile_timer = None
         self._sub_assi = None
         self._sub_ami = None
         self._sub_ctrl_cmd = None
         self._sub_ctrl_emergency = None
-        self._sub_slam_finished = None
+        self._sub_mission_complete = None
+        self._sub_slam_pose = None
         self._sub_mode_manager_progress = None
 
         # --- uDV uplink state ---
@@ -239,7 +257,12 @@ class MissionControlNode(LifecycleNode):
 
         # Sticky terminal/override flags (cleared when torn down / idle).
         self._failed: bool = False
+        # _finishing: slam signalled /slam/mission_complete — we've asserted the
+        # service brake and are waiting for the car to come to rest. _finished:
+        # standstill reached, DV_FINISHED reported.
+        self._finishing: bool = False
         self._finished: bool = False
+        self._finish_stop_since: float | None = None  # monotonic t of first sub-threshold speed
         self._emergency: bool = False
         self._ebs_requested: bool = False   # set only when /force_ebs acks
         self._ebs_future = None             # in-flight /force_ebs call, if any
@@ -268,6 +291,14 @@ class MissionControlNode(LifecycleNode):
             UInt8, TOPIC_DV_STATUS, _STATUS_QOS)
         self._ctrl_cmd_pub = self.create_lifecycle_publisher(
             Twist, TOPIC_CTRL_CMD, _CMD_QOS)
+        # /service_brake — latched finish service-brake command. The uDV engages
+        # the EBS actuators WITHOUT opening the SDC while this is true during AS
+        # Driving (heavy controlled stop, stays AS Driving). Latched so a
+        # late-joining uDV inherits the current value; RELIABLE so the edge is
+        # never dropped. We never assert it on the emergency path (that is
+        # /force_ebs, which DOES open the SDC).
+        self._service_brake_pub = self.create_lifecycle_publisher(
+            Bool, TOPIC_SERVICE_BRAKE, _LATCHED_QOS)
         # Linux-side diagnostic for the web spinner (the old SetMission
         # feedback `stage`). The uDV ignores this.
         self._dv_status_msg_pub = self.create_lifecycle_publisher(
@@ -294,8 +325,17 @@ class MissionControlNode(LifecycleNode):
         self._sub_ctrl_emergency = self.create_subscription(
             Bool, "/ctrl/emergency", self._on_ctrl_emergency, _LATCHED_QOS,
             callback_group=self._cb_group)
-        self._sub_slam_finished = self.create_subscription(
-            Bool, "/slam/finished", self._on_slam_finished, _LATCHED_QOS,
+        # /slam/mission_complete: slam's "driving objective met, begin the finish
+        # stop" edge → we assert the service brake. Latched (a late-join sees it).
+        self._sub_mission_complete = self.create_subscription(
+            Bool, "/slam/mission_complete", self._on_mission_complete,
+            _LATCHED_QOS, callback_group=self._cb_group)
+        # /slam/pose: absolute pose+velocity. Used only while finishing, to detect
+        # standstill (twist ≈ 0) and report DV_FINISHED. BEST_EFFORT depth-10 to
+        # track the ~10 Hz feed without back-pressure.
+        self._sub_slam_pose = self.create_subscription(
+            Odometry, "/slam/pose", self._on_slam_pose,
+            QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT),
             callback_group=self._cb_group)
         self._sub_mode_manager_progress = self.create_subscription(
             LifecycleProgress, "/mode_manager/progress",
@@ -308,7 +348,11 @@ class MissionControlNode(LifecycleNode):
             f"on_activate: starting reconcile loop ({_RECONCILE_HZ:.0f} Hz)")
         self._reconcile_timer = self.create_timer(
             1.0 / _RECONCILE_HZ, self._tick, callback_group=self._cb_group)
-        return super().on_activate(state)
+        result = super().on_activate(state)
+        # Latch /service_brake=false so a late-joining uDV inherits a defined
+        # (not-braking) state before any mission runs.
+        self._publish_service_brake(False)
+        return result
 
     def on_deactivate(self, state: State) -> TransitionCallbackReturn:
         self.get_logger().info("on_deactivate: stopping reconcile loop")
@@ -323,16 +367,18 @@ class MissionControlNode(LifecycleNode):
             self.destroy_timer(self._reconcile_timer)
             self._reconcile_timer = None
         for sub in (self._sub_assi, self._sub_ami, self._sub_ctrl_cmd,
-                    self._sub_ctrl_emergency, self._sub_slam_finished,
-                    self._sub_mode_manager_progress):
+                    self._sub_ctrl_emergency, self._sub_mission_complete,
+                    self._sub_slam_pose, self._sub_mode_manager_progress):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_assi = self._sub_ami = self._sub_ctrl_cmd = None
-        self._sub_ctrl_emergency = self._sub_slam_finished = None
+        self._sub_ctrl_emergency = self._sub_mission_complete = None
+        self._sub_slam_pose = None
         self._sub_mode_manager_progress = None
         self._dv_status_pub = None
         self._dv_status_msg_pub = None
         self._ctrl_cmd_pub = None
+        self._service_brake_pub = None
         self._activate_mode_client = None
         self._force_ebs_client = None
         return TransitionCallbackReturn.SUCCESS
@@ -388,12 +434,47 @@ class MissionControlNode(LifecycleNode):
             self._request_ebs()
             self._publish_dv_status(DV_EMERGENCY)
 
-    def _on_slam_finished(self, msg: Bool) -> None:
-        if msg.data and not self._finished:
+    def _on_mission_complete(self, msg: Bool) -> None:
+        """slam's driving objective is met — assert the service brake.
+
+        Publish /service_brake=true (latched): while AS Driving the uDV engages
+        the EBS actuators WITHOUT opening the SDC, bringing the car to a heavy
+        controlled stop that stays in AS Driving. DV_FINISHED is reported later,
+        once /slam/pose shows the car has actually come to rest (_on_slam_pose).
+        """
+        if msg.data and not self._finishing:
             self.get_logger().info(
-                "/slam/finished rising — mission complete, stopping command relay")
-            self._finished = True
-            self._publish_dv_status(DV_FINISHED)
+                "/slam/mission_complete rising — asserting /service_brake "
+                "(EBS heavy stop, SDC stays closed), awaiting standstill")
+            self._finishing = True
+            self._finish_stop_since = None
+            self._publish_service_brake(True)
+
+    def _on_slam_pose(self, msg: Odometry) -> None:
+        """While finishing, watch for standstill → report DV_FINISHED.
+
+        Gated on _finishing so an ordinary standstill (the driving-start hold, a
+        slow hairpin) can never trip the finish. Standstill = twist speed below
+        _FINISH_STOP_SPEED_MS held for _FINISH_STOP_DWELL_S. The uDV then latches
+        AS_FINISHED (DRIVING→FINISHED on dv_finished).
+        """
+        if self._finished or not self._finishing:
+            return
+        v = msg.twist.twist.linear
+        speed = math.hypot(v.x, v.y)
+        now = time.monotonic()
+        if speed > _FINISH_STOP_SPEED_MS:
+            self._finish_stop_since = None
+            return
+        if self._finish_stop_since is None:
+            self._finish_stop_since = now
+        if (now - self._finish_stop_since) < _FINISH_STOP_DWELL_S:
+            return
+        self.get_logger().info(
+            "standstill after mission_complete — reporting DV_FINISHED "
+            "(uDV latches AS_FINISHED), stopping command relay")
+        self._finished = True
+        self._publish_dv_status(DV_FINISHED)
 
     # ==================================================================
     # reconcile loop
@@ -441,6 +522,13 @@ class MissionControlNode(LifecycleNode):
         if (action is ReconcileAction.NONE
                 and not self._activated and self._prepared_mission_id == 0):
             self._failed = self._finished = False
+            # Re-arm the finish path: drop the service brake once, on the
+            # transition out of finishing (guarded so we don't republish every
+            # idle tick), then clear the finishing state.
+            if self._finishing:
+                self._publish_service_brake(False)
+                self._finishing = False
+            self._finish_stop_since = None
             self._emergency = False
             self._ebs_requested = False
             self._ebs_future = None
@@ -532,6 +620,11 @@ class MissionControlNode(LifecycleNode):
     def _publish_dv_status(self, status: int) -> None:
         if self._dv_status_pub is not None:
             self._dv_status_pub.publish(UInt8(data=int(status)))
+
+    def _publish_service_brake(self, on: bool) -> None:
+        """Publish the latched /service_brake command (finish stop / re-arm)."""
+        if self._service_brake_pub is not None:
+            self._service_brake_pub.publish(Bool(data=bool(on)))
 
     def _publish_ctrl_cmd(self) -> None:
         """Emit one normalised Twist from the cached ControlCommand."""
