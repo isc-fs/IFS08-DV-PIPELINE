@@ -1,8 +1,7 @@
 """IFSSIM autonomy control node — clean rewrite (feat/34).
 
 Single ROS node that:
-  1. Subscribes to /Path (planner), /slam/pose (SLAM Odometry),
-     /Conos_Orange (finish-gate detection)
+  1. Subscribes to /Path (planner), /slam/pose (SLAM Odometry), /odom
   2. Builds VehicleState + ReferenceTrajectory each tick
   3. Calls a DriveController (default: CompositeDriveController wrapping
      lateral + longitudinal strategies selected by params / mode_manager)
@@ -37,7 +36,6 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from fs_msgs.msg import ControlCommand
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, Float32
-from visualization_msgs.msg import MarkerArray
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from transforms3d.euler import quat2euler
@@ -100,12 +98,7 @@ class ControlNode(BaseLifecycleNode):
         # ReferenceTrajectory builder falls back to its own finite-
         # difference κ when this list is empty or all-zero.
         self._latest_path_kappas: list[float] = []
-        # Big-orange forward distances (base_link frame) — captured at the
-        # tick when the gate is first detected, then frozen as a stop anchor
-        # in odom frame (see _on_orange / _stop_distance).
-        self._stop_anchor_xy: Optional[tuple[float, float]] = None
-        self._stop_latched: bool = False
-        # Travel distance (odom-frame) used as the gate-latch guard.
+        # Travel distance (odom-frame), used by the startup throttle ramp.
         self._travelled: float = 0.0
         self._last_pose_xy: Optional[tuple[float, float]] = None
 
@@ -129,7 +122,6 @@ class ControlNode(BaseLifecycleNode):
         self._sub_path = None
         self._sub_pose = None
         self._sub_odom = None
-        self._sub_orange = None
         self._tick_timer = None
 
     # ------------------------------------------------------------------
@@ -200,8 +192,6 @@ class ControlNode(BaseLifecycleNode):
         self._latest_path_xs = []
         self._latest_path_ys = []
         self._latest_path_kappas = []
-        self._stop_anchor_xy = None
-        self._stop_latched = False
         self._travelled = 0.0
         self._last_pose_xy = None
         self._last_throttle = 0.0
@@ -222,7 +212,7 @@ class ControlNode(BaseLifecycleNode):
         self._sub_path = self.create_subscription(
             Path, "Path", self._on_path, 10)
         # Absolute pose — comes from SLAM at LiDAR tick rate (~10 Hz).
-        # Used for x/y/yaw and the gate-latch body→world projection.
+        # Used for x/y/yaw and the travelled-distance accumulator.
         self._sub_pose = self.create_subscription(
             Odometry, "/slam/pose", self._on_pose, 10)
         # Body-frame twist — comes from sim_supervisor (or uDV on the
@@ -231,8 +221,6 @@ class ControlNode(BaseLifecycleNode):
         # tracking has fresh data every 40 Hz tick.
         self._sub_odom = self.create_subscription(
             Odometry, "/odom", self._on_odom, 10)
-        self._sub_orange = self.create_subscription(
-            MarkerArray, "/Conos_Orange", self._on_orange, 10)
 
         # 40 Hz tick
         self._tick_timer = self.create_timer(
@@ -244,14 +232,12 @@ class ControlNode(BaseLifecycleNode):
         self, state: LifecycleState
     ) -> TransitionCallbackReturn:
         self.get_logger().info("on_deactivate: dropping timers + subs")
-        for sub in (self._sub_path, self._sub_pose, self._sub_odom,
-                    self._sub_orange):
+        for sub in (self._sub_path, self._sub_pose, self._sub_odom):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_path = None
         self._sub_pose = None
         self._sub_odom = None
-        self._sub_orange = None
         if self._tick_timer is not None:
             self.destroy_timer(self._tick_timer)
         self._tick_timer = None
@@ -261,14 +247,12 @@ class ControlNode(BaseLifecycleNode):
         self, state: LifecycleState
     ) -> TransitionCallbackReturn:
         self.get_logger().info("on_cleanup: destroying publishers + TF")
-        for sub in (self._sub_path, self._sub_pose, self._sub_odom,
-                    self._sub_orange):
+        for sub in (self._sub_path, self._sub_pose, self._sub_odom):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_path = None
         self._sub_pose = None
         self._sub_odom = None
-        self._sub_orange = None
         if self._tick_timer is not None:
             self.destroy_timer(self._tick_timer)
         self._tick_timer = None
@@ -366,11 +350,6 @@ class ControlNode(BaseLifecycleNode):
         self.declare_parameter("throttle_rate", 2.0)
         self.declare_parameter("regen_rate", 3.33)
         self.declare_parameter("steering_rate", 5.0)
-        # Stop-latch guard. The FS start gate is also big-orange, so we
-        # need to drive at least one lap-ish before the first orange
-        # detection counts as the finish. Trackdrive courses are >100 m
-        # per lap; 30 m is safely past any start-gate proximity.
-        self.declare_parameter("stop_latch_min_travel", 30.0)
 
     def _p(self, name: str):
         return self.get_parameter(name).value
@@ -455,56 +434,20 @@ class ControlNode(BaseLifecycleNode):
         # _pose_stamped for the encoding rationale.
         self._latest_path_kappas = [p.pose.position.z for p in msg.poses]
 
-    def _on_orange(self, msg: MarkerArray) -> None:
-        """Latch a stop anchor on the first tick we see ≥2 big-orange cones,
-        AFTER the car has travelled at least stop_latch_min_travel metres
-        from origin. The minimum-travel gate exists because the FS start
-        gate is also big-orange; without it, we latch on the start cones
-        at t=0 and the controller immediately tries to brake to a stop.
-
-        Once latched, never unlatch — transient detector flicker (audit
-        P0 item #2) cannot release the stop. The anchor is the centroid
-        of the orange cones, projected from the car's current odom-frame
-        pose. After that, _stop_distance() is the residual euclidean
-        distance from the car to the anchor in odom frame.
-
-        The cones come in base_link (vehicle frame), so we transform via
-        the latest *absolute* pose — close enough at the moment of latch
-        since the car is still ~10 m from the gate. Uses /slam/pose
-        rather than /odom because the stop anchor is a long-lived
-        world-frame point and dead-reckoning drift would walk it
-        across laps."""
-        if self._stop_latched or self._latest_pose is None:
-            return
-        if len(msg.markers) < 2:
-            return
-        if self._travelled < self.get_parameter("stop_latch_min_travel").value:
-            return
-        # Centroid in base_link
-        n = len(msg.markers)
-        sx = sum(m.pose.position.x for m in msg.markers) / n
-        sy = sum(m.pose.position.y for m in msg.markers) / n
-        # base_link → odom using current absolute pose from SLAM
-        o = self._latest_pose
-        q = o.pose.pose.orientation
-        _, _, yaw = quat2euler([q.w, q.x, q.y, q.z])
-        cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-        ax = o.pose.pose.position.x + cos_y * sx - sin_y * sy
-        ay = o.pose.pose.position.y + sin_y * sx + cos_y * sy
-        self._stop_anchor_xy = (ax, ay)
-        self._stop_latched = True
-        self.get_logger().info(
-            f"stop latched at odom=({ax:.2f}, {ay:.2f}) "
-            f"from {n} big-orange cones"
-        )
-
-    def _stop_distance(self, state: VehicleState) -> float:
-        """Euclidean distance from car to the latched stop anchor. Returns
-        +inf when no stop is latched (controller treats this as 'no cap')."""
-        if not self._stop_latched or self._stop_anchor_xy is None:
-            return float("inf")
-        ax, ay = self._stop_anchor_xy
-        return math.hypot(ax - state.x, ay - state.y)
+    # NOTE: the big-orange stop-anchor (/Conos_Orange → latch a stop point →
+    # brake to it) was removed. The finish stop is now owned end-to-end by
+    # mission_control + the uDV's EBS service brake: slam raises
+    # /slam/mission_complete, mission_control asserts /service_brake, and the
+    # uDV engages the brake actuators with the SDC held closed. The anchor was
+    # not just redundant but harmful:
+    #   * it could never actually brake on the car — control's only longitudinal
+    #     channel is /ctrl/cmd throttle, and the uDV clamps negative torque to 0,
+    #     so a "brake" command merely coasts;
+    #   * it latched on the FIRST orange gate seen after 30 m, i.e. the end of
+    #     lap 1 — which stops trackdrive nine laps early, since control has no
+    #     lap counter of its own.
+    # ReferenceTrajectory.stop_distance / .stop_latched therefore stay at their
+    # defaults (+inf / False), so the longitudinal controller applies no stop cap.
 
     # ------------------------------------------------------------- tick
 
@@ -538,12 +481,9 @@ class ControlNode(BaseLifecycleNode):
             self._travelled += math.hypot(dx, dy)
             self._last_pose_xy = (state.x, state.y)
 
-        # Stop semantics — populated here so both controllers see the same
-        # snapshot. Distance is to the latched orange-gate anchor in odom
-        # frame; treated as +inf until ≥2 big-orange cones have been seen
-        # at least once.
-        ref.stop_distance = self._stop_distance(state)
-        ref.stop_latched = self._stop_latched
+        # ref.stop_distance / ref.stop_latched keep their defaults (+inf /
+        # False): control no longer owns any stop. See the note above _tick —
+        # the finish stop is mission_control + the uDV's EBS service brake.
 
         # Strategies own all algorithm logic. Per-tick state is immutable;
         # any internal accumulator (PI integral) lives on the drive controller.
@@ -632,8 +572,7 @@ class ControlNode(BaseLifecycleNode):
                 f"v={state.speed:.2f} travelled={self._travelled:.1f}m -> "
                 f"thr={cmd.throttle:+.3f} regen={cmd.brake:+.3f} "
                 f"steer={cmd.steering:+.3f} | "
-                f"path_n={len(ref.x)} path_len={ref.length:.1f}m "
-                f"stop_d={ref.stop_distance:.1f} latched={ref.stop_latched}"
+                f"path_n={len(ref.x)} path_len={ref.length:.1f}m"
             )
 
     def _build_state(self) -> Optional[VehicleState]:
