@@ -128,9 +128,10 @@ The uDV should react (DRIVING→FINISHED) — confirm it does, either via
 ### G5 — AMI → mission mapping
 `interface_contract.DEFAULT_AMI_TO_MISSION_ID` maps the AMI index (uDV
 `ws2812.c`: 4=Track drive) to the registry (trackdrive=1, autocross=2,
-accel=3, skidpad=4, scruti=5). Confirm against AMI firmware. Soft spots:
-AMI 5 "EVS/EBS test" + AMI 6 "Inspection" both map to `scruti`; the
-firmware table (index 4 = Track drive) is authoritative.
+accel=3, skidpad=4). Confirm against AMI firmware; the firmware table
+(index 4 = Track drive) is authoritative. AMI 5 "EVS/EBS test" + AMI 6
+"Inspection" are **standalone uDV missions** and map to `0` (no mission):
+the uDV runs them on-board, so the pipeline stays torn down and idle.
 
 ### G6 — IMU / LiDAR frames + TF
 `cone_detection` reads `header.frame_id`; provide the static TFs

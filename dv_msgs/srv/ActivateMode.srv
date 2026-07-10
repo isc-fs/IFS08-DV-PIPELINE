@@ -12,7 +12,7 @@
 # activate (tear down / mission_id=0).
 #
 # Mission values:
-#   "trackdrive" | "autocross" | "accel" | "skidpad" | "scruti"
+#   "trackdrive" | "autocross" | "accel" | "skidpad"
 #
 # Response field is `ok` (not `success`).
 

@@ -34,17 +34,9 @@ class SkidpadPathPlanner(PathPlannerStrategy):
         return MissionTypes.skidpad
 
 
-class ScrutiPathPlanner(PathPlannerStrategy):
-    """Conservative planning — reuse skidpad mission type in FaSTTUBe."""
-
-    def get_mission_type(self) -> MissionTypes:
-        return MissionTypes.skidpad
-
-
 PATH_PLANNING_STRATEGY_MAP: dict[str, type[PathPlannerStrategy]] = {
     "trackdrive": TrackdrivePathPlanner,
     "autocross": AutocrossPathPlanner,
     "accel": AccelPathPlanner,
     "skidpad": SkidpadPathPlanner,
-    "scruti": ScrutiPathPlanner,
 }
