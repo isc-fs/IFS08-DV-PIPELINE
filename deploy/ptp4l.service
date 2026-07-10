@@ -1,0 +1,11 @@
+[Unit]
+Description=PTP/gPTP master clock (Hesai ATX, enp1s0)
+After=network.target
+
+[Service]
+ExecStart=/usr/sbin/ptp4l -f /etc/linuxptp/ptp4l.conf -i enp1s0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

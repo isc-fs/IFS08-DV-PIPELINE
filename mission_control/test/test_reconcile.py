@@ -23,10 +23,12 @@ from mission_control.interface_contract import (  # noqa: E402
     DV_RUNNING,
 )
 from mission_control.reconcile import (  # noqa: E402
+    EbsAction,
     ReconcileAction,
     Target,
     is_runnable_mission,
     next_action,
+    next_ebs_action,
     should_request_ebs,
     steady_dv_status,
     target_for,
@@ -139,6 +141,48 @@ def test_ebs_only_on_emergency():
     assert should_request_ebs(AS_EMERGENCY) is True
     for st in (AS_OFF, AS_READY, AS_DRIVING, AS_FINISHED):
         assert should_request_ebs(st) is False
+
+
+# --------------------------------------------------------------------
+# next_ebs_action — the "retry until acked" state machine
+# --------------------------------------------------------------------
+
+def _ebs(**kw):
+    base = dict(emergency=True, acked=False,
+                call_in_flight=False, service_ready=True)
+    base.update(kw)
+    return next_ebs_action(**base)
+
+
+def test_ebs_dispatch_when_emergency_ready_and_idle():
+    assert _ebs() is EbsAction.DISPATCH
+
+
+def test_ebs_none_when_not_in_emergency():
+    # Even if everything else says "go", no emergency → do nothing.
+    assert _ebs(emergency=False) is EbsAction.NONE
+
+
+def test_ebs_none_once_acked():
+    # The ONLY latch: a positive ack stops further requests.
+    assert _ebs(acked=True) is EbsAction.NONE
+
+
+def test_ebs_wait_when_service_not_ready_does_not_latch():
+    # Regression: an unavailable service must NOT kill the path — it waits
+    # so a later tick retries once the server appears.
+    assert _ebs(service_ready=False) is EbsAction.WAIT
+
+
+def test_ebs_wait_while_call_in_flight():
+    # Don't dispatch a duplicate while one is awaiting its response.
+    assert _ebs(call_in_flight=True) is EbsAction.WAIT
+
+
+def test_ebs_retries_after_a_dropped_call():
+    # A call that went out but never acked leaves acked=False; once it is
+    # no longer in flight and the service is ready we dispatch again.
+    assert _ebs(call_in_flight=False, acked=False) is EbsAction.DISPATCH
 
 
 def test_steady_status_mapping():
