@@ -24,8 +24,12 @@ Two responsibilities:
      `/ctrl/emergency` + `/slam/finished`, and — only while the mission
      is RUNNING — republishes throttle/steering as a normalised
      `geometry_msgs/Twist` on /ctrl/cmd for the uDV/emulator to scale and
-     actuate. Emergencies are requested via the uDV's /force_ebs
-     (std_srvs/SetBool) service. The autonomy never publishes
+     actuate. On emergency the relay publishes /dv/status = EMERGENCY —
+     the path the uDV latches into AS Emergency + EBS — and additionally
+     calls the uDV's /force_ebs (std_srvs/SetBool) as a redundant,
+     non-latching request (DV_EMERGENCY is what actually holds the brake;
+     the service is a defense-in-depth / bench actuator hook).
+     The autonomy never publishes
      /fsds/control_command directly; this relay is what makes the sim
      path mirror the real-car DVPC→uDV chain.
 

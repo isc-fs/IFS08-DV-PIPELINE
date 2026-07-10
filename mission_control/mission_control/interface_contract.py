@@ -18,7 +18,10 @@ plays the uDV.
     /ctrl/cmd     geometry_msgs/Twist  normalised command:
                                    linear.x = throttle [-1, 1],
                                    angular.z = steering [-1, 1]
-    /force_ebs    std_srvs/SetBool (service)  emergency-brake request
+    /force_ebs    std_srvs/SetBool (service)  redundant EBS request —
+                                   DV_EMERGENCY on /dv/status is the
+                                   actuating path; this service is a
+                                   non-latching bench / defense-in-depth hook
 
 Both byte topics MUST be published at a steady cadence (>= ~2 Hz, not
 edge-only): each is the other side's liveness heartbeat (a stale
