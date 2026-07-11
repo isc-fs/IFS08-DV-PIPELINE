@@ -55,6 +55,7 @@ from cone_slam.data_association import DISTANCE_GATE_M, Observation, associate
 from cone_slam.factor_graph import FactorGraph, ScanResult
 from cone_slam.imu_preintegrator import ImuPreintegrator, ImuSample
 from cone_slam.landmark_db import LandmarkDb
+from cone_slam.lap_counter import LapCounter, LapCounterConfig
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from node_base.base_lifecycle_node import BaseLifecycleNode
@@ -396,6 +397,21 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self.declare_parameter("loc_prior_sigma_xy_m", 0.30)
         self.declare_parameter("loc_prior_sigma_yaw_rad", 0.05)
 
+        # --- Mission completion → /slam/finished (#384) ----------------
+        # Lap/distance completion detector (see lap_counter.LapCounter).
+        # Origin ≈ spawn ≈ start/finish, so lap counting reuses the
+        # loop_close_* geometry above (arm >= min_radius, close <= radius).
+        # Finish is gated on standstill: entering AS Finished fires the EBS
+        # + opens the SDC on the firmware, so signalling at speed would
+        # hard-brake the car (FS rules also require standstill). Per-mission
+        # defaults live in _resolve_finish_config (autocross=1 lap,
+        # trackdrive=10, accel=75 m distance). -1 => use the mission
+        # default; >= 0 overrides. trackdrive won't actually fire until
+        # control_node holds its stop-anchor to the final lap (follow-up).
+        self.declare_parameter("laps_to_finish", -1)
+        self.declare_parameter("finish_distance_m", -1.0)
+        self.declare_parameter("finish_standstill_speed_mps", 0.5)
+
         # --- GT-cone debug mode (sim only) -----------------------------
         # When `debug_gt_cones` is true, SLAM ignores the *perceived*
         # cone positions on /Conos_raw and instead synthesizes body-frame
@@ -551,6 +567,11 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # (DA staleness gating / diagnostics). Continues from the frozen
         # graph step since iSAM2's own step stops advancing once frozen.
         self._loc_scan = 0
+        # /slam/finished lap/distance detector (#384). Rebuilt each run
+        # from the mission's resolved completion criteria (self._finish_cfg,
+        # set in on_configure) so counts start clean; a fresh node with no
+        # resolved config yet gets a disabled counter (never finishes).
+        self._lap_counter = LapCounter(getattr(self, "_finish_cfg", None))
 
     # ------------------------------------------------------------------
     # Lifecycle transitions
@@ -594,6 +615,11 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 "GT pose. /Conos_raw is the scan trigger only; perceived "
                 "cone xy are IGNORED. SIM-ONLY diagnostic; never run on car."
             )
+
+        # Resolve this mission's /slam/finished criteria from the behavior
+        # string (== mission name) BEFORE _reset_run_memory builds the lap
+        # counter from it. See _resolve_finish_config.
+        self._finish_cfg = self._resolve_finish_config()
 
         # Components + run-memory: start from a clean slate.
         self._reset_run_memory()
@@ -1185,6 +1211,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                     "localization_only_after_loop_close").value):
                 self._prev_scan_odom_pose = cur_odom_pose
                 predicted_pose = self._latest_result.pose.compose(between_pose)
+                # Mission-completion (#384): keep counting laps after the
+                # mapping-freeze switched us to the localization-only path.
+                if self._lap_counter.update(
+                        predicted_pose.x(), predicted_pose.y(),
+                        self._current_speed()):
+                    self._publish_finished()
                 self._localize_scan(msg, stamp, predicted_pose, v_world)
                 return
             predicted_pose = self._graph.stage_odom_motion_step(
@@ -1317,6 +1349,13 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # Loop-closure check: once a lap is detected, freeze landmark
         # spawning for the rest of the run (track is fully mapped).
         self._update_loop_closure(pred_x, pred_y)
+
+        # Mission-completion (#384): count laps / distance and raise
+        # /slam/finished when the per-mission target is met AND the car is
+        # stopped. Runs on both the mapping and localization-only paths so
+        # it keeps counting after the first lap freezes mapping.
+        if self._lap_counter.update(pred_x, pred_y, self._current_speed()):
+            self._publish_finished()
 
         # Mahalanobis DA stays disabled. Three variants tested on
         # 2026-04-29:
@@ -2157,6 +2196,62 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 f"{self._loop_max_dist:.1f} m, map={len(self._db)}). No new "
                 f"landmarks will be spawned; observations re-associate only."
             )
+
+    def _resolve_finish_config(self) -> LapCounterConfig:
+        """Per-mission `/slam/finished` criteria, keyed by the behavior
+        string (== mission name from mode_registry). The `laps_to_finish` /
+        `finish_distance_m` params override the per-mission default: -1
+        means "use the mission default", >= 0 forces the value.
+
+        Defaults: autocross = 1 lap, trackdrive = 10 laps, accel = 75 m
+        (distance, since accel never returns to origin). trackdrive is
+        wired but won't fire until control_node holds its stop-anchor to
+        the final lap (follow-up) — today the car stops after ~lap 1 so the
+        count never reaches 10. skidpad has no criterion yet (figure-8) and
+        so never auto-finishes.
+        """
+        defaults = {
+            "autocross": (1, 0.0),
+            "trackdrive": (10, 0.0),
+            "accel": (0, 75.0),
+        }
+        laps_def, dist_def = defaults.get(self._behavior, (0, 0.0))
+        laps = int(self.get_parameter("laps_to_finish").value)
+        dist = float(self.get_parameter("finish_distance_m").value)
+        cfg = LapCounterConfig(
+            laps_to_finish=laps if laps >= 0 else laps_def,
+            finish_distance_m=dist if dist >= 0.0 else dist_def,
+            arm_radius_m=float(
+                self.get_parameter("loop_close_min_radius_m").value),
+            close_radius_m=float(
+                self.get_parameter("loop_close_radius_m").value),
+            standstill_mps=float(
+                self.get_parameter("finish_standstill_speed_mps").value),
+        )
+        self.get_logger().info(
+            f"mission-finish: behavior='{self._behavior}' -> "
+            f"laps={cfg.laps_to_finish} dist={cfg.finish_distance_m:.0f}m "
+            f"(standstill <= {cfg.standstill_mps} m/s)"
+        )
+        return cfg
+
+    def _current_speed(self) -> float:
+        """Planar speed (m/s) from the latest SLAM velocity estimate.
+        Returns +inf when there is no solve yet so the standstill gate
+        can't trip before the car has even localized."""
+        if self._latest_result is None:
+            return float("inf")
+        v = self._latest_result.velocity
+        return float(np.hypot(float(v[0]), float(v[1])))
+
+    def _publish_finished(self) -> None:
+        """Latch `/slam/finished = true` — mission complete and stopped."""
+        self.get_logger().info(
+            f"MISSION FINISHED — {self._lap_counter.summary()} "
+            f"-> /slam/finished=true"
+        )
+        if self._finished_pub is not None:
+            self._finished_pub.publish(Bool(data=True))
 
     def _publish_cone_map(self, stamp) -> None:
         """Publish the persistent cone landmark database to /Conos.
