@@ -84,12 +84,16 @@ class ConeDetectionConfig:
     # max_input_points below are secondary (far returns / absolute cap).
     roi_crop_height_m: float = 0.6
 
-    # Hard cap on points fed to clustering, applied AFTER the ROI crops as a
-    # last-resort safety net for pathologically dense scans. If the cropped
-    # cloud still exceeds this, a deterministic uniform subsample bounds
-    # RANSAC/DBSCAN cost + memory. Cones are dense small clusters, so a high
-    # cap keeps enough returns per cone to fit. 0 disables.
-    max_input_points: int = 90000
+    # Hard cap on points fed to clustering, applied AFTER the ROI crops. This
+    # is the UNIVERSAL memory bound: the height crop only helps scenery-dense
+    # scenes (on open track ground it keeps all the low ground returns), so on
+    # its own it can't stop a ~100k-point open-ground scan from spiking DBSCAN
+    # past the 8 GiB container limit. Capping the count deterministically
+    # subsamples any larger cloud, bounding RANSAC/DBSCAN memory regardless of
+    # scene. 40k keeps cone_detection well under ~2 GiB (measured ~444 MB at
+    # 10k, ~6 GB at 128k) while leaving dense small cone clusters intact. Set
+    # 0 to disable.
+    max_input_points: int = 40000
 
     # Confidence margin (residual_other / residual_min) for template_dispatch
     # ambiguity. Ignored when ``res_other`` is not finite (e.g. two_param path).
