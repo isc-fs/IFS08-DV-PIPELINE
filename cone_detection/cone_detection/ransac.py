@@ -9,7 +9,11 @@ import numpy as np
 import numba
 
 
-@numba.jit(nopython=True)
+# cache=True persists compiled machine code in __pycache__ (or
+# NUMBA_CACHE_DIR) so restarts skip the multi-second JIT. Requires every
+# default value to be picklable — hence initial_coefs defaults to None,
+# not an empty array.
+@numba.jit(nopython=True, cache=True)
 def ransac2(
     data,
     m=3,
@@ -17,6 +21,7 @@ def ransac2(
     threshold=None,
     max_iter=200,
     iter_subsample_max=5000,
+    initial_coefs=None,
 ):
     """RANSAC plane fit. Returns (inlier_mask, plane coefficients).
 
@@ -38,6 +43,13 @@ def ransac2(
             loop (#247). Consensus scoring runs on at most this many
             points; the final inlier mask always uses the full cloud.
             Set to 0 or negative to disable subsampling (profiling only).
+        initial_coefs: optional warm-start plane ``[bias, n_x, ..., n_z]``
+            (e.g. the previous scan's result). Scored as candidate zero
+            before the random loop: if it still explains the ground, the
+            adaptive iteration bound collapses to a handful of iterations;
+            if the scene changed, it loses the support comparison and the
+            full random search runs as before. None or an empty array = no
+            warm start.
 
     Returns:
         np.where-style index of inlier points in the full input cloud,
@@ -87,6 +99,29 @@ def ransac2(
     # iters>50 to avoid hanging — but if the loop exited that way, the
     # subsequent `def_coefs[-1] < 0` check crashed.
     def_coefs = np.array([0.0, 0.0, 0.0, 1.0])
+
+    # Warm start: score the caller-provided plane exactly like a random
+    # candidate (same subsample, same threshold, same -m correction) so the
+    # support comparison against loop candidates stays fair.
+    if (
+        initial_coefs is not None
+        and initial_coefs.shape[0] == data.shape[1]
+        and abs(initial_coefs[-1]) > 1e-12
+    ):
+        warm = initial_coefs.astype(np.float64)
+        support_aux = 0
+        for i in A_xy.dot(warm[:-1] / (-1 * warm[-1])) - A_z:
+            if abs(i) < threshold:
+                support_aux += 1
+        support_aux -= m
+        if support_aux > support:
+            support = support_aux
+            def_coefs = warm.copy()
+            inlier_ratio = support / iter_data_size
+            if 0.0 < inlier_ratio < 1.0:
+                k_new = np.log(1 - prob) / np.log(1 - inlier_ratio ** m)
+                if k_new < k:
+                    k = k_new
 
     while iters < k and iters < max_iter:
         # Sample m anchors from the FULL cloud — the iteration subsample
