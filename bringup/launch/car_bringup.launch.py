@@ -11,11 +11,17 @@ old isc_ws/isc_startup stub stack as the DVPC race-mode entry point:
     at launch time via FindPackageShare, so this file imports fine on
     machines without it as long as with_lidar:=false.
   * Static base_link → hesai_lidar / imu_link TFs. REP-103 (x forward,
-    y left, z up), base_link z=0 at the CAR floor. Vertical distances
-    measured 2026-06-29: LiDAR base 912.7 mm above the car floor; IMU
-    616.5 mm below the LiDAR (≈ LattePanda location) → z = 0.2962 m.
-    ⚠️ x/y offsets of both sensors and the ATX mounting orientation
-    (yaw/pitch/roll) are still UNMEASURED — 0.0 placeholders below.
+    y left, z up), base_link z=0 at the CAR floor, origin at the rear-axle
+    midpoint. Geometry measured 2026-06-29 (heights) + 2026-07-11 (x/y and
+    orientation): LiDAR x=0.667 y=0.027 z=0.9127, pitch 3.323deg nose-down
+    (0.0580 rad); IMU remounted aligned 2026-07-11 x=0.425 y=0.040, z=0.2962
+    inherited (height unchanged), roll/pitch/yaw=0.
+    NOTE: these TFs are consumed by tf2 (viz + any tf2-based transform) but
+    NOT by the estimation data path — cone_detection emits cones already
+    labelled base_link (lidar_xy hardcoded (0,0)) and the EKF/SLAM read /imu
+    raw. So the LiDAR x/pitch is not yet applied to cone positions (bounded
+    bias); the aligned IMU needs no correction beyond a minor translation
+    lever-arm. See dvpc-pipeline-integration-tasks item 10.
   * Optional foxglove_bridge for umbilical/bench monitoring
     (foxglove:=true; default off — racing needs no visualisation).
 
@@ -66,8 +72,9 @@ def generate_launch_description() -> LaunchDescription:
             package="tf2_ros", executable="static_transform_publisher",
             name="tf_base_to_lidar",
             arguments=[
-                "--x", "0.0", "--y", "0.0", "--z", "0.9127",  # x,y TODO: measure
-                "--yaw", "0.0", "--pitch", "0.0", "--roll", "0.0",  # TODO: ATX level?
+                "--x", "0.667", "--y", "0.027", "--z", "0.9127",
+                # pitch 3.323deg nose-down (0.0580 rad); roll/yaw level.
+                "--yaw", "0.0", "--pitch", "0.0580", "--roll", "0.0",
                 "--frame-id", "base_link", "--child-frame-id", "hesai_lidar",
             ],
         ),
@@ -77,7 +84,9 @@ def generate_launch_description() -> LaunchDescription:
             package="tf2_ros", executable="static_transform_publisher",
             name="tf_base_to_imu",
             arguments=[
-                "--x", "0.0", "--y", "0.0", "--z", "0.2962",  # x,y TODO: measure
+                # IMU remounted aligned 2026-07-11 (roll/pitch/yaw=0); z
+                # inherited from the 2026-06-29 measurement (height unchanged).
+                "--x", "0.425", "--y", "0.040", "--z", "0.2962",
                 "--yaw", "0.0", "--pitch", "0.0", "--roll", "0.0",
                 "--frame-id", "base_link", "--child-frame-id", "imu_link",
             ],
