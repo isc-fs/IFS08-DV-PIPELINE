@@ -339,9 +339,19 @@ class ControlNode(BaseLifecycleNode):
         #                        (rad / (rad/s)); 0.0 disables
         #   stanley_k_damp_steer: optional single-tick damping against
         #                         the previous command; 0.0 disables
-        self.declare_parameter("stanley_k", 3.5)
+        # NB k=3.5 with k_yaw_rate=0.0 (no yaw damping) limit-cycled the
+        # lateral loop at 1-3 m/s: the heading-error term is fed straight into
+        # steering and nothing damped the overshoot, so on any heading
+        # disturbance (corner) the steering bang-banged ±1. Measured on bag
+        # autocross_track_20260711_184630: steering at full lock 25-53% of the
+        # run, ±1 rad/s yaw limit cycle, steering leading yaw by 0.15 s
+        # (closed-loop instability). The #306 actuator slew limiter softened
+        # but did not remove it. Reverted to the previously-validated k=2.0 +
+        # k_yaw_rate=0.5 (Hoffmann yaw-rate damping) — the damping term is the
+        # lever that breaks the cycle. Confirmed on a live autocross run.
+        self.declare_parameter("stanley_k", 2.0)
         self.declare_parameter("stanley_k_soft", 1.5)
-        self.declare_parameter("stanley_k_yaw_rate", 0.0)
+        self.declare_parameter("stanley_k_yaw_rate", 0.5)
         self.declare_parameter("stanley_k_damp_steer", 0.2)
         # Kinematic-bicycle geometry. Used by every lateral controller
         # via the shared KinematicBicycle model. Default matches the
