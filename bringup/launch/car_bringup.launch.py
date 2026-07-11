@@ -41,9 +41,16 @@ def generate_launch_description() -> LaunchDescription:
 
     return LaunchDescription([
         DeclareLaunchArgument(
-            "with_lidar", default_value="true",
+            # prerun/ BRANCH DIVERGENCE — DO NOT MERGE TO dev (see PRERUN.md).
+            # Default flipped true->false so the service boots WITHOUT the
+            # Hesai driver: a replayed rosbag feeds /lidar_points (re-stamped
+            # to now via deploy/prerun_restamp_relay.py) as the only source,
+            # else the live driver and the bag collide. Pass with_lidar:=true
+            # to run the real driver. This is the sole functional change here.
+            "with_lidar", default_value="false",
             description="Start the Hesai ATX driver (needs hesai_ros_driver "
-                        "from the DVPC's ros2_ws sourced)."),
+                        "from the DVPC's ros2_ws sourced). prerun/: default "
+                        "false — the bag provides /lidar_points."),
         DeclareLaunchArgument(
             "foxglove", default_value="false",
             description="Start foxglove_bridge (bench/umbilical monitoring)."),
