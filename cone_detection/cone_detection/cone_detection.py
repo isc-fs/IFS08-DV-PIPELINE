@@ -60,6 +60,37 @@ class ConeDetectionConfig:
     # Range cutoff (m): beyond this, drop as too sparse / unreliable.
     range_gate_max_m: float = 20.0
 
+    # ROI crop (m): drop LiDAR returns beyond this 2D range BEFORE the
+    # expensive RANSAC-ground + DBSCAN. Cones live within range_gate_max_m;
+    # a dense scene (sim customMap walls / distant geometry) can push a single
+    # scan to 120k+ points that are almost all far returns clustering never
+    # turns into cones. Processing the full cloud spikes memory (we hit the
+    # container's 8 GiB limit -> OOM-kill mid-scan) and slows a scan to several
+    # seconds. Cropping to a margin past the range gate keeps every real cone
+    # while cutting the point count several-fold. Radial (2D) so cones ahead
+    # AND to either side survive regardless of car heading. 0 disables.
+    roi_crop_max_m: float = 25.0
+
+    # Height crop (m above the lowest return): drop LiDAR returns taller than
+    # this BEFORE clustering. Cones are short (< cluster_height_max_m); the
+    # bulk of a dense scan is tall wall / scenery returns the pipeline never
+    # turns into cones. A boxed-in car (off-track in sim scenery) sees 90%+ of
+    # its returns above cone height and within 5 m -- clustering that full
+    # cloud OOM-kills the node. Keeping only the low band leaves the ground
+    # (for the RANSAC plane fit) + cones while cutting the point count ~10x,
+    # and drops tall clusters that could otherwise fake cones. The floor is
+    # estimated as a low z-percentile (robust to a stray low return). 0
+    # disables. This is the primary point-count guard; roi_crop_max_m /
+    # max_input_points below are secondary (far returns / absolute cap).
+    roi_crop_height_m: float = 0.6
+
+    # Hard cap on points fed to clustering, applied AFTER the ROI crops as a
+    # last-resort safety net for pathologically dense scans. If the cropped
+    # cloud still exceeds this, a deterministic uniform subsample bounds
+    # RANSAC/DBSCAN cost + memory. Cones are dense small clusters, so a high
+    # cap keeps enough returns per cone to fit. 0 disables.
+    max_input_points: int = 90000
+
     # Confidence margin (residual_other / residual_min) for template_dispatch
     # ambiguity. Ignored when ``res_other`` is not finite (e.g. two_param path).
     ambiguous_margin_ratio: float = 1.5
@@ -231,10 +262,44 @@ class RealtimeConeDetector:
     ) -> list[tuple[float, float, float, float]]:
         """Detect cones in a single LiDAR scan (same contract as ``final_cone_result_rt``)."""
         cfg = self.config
+        data = np.asarray(data)
         if debug_counters is not None:
             debug_counters["n_input_points"] = len(data)
         if len(data) == 0:
             return []
+
+        # ROI crops + safety cap BEFORE the expensive RANSAC-ground + DBSCAN.
+        # Dense scenes push a scan to 120k+ points that clustering never turns
+        # into cones; processing the full cloud OOM-kills the node at the
+        # container memory limit and slows a scan to seconds. See the
+        # roi_crop_height_m / roi_crop_max_m / max_input_points config comments.
+        n_before_crop = len(data)
+        # 1) Height crop (primary): keep only the low band (ground + cones),
+        #    dropping tall wall/scenery returns. Floor = low z-percentile so a
+        #    stray low return doesn't shift the band.
+        if cfg.roi_crop_height_m > 0.0:
+            floor_z = float(np.percentile(data[:, 2], 2.0))
+            data = data[data[:, 2] <= floor_z + cfg.roi_crop_height_m]
+            if len(data) == 0:
+                return []
+        # 2) Radial crop (secondary): drop returns beyond the range gate margin.
+        if cfg.roi_crop_max_m > 0.0:
+            data = data[(data[:, 0] ** 2 + data[:, 1] ** 2)
+                        <= cfg.roi_crop_max_m ** 2]
+            if len(data) == 0:
+                return []
+        if debug_counters is not None:
+            debug_counters["n_roi_cropped"] = int(n_before_crop - len(data))
+        if 0 < cfg.max_input_points < len(data):
+            # Deterministic seed: reproducible scan-to-scan, no per-frame jitter
+            # in which cones survive the subsample.
+            idx = np.random.default_rng(0).choice(
+                len(data), cfg.max_input_points, replace=False
+            )
+            if debug_counters is not None:
+                debug_counters["n_subsampled_from"] = int(len(data))
+            data = data[idx]
+
         labels, clean_data, def_coefs = clustering_separation_rt(
             data,
             cfg,
