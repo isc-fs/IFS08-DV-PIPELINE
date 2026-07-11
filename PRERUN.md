@@ -47,21 +47,32 @@ TF still applies to the re-stamped cloud.)
 ```bash
 # 1) Pipeline up (this branch → Hesai driver off, autonomy consuming
 #    /imu + /lidar_points). uDV flashed from its prerun/rosbag-onboard branch.
-ros2 launch bringup car_bringup.launch.py        # or the dv-pipeline.service
+dv race        # (car boot) — or: ros2 launch bringup car_bringup.launch.py
 
-# 2) Re-stamp relay (shadow topics -> real topics, stamped now):
-python3 deploy/prerun_restamp_relay.py
+# 2) Automated replay: starts the re-stamp relay, WAITS for AS DRIVING, then
+#    plays the bag. It never arms the car — the operator does the normal
+#    arm + RES GO, and the replay fires the instant the car enters DRIVING.
+prerun-play [BAG]                 # default: newest dir under ~/bags
 
-# 3) Play the bag into the shadow topics, 1x so relative timing is preserved:
-ros2 bag play <bag> --remap /imu:=/imu_bag /lidar_points:=/lidar_points_bag
+#    …or by hand (bag topics -> relay shadow inputs; the relay re-stamps to
+#    now and republishes /imu + /lidar_points, 1x so timing is preserved):
+python3 deploy/prerun_restamp_relay.py &
+ros2 bag play <bag> --remap /imu:=/imu_bag /lidar/Lidar1:=/lidar_points_bag
 ```
+
+> The LiDAR remap source is **`/lidar/Lidar1`** — the topic name in the
+> car-recorded bags — NOT `/lidar_points`. The autonomy reads `/lidar_points`
+> (the Hesai topic); the relay bridges the two. ⚠️ Once armed, `prerun-play`
+> feeds a **live drivetrain** — car on stands, RES e-stop + EBS ready.
 
 ## Rosbag requirements (shared with the uDV branch)
 
 - The bag must contain **only** the replayed sensor feeds: `/imu`
-  (sensor_msgs/Imu, `frame_id=imu_link`) and `/lidar_points`
-  (sensor_msgs/PointCloud2, `frame_id=hesai_lidar`). If it also carries other
-  uDV topics (`/motor_rpm`, `/steering_angle`, `/res/*`, `/assi/state`, …) they
+  (sensor_msgs/Imu, `frame_id=imu_link`) and the LiDAR cloud
+  (sensor_msgs/PointCloud2, `frame_id=hesai_lidar`) — in the car-recorded bags
+  the LiDAR topic is **`/lidar/Lidar1`**, remapped on replay to feed the
+  autonomy's `/lidar_points`. If the bag also carries other uDV topics
+  (`/motor_rpm`, `/steering_angle`, `/res/*`, `/assi/state`, …) they
   collide with the live firmware — strip them or add stubs.
 - Do **not** include `/tf`/`/tf_static` for `hesai_lidar`/`imu_link` in the
   bag; those are published live by `car_bringup`.

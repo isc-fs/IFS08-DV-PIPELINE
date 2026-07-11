@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# prerun-play — replay a rosbag into the live (prerun) autonomy, gated on AS DRIVING.
+#
+# Starts the re-stamp relay (bag sensor feeds -> /imu + /lidar_points, stamped
+# to *now*), waits until the uDV reports AS DRIVING (/assi/state == 3), then
+# plays the bag. The car ONLY actuates once a human has armed it and hit RES GO
+# (that is what puts the uDV in AS DRIVING) — this script never arms anything.
+# It just fires the replay the instant the car is armed, so the operator does
+# the normal arm + GO and the sensors start flowing hands-free.
+#
+#   prerun-play [BAG]        default: newest dir under ~/bags
+#   prerun-play --now [BAG]  skip the DRIVING gate, play immediately (bench:
+#                            nothing actuates unless the car is separately armed)
+#
+# SAFETY: the drivetrain is LIVE once armed. Car on stands, wheels clear, RES
+# e-stop + EBS ready. Stop the replay with Ctrl-C; stop the relay with
+# `pkill -f prerun_restamp_relay`.
+set -uo pipefail
+
+WS="/home/isc/dv_ws"
+SRC="$WS/src/IFS08-DV-PIPELINE"
+RELAY="$SRC/deploy/prerun_restamp_relay.py"
+IMU_BAG="/imu_bag"                 # relay input (shadow) topics
+LIDAR_BAG="/lidar_points_bag"
+DRIVING_STATE=3                    # /assi/state: OFF0 EMERG1 READY2 DRIVING3 FIN4
+WAIT_DRIVING=1
+
+LOG(){ echo "[prerun-play] $*"; }
+
+BAG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --now) WAIT_DRIVING=0; shift ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) BAG="$1"; shift ;;
+  esac
+done
+BAG="${BAG:-$(ls -dt /home/isc/bags/*/ 2>/dev/null | head -1)}"
+
+set +u
+source /opt/ros/humble/setup.bash
+source "$WS/install/setup.bash" 2>/dev/null || true
+set -u
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+[ -n "$BAG" ] && [ -e "$BAG" ] || { LOG "bag not found: '${BAG:-<none>}' (put one under ~/bags or pass a path)"; exit 1; }
+[ -f "$RELAY" ] || { LOG "relay missing: $RELAY — is the car on the prerun branch? check: prerun status"; exit 1; }
+
+# 1) re-stamp relay ---------------------------------------------------------
+if pgrep -f "prerun_restamp_relay" >/dev/null 2>&1; then
+  LOG "re-stamp relay already running."
+else
+  LOG "starting re-stamp relay ($IMU_BAG,$LIDAR_BAG -> /imu,/lidar_points @ now)…"
+  nohup python3 "$RELAY" >"$WS/prerun_relay.log" 2>&1 &
+  sleep 2
+fi
+
+# 2) wait for AS DRIVING ----------------------------------------------------
+if [ "$WAIT_DRIVING" -eq 1 ]; then
+  LOG "waiting for AS DRIVING (/assi/state==$DRIVING_STATE). Arm the car + RES GO. Ctrl-C aborts."
+  while :; do
+    v=$(timeout 2 ros2 topic echo /assi/state --once --qos-reliability best_effort 2>/dev/null \
+          | sed -n 's/^data: *//p' | head -1)
+    [ "$v" = "$DRIVING_STATE" ] && break
+    sleep 0.3
+  done
+  LOG "AS DRIVING detected — starting replay."
+else
+  LOG "--now: DRIVING gate skipped (nothing actuates unless the car is armed)."
+fi
+
+# 3) play the bag (1x; bag topics -> relay inputs) --------------------------
+LOG "playing: $BAG"
+LOG "remap: /imu->$IMU_BAG , /lidar/Lidar1->$LIDAR_BAG  (relay re-stamps to now)"
+exec ros2 bag play "$BAG" --remap /imu:="$IMU_BAG" /lidar/Lidar1:="$LIDAR_BAG"
