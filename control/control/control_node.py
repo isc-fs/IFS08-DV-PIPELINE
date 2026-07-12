@@ -339,9 +339,9 @@ class ControlNode(BaseLifecycleNode):
         #                        (rad / (rad/s)); 0.0 disables
         #   stanley_k_damp_steer: optional single-tick damping against
         #                         the previous command; 0.0 disables
-        self.declare_parameter("stanley_k", 3.5)
+        self.declare_parameter("stanley_k", 2.0)  # de-tune (=PR#41) — Stanley limit-cycle fix; prerun predated it
         self.declare_parameter("stanley_k_soft", 1.5)
-        self.declare_parameter("stanley_k_yaw_rate", 0.0)
+        self.declare_parameter("stanley_k_yaw_rate", 0.5)  # Hoffmann yaw-rate damping (was 0.0)
         self.declare_parameter("stanley_k_damp_steer", 0.2)
         # Kinematic-bicycle geometry. Used by every lateral controller
         # via the shared KinematicBicycle model. Default matches the
