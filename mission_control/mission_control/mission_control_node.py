@@ -539,7 +539,15 @@ class MissionControlNode(LifecycleNode):
             return
         cmd = self._latest_ctrl_cmd
         twist = Twist()
-        twist.linear.x = float(cmd.throttle)   # [-1, 1], negative = regen
+        # control_node emits SPLIT unsigned channels — throttle[0,1] (motor) and
+        # brake[0,1] (regen) — with a deadband guaranteeing only one is non-zero.
+        # Pack them into the single signed /ctrl/cmd convention (linear.x ∈
+        # [-1, 1], negative = regen) that the uDV / sim_supervisor decode, so
+        # throttle − brake is a lossless encode. Sending cmd.throttle ALONE
+        # silently dropped the entire regen channel: the car could only coast,
+        # never brake — on the bench (wheels on stands) that let a freewheel
+        # over-rev trip the inverter because the loop had no braking authority.
+        twist.linear.x = float(cmd.throttle) - float(cmd.brake)  # +motor / −regen
         twist.angular.z = float(cmd.steering)  # [-1, 1], left positive
         self._ctrl_cmd_pub.publish(twist)
 
