@@ -126,6 +126,8 @@ class ControlNode(BaseLifecycleNode):
         self._emergency_pub = None
         self._v_set_pub = None
         self._kappa_max_pub = None
+        self._steer_column_pub = None
+        self._steer_motor_pub = None
         self._sub_path = None
         self._sub_pose = None
         self._sub_odom = None
@@ -176,6 +178,13 @@ class ControlNode(BaseLifecycleNode):
             Float32, "/control/v_set_mps", 10)
         self._kappa_max_pub = self.create_lifecycle_publisher(
             Float32, "/control/kappa_max_per_m", 10)
+        # Absolute steering angles for the uDV (steering-kinematics output):
+        # the desired COLUMN angle and the stepper MOTOR angle that produce the
+        # commanded road-wheel angle through the real steering geometry.
+        self._steer_column_pub = self.create_lifecycle_publisher(
+            Float32, "/ctrl/steer_column_deg", 10)
+        self._steer_motor_pub = self.create_lifecycle_publisher(
+            Float32, "/ctrl/steer_motor_deg", 10)
 
         # TF listener — post-#382 sim_supervisor publishes
         # odom→base_link (100 Hz dead-reckoning) and slam_node
@@ -280,6 +289,8 @@ class ControlNode(BaseLifecycleNode):
         self._emergency_pub = None
         self._v_set_pub = None
         self._kappa_max_pub = None
+        self._steer_column_pub = None
+        self._steer_motor_pub = None
         self._tf_listener = None
         self._tf_buffer = None
         self._drive = None
@@ -358,6 +369,19 @@ class ControlNode(BaseLifecycleNode):
         # IFS-08 chassis (also the default inside bicycle.py).
         self.declare_parameter("wheelbase", 1.627)
         self.declare_parameter("max_steer_deg", 28.0)
+        # Steering kinematics — road-wheel angle -> column -> stepper motor.
+        # The steering motor sits on the COLUMN (not the rack), so the
+        # normalized road-wheel command the lateral controllers emit is geared
+        # up twice before it reaches the actuator:
+        #   column_deg = road_wheel_deg * steering_ratio   (volante:rueda)
+        #   motor_deg  = column_deg     * motor_to_column
+        # steering_ratio from the IFS-08 rack (87.9 mm/rev, LWS on the column):
+        # 360 deg column -> 72.1 deg wheel = 5.0:1 (or 84.5 deg = 4.3:1).
+        # motor_to_column = 1.1 (column:motor 1:1.1 — stepper turns 1.1x column).
+        # Published on /ctrl/steer_column_deg + /ctrl/steer_motor_deg as ABSOLUTE
+        # angles for the uDV to forward, replacing norm*STEER_FULL_LOCK_DEG.
+        self.declare_parameter("steering_ratio", 5.0)
+        self.declare_parameter("motor_to_column", 1.1)
         self.declare_parameter("kp_v", 0.5)
         self.declare_parameter("ki_v", 0.05)
         self.declare_parameter("deadband_v", 0.2)
@@ -633,6 +657,16 @@ class ControlNode(BaseLifecycleNode):
         kappa_msg = Float32()
         kappa_msg.data = float(getattr(self._drive, "last_kappa_max", 0.0))
         self._kappa_max_pub.publish(kappa_msg)
+
+        # ----- steering kinematics: road-wheel -> column -> motor -----
+        # cmd.steering is the normalized road-wheel command (+/-1 = +/-max_steer_deg)
+        # in the actuator sign convention. Gear it up through the column steering
+        # ratio and the motor:column ratio to the absolute angles the uDV forwards.
+        road_wheel_deg = cmd.steering * float(self._p("max_steer_deg"))
+        column_deg = road_wheel_deg * float(self._p("steering_ratio"))
+        motor_deg = column_deg * float(self._p("motor_to_column"))
+        self._steer_column_pub.publish(Float32(data=float(column_deg)))
+        self._steer_motor_pub.publish(Float32(data=float(motor_deg)))
 
         # Heartbeat — every ~0.5 s. Tells us at a glance whether each
         # stage is producing what we expect.
