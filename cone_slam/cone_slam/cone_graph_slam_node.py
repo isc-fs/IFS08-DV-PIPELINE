@@ -274,6 +274,13 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # Set to 0 to disable the veto.
         self.declare_parameter("new_landmark_proximity_veto_m", 1.5)
 
+        # IMU bias-calibration window at init (INIT_CALIBRATING assumes the car
+        # is stationary). Default = the module constant; exposed as a param so a
+        # rosbag REPLAY on the car — where the bag may not present a clean
+        # stationary window at the moment the node activates — can shorten it
+        # without a code change. Default behaviour is unchanged.
+        self.declare_parameter("imu_calibration_seconds", CALIBRATION_SECONDS)
+
         # Count-based DA-spike threshold (issue #447, post-Phase-2 finding).
         # The original spike detector compared n_new_pre against
         # 60 % of total observations — but a 5-of-14 burst (36 %)
@@ -1045,13 +1052,15 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         if self._state == State.INIT_WAITING_IMU:
             self._calib_started_t = t
             self._state = State.INIT_CALIBRATING
+            cal_s = float(self.get_parameter("imu_calibration_seconds").value)
             self.get_logger().info(
                 "first IMU received — INIT_CALIBRATING (stationary, "
-                f"{CALIBRATION_SECONDS:.1f} s)"
+                f"{cal_s:.1f} s)"
             )
 
         elif self._state == State.INIT_CALIBRATING:
-            if self._preint.has_enough_for_calibration(CALIBRATION_SECONDS):
+            cal_s = float(self.get_parameter("imu_calibration_seconds").value)
+            if self._preint.has_enough_for_calibration(cal_s):
                 self._finish_calibration()
 
     def _finish_calibration(self) -> None:
