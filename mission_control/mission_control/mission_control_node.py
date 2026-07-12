@@ -167,7 +167,7 @@ _RECONCILE_HZ = 20.0
 # "4 missed cycles at 10 Hz" (dv_interface.h), so the wire rate stays
 # 10 Hz — _tick publishes every _DV_STATUS_EVERY_N-th tick. Must divide
 # _RECONCILE_HZ exactly (test-pinned).
-_DV_STATUS_PUB_HZ = 20.0  # 10->20Hz: land /dv/status inside the uDV's 400ms window under driving-load link latency (bench dv_lost_hb)
+_DV_STATUS_PUB_HZ = 10.0  # reverted: 20Hz congestion-collapsed the uDV micro-ROS link (see IFS08-DV-uDV#166)
 _DV_STATUS_EVERY_N = int(_RECONCILE_HZ / _DV_STATUS_PUB_HZ)
 
 # /assi/state liveness. If no AS-state heartbeat arrives within this
