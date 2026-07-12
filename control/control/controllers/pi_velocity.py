@@ -30,6 +30,7 @@ internally), the derivative is mostly quantisation noise. The audit's
 by simply not having a D term. Add it back if and when we have a clean
 high-rate v_meas signal.
 """
+
 from __future__ import annotations
 import math
 from typing import Tuple
@@ -38,28 +39,31 @@ from control.controllers.base import LongitudinalController
 from control.state import VehicleState
 from control.reference import ReferenceTrajectory
 
-
 # Tick period — must match ControlNode.PUBLISH_RATE_HZ. Used only by the
 # integrator. Hard-coded so this module doesn't need to know about the node.
 _DT = 1.0 / 40.0
 
 
 class PIVelocity(LongitudinalController):
-    def __init__(self,
-                 v_max: float = 12.0,
-                 a_lat_max: float = 3.0,
-                 a_dec_max: float = 4.0,
-                 kp: float = 0.5,
-                 ki: float = 0.05,
-                 deadband: float = 0.2,
-                 lookahead_curvature_s: float = 3.0,
-                 throttle_max: float = 0.6):
+    def __init__(
+        self,
+        v_max: float = 12.0,
+        a_lat_max: float = 3.0,
+        a_dec_max: float = 4.0,
+        kp: float = 0.5,
+        ki: float = 0.05,
+        deadband: float = 0.2,
+        lookahead_curvature_s: float = 3.0,
+        throttle_max: float = 0.6,
+    ):
         self.v_max = v_max
         self.a_lat_max = a_lat_max
         self.a_dec_max = a_dec_max
         self.kp = kp
         self.ki = ki
-        self.deadband = deadband
+        # Defensive: negative deadband inverts threshold logic. Treat it as
+        # a magnitude so the split stays monotonic.
+        self.deadband = max(0.0, float(deadband))
         self.lookahead_curvature_s = lookahead_curvature_s
         # Throttle saturation. Lower than the regen cap because if SLAM's
         # velocity estimate lags reality (we observed this triggering at
@@ -79,7 +83,9 @@ class PIVelocity(LongitudinalController):
     def reset(self) -> None:
         self._integral = 0.0
 
-    def compute(self, state: VehicleState, ref: ReferenceTrajectory) -> Tuple[float, float]:
+    def compute(
+        self, state: VehicleState, ref: ReferenceTrajectory
+    ) -> Tuple[float, float]:
         v_set = self._setpoint(state, ref)
         # Stash for diagnostic publish (#260 follow-up).
         self.last_v_set = v_set
@@ -124,7 +130,9 @@ class PIVelocity(LongitudinalController):
 
         return max(0.0, min(self.v_max, v_corner, v_stop))
 
-    def _max_curvature_ahead(self, state: VehicleState, ref: ReferenceTrajectory) -> float:
+    def _max_curvature_ahead(
+        self, state: VehicleState, ref: ReferenceTrajectory
+    ) -> float:
         """Maximum |κ| ahead of the car's nearest point, over the entire
         path.
 
