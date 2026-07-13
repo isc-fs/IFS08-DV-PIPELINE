@@ -53,8 +53,14 @@ ConeFitBackend = Literal["template_dispatch", "two_param"]
 class ConeDetectionConfig:
     """Tunable perception pipeline (clustering, gates, cone fit)."""
 
-    # Drop a cluster if the chosen fit's MSE residual exceeds this.
-    residual_gate_mse: float = 0.002
+    # Drop a cluster if the chosen fit's MSE residual exceeds this (RMSE = √mse:
+    # 0.1 → 316 mm). Loosened from the sim-tuned 0.002 (RMSE 45 mm), which
+    # rejected 100% of shape-valid candidates on the real Hesai ATX track
+    # (CONE_FILTER: ~20/scan pass shape, 0 pass residual → empty /Conos_raw →
+    # no map/path → car won't move). Deliberately permissive to get the car
+    # driving; expect more false positives. RE-TIGHTEN toward 0.02-0.03 once a
+    # real-cloud residual histogram is measured (bag /lidar_points via #68).
+    residual_gate_mse: float = 0.1
 
     # Coarse cluster-shape pre-filter (meters).
     cluster_height_min_m: float = 0.02
