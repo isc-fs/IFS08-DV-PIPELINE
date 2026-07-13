@@ -357,11 +357,11 @@ class ControlNode(BaseLifecycleNode):
         # via the shared KinematicBicycle model. Default matches the
         # IFS-08 chassis (also the default inside bicycle.py).
         self.declare_parameter("wheelbase", 1.627)
-        self.declare_parameter("max_steer_deg", 28.0)
+        self.declare_parameter("max_steer_deg", 18.2)  # road-wheel ceiling = column limit 100 deg / effective ratio 5.5; MUST match uDV MAX_STEER_ROADWHEEL_DEG (#59, uDV#172)
         self.declare_parameter("kp_v", 0.5)
         self.declare_parameter("ki_v", 0.05)
         self.declare_parameter("deadband_v", 0.2)
-        self.declare_parameter("throttle_max", 0.6)
+        self.declare_parameter("throttle_max", 0.2)
         # Actuator slew limits (units = command-units per second). The
         # sim takes commands instantaneously; real actuators don't.
         # These rate-limit the published command at the boundary so

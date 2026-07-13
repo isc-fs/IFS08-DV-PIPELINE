@@ -70,16 +70,22 @@ namespace odometry_filter {
 // ---------------------------------------------------------------------
 
 // Motor-RPM → body-frame longitudinal velocity.
-// 2026-05-10 re-derivation (issue #380): bagged /odom and
-// /testing_only/odom over a 41 s motion window on test_submodule.csv,
-// paired GT vs filter-output samples within ±50 ms windows, computed
-// mean(|GT.vx|) / mean(|/odom.vx|) = 0.9140 across 3324 paired
-// samples (p10=0.898, p90=0.944, spread 0.046 — tight, steady).
-// Doc-derived value from docs/dv_pipeline_rebuild.md §3.5:
-//     RPM_TO_MS = (2π × WheelRadius / GearRatio) / 60
-//               = (2π × 0.228 / 2.909) / 60
-//               = 0.00821
-constexpr double kRpmToMs = 0.00821;
+// v = rpm × (2π × WheelRadius / GearRatio) / 60.
+//
+// 2026-07-12 (Option B): WheelRadius corrected 0.228 → 0.202 m to match
+// the real IFS-08 tyre. The sim *generates* rpm from ground speed with the
+// same radius (settings.json WheelRadius → FSDSVehiclePawn), so sim
+// /odom.vx = ground truth for any consistent radius — this change is
+// GT-neutral in sim and makes the real car (which reports true rotor rpm)
+// geometrically correct. UE settings.json + Chaos wheels move to 0.202 in
+// lockstep.
+//     RPM_TO_MS = (2π × 0.202 / 2.909) / 60 = 0.00727
+//
+// History (issue #380): the prior 0.00821 was validated in sim as
+// mean(|GT.vx|)/mean(|/odom.vx|) = 0.9140 over 3324 samples on
+// test_submodule.csv — but that only confirmed the sim's self-consistent
+// 0.228 loop, not the real tyre. Superseded by the geometric 0.202 above.
+constexpr double kRpmToMs = 0.00727;
 
 // Stationary-calibration window. While collecting IMU samples the
 // filter does not publish — the autonomy stack tolerates brief
