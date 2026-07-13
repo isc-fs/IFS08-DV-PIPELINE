@@ -361,7 +361,7 @@ class ControlNode(BaseLifecycleNode):
         self.declare_parameter("kp_v", 0.5)
         self.declare_parameter("ki_v", 0.05)
         self.declare_parameter("deadband_v", 0.2)
-        self.declare_parameter("throttle_max", 0.6)
+        self.declare_parameter("throttle_max", 0.2)
         # Actuator slew limits (units = command-units per second). The
         # sim takes commands instantaneously; real actuators don't.
         # These rate-limit the published command at the boundary so
