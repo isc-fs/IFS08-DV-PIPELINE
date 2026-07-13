@@ -69,6 +69,14 @@ class ConeDetectionConfig:
     # Range cutoff (m): beyond this, drop as too sparse / unreliable.
     range_gate_max_m: float = 20.0
 
+    # Input range pre-crop (m): drop points beyond this horizontal radius
+    # BEFORE RANSAC + DBSCAN. Everything past range_gate_max_m is discarded
+    # downstream anyway (far_dropped), so cropping here is behavior-preserving
+    # (radius > range_gate_max_m + cone extent) and removes most of the ~174k
+    # ATX returns (far ground) before the O(n) clustering — the dominant cost.
+    # Set to 0 to disable.
+    input_range_crop_m: float = 25.0
+
     # Confidence margin (residual_other / residual_min) for template_dispatch
     # ambiguity. Ignored when ``res_other`` is not finite (e.g. two_param path).
     ambiguous_margin_ratio: float = 1.5
@@ -261,10 +269,19 @@ class RealtimeConeDetector:
     ) -> list[tuple[float, float, float, float]]:
         """Detect cones in a single LiDAR scan (same contract as ``final_cone_result_rt``)."""
         cfg = self.config
-        if debug_counters is not None:
-            debug_counters["n_input_points"] = len(data)
         if len(data) == 0:
             return []
+        # Range pre-crop: drop far points before the O(n) RANSAC + DBSCAN
+        # instead of clustering ~1000 far groups just to discard them by the
+        # range gate. Uses squared radius (no sqrt). Behavior-preserving for
+        # crop radius > range_gate_max_m + cone extent.
+        if cfg.input_range_crop_m > 0:
+            r2 = data[:, 0] ** 2 + data[:, 1] ** 2
+            data = data[r2 <= cfg.input_range_crop_m ** 2]
+            if len(data) == 0:
+                return []
+        if debug_counters is not None:
+            debug_counters["n_input_points"] = len(data)
         labels, clean_data, def_coefs = clustering_separation_rt(
             data,
             cfg,
