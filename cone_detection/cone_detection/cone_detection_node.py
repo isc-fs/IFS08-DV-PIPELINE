@@ -178,16 +178,35 @@ class ConeDetectionNode(BaseLifecycleNode):
     # ------------------------------------------------------------------
     @staticmethod
     def pointcloud2_to_xyz(msg: PointCloud2) -> np.ndarray:
-        """Decode PointCloud2 to ``(N, 3)`` float32.
+        """Decode PointCloud2 to ``(N, 3)`` float32 (x, y, z).
 
-        Uses ``point_step`` so any field layout works (xyz, xyz+padding, xyzi, …).
+        Reads x/y/z by their declared byte offsets over a ``point_step`` stride,
+        so ANY layout works regardless of whether ``point_step`` is a whole
+        number of float32s.
+
+        Do NOT reshape by ``point_step // 4``: the Hesai ATX driver publishes a
+        *packed* 26-byte point (x,y,z,intensity f32 + ring u16 + timestamp f64),
+        and 26 is not divisible by 4 — ``frombuffer(...).reshape(N, 26//4)`` then
+        raised ``ValueError`` on every scan, so the node silently emitted zero
+        cones (the sim's 16-byte cloud hid this). Offset slicing over a uint8
+        view handles packed-26, aligned-32, and the sim layouts alike.
         """
-        floats_per_point = msg.point_step // 4  # bytes per point / 4 per float32
         num_points = msg.width * msg.height
-        raw = np.frombuffer(msg.data, dtype=np.float32).reshape(
-            num_points, floats_per_point
+        raw = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            num_points, msg.point_step
         )
-        return np.ascontiguousarray(raw[:, :3])
+        off = {f.name: f.offset for f in msg.fields}
+        try:
+            ox, oy, oz = off["x"], off["y"], off["z"]
+        except KeyError as exc:  # pragma: no cover - malformed cloud
+            raise ValueError(
+                f"PointCloud2 missing x/y/z field: have {sorted(off)}"
+            ) from exc
+        # .copy() makes each 4-byte column contiguous so .view(float32) is valid.
+        x = raw[:, ox:ox + 4].copy().view(np.float32).reshape(num_points)
+        y = raw[:, oy:oy + 4].copy().view(np.float32).reshape(num_points)
+        z = raw[:, oz:oz + 4].copy().view(np.float32).reshape(num_points)
+        return np.ascontiguousarray(np.stack((x, y, z), axis=1))
 
     def listener_callback(self, msg: PointCloud2) -> None:
         # Defensive: should not fire if subscription was destroyed in
