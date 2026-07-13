@@ -146,26 +146,18 @@ def cascade_spike_triggered(
 
 # Motor-RPM → body-frame longitudinal velocity.
 #
-# 2026-05-10 re-derivation (issue #380, supersedes the 2026-04-28
-# value of 0.00898): bagged /odom (sim_supervisor's IMU+RPM filter
-# output) and /testing_only/odom over a 41 s motion window on
-# test_submodule.csv, paired samples within ±50 ms, observed
-# mean(|GT.vx|) / mean(|filter.vx|) = 0.9140 — implying the previous
-# 0.00898 produces a +9.4 % vx overestimate. The previous April
-# diagnostic compared raw RPM×const directly to GT; today's compares
-# filter-output to GT, which is the closed-loop quantity consumers
-# (including this node, via the velocity prior) actually see.
+# 2026-07-12 (Option B): WheelRadius corrected 0.228 → 0.202 m to match the
+# real IFS-08 tyre. Must stay in sync with odometry_filter's kRpmToMs — both
+# scale the same /motor_rpm, and a mismatch splits the odom and SLAM velocity
+# estimates. The sim generates rpm from ground speed with the same radius, so
+# /odom.vx = GT for any consistent radius (GT-neutral in sim); on the real car
+# (true rotor rpm) 0.202 is the correct geometry.
+#     RPM_TO_MS = (2π × 0.202 / 2.909) / 60 = 0.00727
 #
-# The new value 0.00898 × 0.9140 = 0.00821 recovers exactly the
-# pure-geometry doc-derived form from docs/dv_pipeline_rebuild.md
-# §3.5:
-#     RPM_TO_MS = (2π × WheelRadius / GearRatio) / 60
-#               = (2π × 0.228 / 2.909) / 60 = 0.00821
-#
-# Keeping the constant in sync with sim_supervisor's OdometryFilter
-# (single source of truth — both consumers depend on the same
-# value).
-RPM_TO_MS = 0.00821
+# History (issue #380): the prior 0.00821 (= 0.00898 × 0.9140, matching the
+# sim's self-consistent 0.228 geometry) was validated only against sim GT, not
+# the real tyre. Superseded by the geometric 0.202 above.
+RPM_TO_MS = 0.00727
 
 # Drop /motor_rpm samples this old (seconds). Sustained RPM staleness
 # means the bridge stopped publishing; fall back to no velocity prior
