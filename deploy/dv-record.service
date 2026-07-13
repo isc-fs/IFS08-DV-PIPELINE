@@ -1,0 +1,29 @@
+# dv-record.service — race telemetry rosbag recorder.
+# Pulled in automatically by dv-pipeline.service (WantedBy below + enable),
+# so every racing start (race boot, `dv race`, `dv restart`) records a bag.
+# PartOf= propagates stop/restart from the pipeline: `dv stop` also stops
+# the recorder, cleanly (SIGINT so rosbag2 finalizes metadata.yaml).
+# The script itself waits for pipeline warmup (/dv/status) before recording,
+# and honours /etc/dv/norecord as an opt-out.
+#
+# Versioned in IFS08-DV-PIPELINE/deploy/ — install with
+#   sudo ~/dv_ws/src/IFS08-DV-PIPELINE/deploy/install_dv_pipeline_service.sh
+
+[Unit]
+Description=ISC DV rosbag recorder (race telemetry)
+Documentation=https://github.com/isc-fs/IFS08-DV-PIPELINE
+After=dv-pipeline.service
+PartOf=dv-pipeline.service
+
+[Service]
+User=isc
+Environment=HOME=/home/isc
+ExecStart=/usr/local/bin/dv_record.sh
+# SIGINT (not SIGTERM) so ros2 bag record finalizes the bag metadata.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=dv-pipeline.service
