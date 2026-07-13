@@ -5,6 +5,10 @@
 # Installs (with timestamped backups into ~isc/.isc_backups/<ts>/):
 #   deploy/dv-pipeline.service → /etc/systemd/system/   (NOT enabled — started
 #                                by dv-mode at race boot, or manually: dv race)
+#   deploy/dv-record.service   → /etc/systemd/system/   (enabled: WantedBy=
+#                                dv-pipeline.service → records a bag on every
+#                                racing start, after pipeline warmup)
+#   deploy/dv_record.sh        → /usr/local/bin/        (warmup wait + record)
 #   deploy/dv                  → /usr/local/bin/dv      (targets dv-pipeline)
 #   deploy/dv_mode_boot.sh     → /usr/local/bin/        (race → dv-pipeline, verified)
 #   deploy/dv_detect_mode.sh   → /usr/local/bin/        (mode detect + override)
@@ -26,17 +30,21 @@ BK="/home/isc/.isc_backups/$TS"
 mkdir -p "$BK"
 
 for f in /etc/systemd/system/dv-pipeline.service \
+         /etc/systemd/system/dv-record.service \
          /usr/local/bin/dv \
          /usr/local/bin/dv_mode_boot.sh \
          /usr/local/bin/dv_detect_mode.sh \
+         /usr/local/bin/dv_record.sh \
          /etc/profile.d/zz-dv-mode-prompt.sh; do
   [ -f "$f" ] && cp -a "$f" "$BK/" && echo "backed up $f"
 done
 
 install -m 644 "$HERE/dv-pipeline.service" /etc/systemd/system/dv-pipeline.service
+install -m 644 "$HERE/dv-record.service"   /etc/systemd/system/dv-record.service
 install -m 755 "$HERE/dv"                  /usr/local/bin/dv
 install -m 755 "$HERE/dv_mode_boot.sh"     /usr/local/bin/dv_mode_boot.sh
 install -m 755 "$HERE/dv_detect_mode.sh"   /usr/local/bin/dv_detect_mode.sh
+install -m 755 "$HERE/dv_record.sh"        /usr/local/bin/dv_record.sh
 
 # Boot-mode override dir: isc-owned so `dv mode {race|umbilical|auto}` can
 # write /etc/dv/mode without sudo. dv_detect_mode.sh reads it (root) at boot.
@@ -60,6 +68,12 @@ if [ -f /etc/profile.d/zz-dv-mode-prompt.sh ]; then
 fi
 
 systemctl daemon-reload
+
+# Recorder rides along with the pipeline: enable creates the
+# dv-pipeline.service.wants/ symlink (WantedBy=dv-pipeline.service), so every
+# racing start also starts dv-record. dv-record itself stays un-started here —
+# updating ≠ running, same policy as dv-pipeline.
+systemctl enable dv-record.service >/dev/null 2>&1 || systemctl enable dv-record.service
 
 echo
 echo "Done. Race mode / 'dv race' now starts dv-pipeline.service"
