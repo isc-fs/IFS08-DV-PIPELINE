@@ -6,9 +6,10 @@
 #   deploy/dv-pipeline.service → /etc/systemd/system/   (NOT enabled — started
 #                                by dv-mode at race boot, or manually: dv race)
 #   deploy/dv-record.service   → /etc/systemd/system/   (enabled: WantedBy=
-#                                dv-pipeline.service → records a bag on every
-#                                racing start, after pipeline warmup)
-#   deploy/dv_record.sh        → /usr/local/bin/        (warmup wait + record)
+#                                dv-pipeline.service → records a sensor bag on
+#                                every racing start, after pipeline warmup)
+#   deploy/dv_record.sh        → /usr/local/bin/        (warmup wait + record
+#                                /lidar_points+/imu, best-effort QoS)
 #   deploy/dv                  → /usr/local/bin/dv      (targets dv-pipeline)
 #   deploy/dv_mode_boot.sh     → /usr/local/bin/        (race → dv-pipeline, verified)
 #   deploy/dv_detect_mode.sh   → /usr/local/bin/        (mode detect + override)
