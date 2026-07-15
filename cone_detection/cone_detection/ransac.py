@@ -123,11 +123,26 @@ def ransac2(
                 if k_new < k:
                     k = k_new
 
+    points_ind = np.empty(m, dtype=np.int64)
     while iters < k and iters < max_iter:
         # Sample m anchors from the FULL cloud — the iteration subsample
         # is only used to score consensus cheaply, not to constrain
-        # which points can define a candidate plane.
-        points_ind = np.random.choice(data_size, m, replace=False)
+        # which points can define a candidate plane. Rejection-sampled
+        # randints, NOT np.random.choice(..., replace=False): numba
+        # implements the latter as a full O(n) permutation per call, which
+        # dominated the whole fit on low-inlier-ratio (tire-wall) scans
+        # where the iteration budget pins at max_iter (~400 ms -> ~4 ms).
+        for jj in range(m):
+            while True:
+                cand = np.random.randint(0, data_size)
+                dup = False
+                for kk in range(jj):
+                    if points_ind[kk] == cand:
+                        dup = True
+                        break
+                if not dup:
+                    points_ind[jj] = cand
+                    break
         points = A[points_ind]
         # Build the candidate plane via cross product (numba doesn't
         # JIT np.linalg.svd cleanly).

@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>pipeline_watchdog</name>
+  <version>0.0.1</version>
+  <description>
+    pipeline_watchdog_node — independent supervisor for the autonomy stack.
+
+    The uDV watchdogs /dv/status for DVPC liveness, which covers the pipeline
+    being DEAD. This node covers the pipeline being ALIVE BUT SICK: it arms off
+    /dv/status == DV_RUNNING and supervises the data liveness of the topics
+    whose staleness leaves the car still driving on stale state (/slam/pose,
+    /odom, /ctrl/cmd_internal). On a trip it latches /watchdog/emergency, which
+    mission_control turns into /force_ebs + DV_EMERGENCY so the uDV drives the
+    AS state machine to AS Emergency.
+
+    Deliberately NOT a lifecycle node and NOT in AUTONOMY_NODE_ORDER — it must
+    keep supervising when the stack it supervises is broken.
+
+    See docs/WATCHDOG.md.
+  </description>
+  <maintainer email="agonzaleztabernero@gmail.com">Alvaro Gonzalez</maintainer>
+  <license>GPL-3.0-or-later</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>fs_msgs</depend>
+  <!-- Imports mission_control.interface_contract for DV_RUNNING +
+       TOPIC_DV_STATUS, so the watchdog's notion of "running" can never
+       drift from the reconciler's own. -->
+  <depend>mission_control</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

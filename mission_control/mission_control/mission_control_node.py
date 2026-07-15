@@ -74,7 +74,9 @@ from mission_control.interface_contract import (
     TOPIC_CTRL_CMD,
     TOPIC_DV_STATUS,
     TOPIC_SLAM_STOP_REQUEST,
+    TOPIC_WATCHDOG_EMERGENCY,
     ami_index_to_mission_id,
+    is_known_ami_index,
 )
 from mission_control.interface_qos import UPLINK_QOS
 from mission_control.reconcile import (
@@ -254,6 +256,7 @@ class MissionControlNode(LifecycleNode):
         self._sub_ami = None
         self._sub_ctrl_cmd = None
         self._sub_ctrl_emergency = None
+        self._sub_watchdog_emergency = None
         self._sub_slam_finished = None
         self._sub_slam_stop_request = None
         self._sub_mode_manager_progress = None
@@ -352,6 +355,14 @@ class MissionControlNode(LifecycleNode):
         self._sub_ctrl_emergency = self.create_subscription(
             Bool, "/ctrl/emergency", self._on_ctrl_emergency, _LATCHED_QOS,
             callback_group=self._cb_group)
+        # Independent supervisor's emergency channel (pipeline_watchdog).
+        # Separate topic from /ctrl/emergency on purpose: control raising an
+        # emergency and the watchdog catching control being stale are
+        # different faults, and a bag must say which one fired. Both land on
+        # the same handler — the response (EBS + DV_EMERGENCY) is identical.
+        self._sub_watchdog_emergency = self.create_subscription(
+            Bool, TOPIC_WATCHDOG_EMERGENCY, self._on_watchdog_emergency,
+            _LATCHED_QOS, callback_group=self._cb_group)
         self._sub_slam_finished = self.create_subscription(
             Bool, "/slam/finished", self._on_slam_finished, _LATCHED_QOS,
             callback_group=self._cb_group)
@@ -387,12 +398,15 @@ class MissionControlNode(LifecycleNode):
             self.destroy_timer(self._reconcile_timer)
             self._reconcile_timer = None
         for sub in (self._sub_assi, self._sub_ami, self._sub_ctrl_cmd,
-                    self._sub_ctrl_emergency, self._sub_slam_finished,
+                    self._sub_ctrl_emergency, self._sub_watchdog_emergency,
+                    self._sub_slam_finished, self._sub_slam_stop_request,
                     self._sub_mode_manager_progress):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_assi = self._sub_ami = self._sub_ctrl_cmd = None
         self._sub_ctrl_emergency = self._sub_slam_finished = None
+        self._sub_watchdog_emergency = None
+        self._sub_slam_stop_request = None
         self._sub_mode_manager_progress = None
         self._dv_status_pub = None
         self._dv_status_msg_pub = None
@@ -419,6 +433,18 @@ class MissionControlNode(LifecycleNode):
         self._as_state_stamp = time.monotonic()
 
     def _on_ami_mission(self, msg: Int32) -> None:
+        # An index the table has never heard of maps to 0 like any other
+        # non-pipeline selection, so it is safe — but silently identical to
+        # "operator picked Manual", which makes it undiagnosable. Firmware-side
+        # it surfaces as a refused GO (uDV#178), i.e. a car that won't launch
+        # for no stated reason. Say so loudly instead. Autonomous Demo is the
+        # live example: it has no assigned AMI index at all.
+        if not is_known_ami_index(int(msg.data)):
+            self.get_logger().warn(
+                f"/ami/mission index {msg.data} is NOT in the AMI table — "
+                f"treating as no-mission (stack stays torn down). If the AMI "
+                f"board really emits this, the table needs an entry: see "
+                f"isc-fs/IFS08-DV-uDV#178.")
         mission_id = ami_index_to_mission_id(int(msg.data))
         if mission_id != self._desired_mission_id:
             self.get_logger().info(
@@ -456,10 +482,26 @@ class MissionControlNode(LifecycleNode):
         # a control-raised emergency there must NOT trip EBS mid-manual-lap.
         # (control never asserts this today; the gate future-proofs it.) The
         # AS-Emergency path in _tick is independent and always honoured.
+        self._raise_emergency(msg, "/ctrl/emergency")
+
+    def _on_watchdog_emergency(self, msg: Bool) -> None:
+        # pipeline_watchdog arms itself off /dv/status == DV_RUNNING, so the
+        # RUNNING gate below is belt-and-braces: two independent reasons a
+        # watchdog trip can never fire the EBS during the free-run floor,
+        # where the human is driving and a stale autonomy stack is expected.
+        self._raise_emergency(msg, TOPIC_WATCHDOG_EMERGENCY)
+
+    def _raise_emergency(self, msg: Bool, source: str) -> None:
+        """Rising-edge emergency from an in-pipeline source.
+
+        The response is identical whichever channel raised it — request EBS,
+        stop relaying, report DV_EMERGENCY. `source` only names the culprit in
+        the log, so the bag says which fault actually fired.
+        """
         if (msg.data and not self._emergency
                 and self._active_level is ActiveLevel.RUNNING):
             self.get_logger().warn(
-                "/ctrl/emergency rising — requesting EBS, stopping command relay")
+                f"{source} rising — requesting EBS, stopping command relay")
             self._emergency = True
             self._request_ebs()
             self._publish_dv_status(DV_EMERGENCY)

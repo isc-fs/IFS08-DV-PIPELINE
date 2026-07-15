@@ -12,7 +12,11 @@ case "${1:-status}" in
   race)    sudo -n systemctl start   dv-pipeline.service && echo "[dv] racing operation started"   ; _mark ;;
   stop)    sudo -n systemctl stop    dv-pipeline.service && echo "[dv] racing operation stopped"   ; _mark ;;
   restart) sudo -n systemctl restart dv-pipeline.service && echo "[dv] racing operation restarted" ;;
-  update)  /home/isc/dv_pipeline_update.sh ;;
+  # After a successful update, re-bake the Numba JIT cache: the update
+  # rewrites sources, which is exactly what invalidates it. Baking now (on
+  # the bench) keeps race-mode bring-up on the warm path (~1 s/node) instead
+  # of a ~1-2 min cold JIT. Best-effort — the warm script always exits 0.
+  update)  /home/isc/dv_pipeline_update.sh && /usr/local/bin/dv_warm_numba.sh ;;
   mode)
     # No arg: report the mode picked at boot. Arg: set/clear the boot-mode
     # override read by dv_detect_mode.sh (effective next boot; /etc/dv is

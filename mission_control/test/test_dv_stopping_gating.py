@@ -162,3 +162,38 @@ def test_finished_is_only_ever_raised_by_slam(node):
     for _ in range(50):                    # a long stop, many ticks
         assert n._current_dv_status() == DV_STOPPING, \
             "mission_control invented FINISHED without /slam/finished"
+
+
+# --------------------------------------------- lifecycle hygiene (regression)
+
+def test_every_subscription_created_is_also_torn_down():
+    """Mechanical invariant: any `self._sub_*` assigned a create_subscription()
+    must appear in on_cleanup's teardown tuple.
+
+    This exists because _sub_slam_stop_request was created but never destroyed
+    — an edit that was supposed to add it to the tuple silently matched
+    nothing, and nothing caught it: colcon builds fine, and no test reached
+    cleanup. A leaked subscription survives cleanup→configure and then
+    double-delivers to its callback.
+
+    Source-level rather than behavioural on purpose: driving a real lifecycle
+    cycle would test one path, whereas this cannot be fooled by a handle that
+    someone forgets to add to the tuple in future.
+    """
+    import re
+    import mission_control.mission_control_node as mod
+
+    src = open(mod.__file__.replace(".pyc", ".py")).read()
+
+    created = set(re.findall(r"(self\._sub_\w+)\s*=\s*self\.create_subscription",
+                             src))
+    assert created, "no subscriptions found — did the file layout change?"
+
+    cleanup = src[src.index("def on_cleanup"):]
+    cleanup = cleanup[:cleanup.index("return TransitionCallbackReturn")]
+
+    missing = sorted(h for h in created if h not in cleanup)
+    assert not missing, (
+        f"subscription handles created but never torn down in on_cleanup: "
+        f"{missing}. A leaked subscription survives cleanup→configure and "
+        f"double-delivers to its callback.")
