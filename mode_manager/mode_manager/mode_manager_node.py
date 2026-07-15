@@ -240,6 +240,10 @@ class ModeManagerNode(LifecycleNode):
         """
         mission = request.mission
         do_activate = bool(request.activate)
+        # Nodes to clean-cycle (deactivate->activate) on this activate so they
+        # re-run on_activate fresh. Empty for every legacy caller. Ignored on
+        # teardown ("" tears everything down regardless).
+        reset = set(request.reset_nodes)
 
         if mission == "":
             self.get_logger().info("activate_mode: tearing down autonomy")
@@ -268,7 +272,7 @@ class ModeManagerNode(LifecycleNode):
         if not do_activate:
             return self._prepare_mode(mission, response)
 
-        return self._activate_prepared_mode(mission, response)
+        return self._activate_prepared_mode(mission, response, reset)
 
     def _prepare_mode(
         self, mission: str, response: ActivateMode.Response,
@@ -337,14 +341,22 @@ class ModeManagerNode(LifecycleNode):
 
     def _activate_prepared_mode(
         self, mission: str, response: ActivateMode.Response,
+        reset: set[str],
     ) -> ActivateMode.Response:
-        """Activate nodes configured during prepare (RuntimeControl open)."""
-        self.get_logger().info(f"activate_mode: activating mission={mission!r}")
+        """Activate nodes configured during prepare (RuntimeControl open).
 
-        if self._active_mode == mission:
-            response.ok = True
-            response.message = f"Mode {mission!r} already active"
-            return response
+        `reset` names nodes to clean-cycle first: each is DEACTIVATEd before
+        the activate fan-out re-activates it, so it re-runs on_activate with
+        fresh per-run state while every other node is left as-is (already-
+        active nodes are idempotently skipped). The free-run go hand-off uses
+        reset={control_node} so control — which ran through the OFF/manual
+        floor logging its would-be commands — starts the real run clean, with
+        no SLAM reset or Numba re-JIT of the perception stack.
+        """
+        self.get_logger().info(
+            f"activate_mode: activating mission={mission!r}"
+            + (f" (reset={sorted(reset)})" if reset else "")
+        )
 
         if self._prepared_mode != mission:
             response.ok = False
@@ -355,6 +367,34 @@ class ModeManagerNode(LifecycleNode):
             )
             self.get_logger().error(response.message)
             return response
+
+        # A reset request always fans out (the clean-cycle must run even when
+        # the mode is already fully active); without one, an already-active
+        # mode is a no-op.
+        if self._active_mode == mission and not reset:
+            response.ok = True
+            response.message = f"Mode {mission!r} already active"
+            return response
+
+        # Clean-cycle the reset nodes: DEACTIVATE first (idempotently skipped
+        # if already inactive), so the ACTIVATE fan-out below re-runs their
+        # on_activate fresh.
+        if reset:
+            reset_nodes = tuple(
+                (name, managed)
+                for name, managed in AUTONOMY_LIFECYCLE_NODES
+                if name in reset
+            )
+            ok, msg = self._fan_out(
+                reset_nodes,
+                (Transition.TRANSITION_DEACTIVATE,),
+                "reset",
+                mission=None,
+            )
+            if not ok:
+                response.ok = False
+                response.message = msg
+                return response
 
         ok, msg = self._fan_out(
             AUTONOMY_LIFECYCLE_NODES,

@@ -34,6 +34,12 @@ AUTONOMY_NODE_ORDER: tuple[str, ...] = (
     "control_node",
 )
 
+# The control node. In the free-run floor it runs (logging its would-be
+# commands) but the pipeline never relays them; on the go hand-off it is
+# clean-cycled for the run. Named here so callers pass it to ActivateMode's
+# reset_nodes without hard-coding the string.
+CONTROL_NODE_NAME: str = "control_node"
+
 
 def _node(node_name: str, behavior: str) -> NodeModeConfig:
     return NodeModeConfig(node_name=node_name, behavior=behavior)

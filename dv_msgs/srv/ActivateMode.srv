@@ -14,11 +14,21 @@
 # Mission values:
 #   "trackdrive" | "autocross" | "accel" | "skidpad"
 #
+# reset_nodes holds autonomy node names to CLEAN-CYCLE on an activate
+# (deactivate -> activate) so they re-run on_activate with fresh per-run
+# state, while every other node is left untouched (already-active nodes are
+# idempotently skipped). Empty for the normal path. Used by the free-run
+# floor's go hand-off: control_node runs through the OFF/manual floor to log
+# its would-be commands, then reset_nodes=[control_node] gives it a clean
+# reset exactly at the Ready->Driving edge so the real run doesn't inherit
+# the manual-lap state. Ignored for teardown (empty mission tears down all).
+#
 # Response field is `ok` (not `success`).
 
 # ---------------- Request ----------------
 string mission
 bool activate
+string[] reset_nodes
 
 ---
 # ---------------- Response ----------------

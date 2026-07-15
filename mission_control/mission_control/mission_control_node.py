@@ -37,6 +37,7 @@ that replaces the old action goal's implicit connection.
 from __future__ import annotations
 
 import time
+from datetime import datetime
 
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -51,14 +52,20 @@ from std_msgs.msg import Bool, Int32, String, UInt8
 from std_srvs.srv import SetBool
 
 from dv_msgs.msg import LifecycleProgress
-from dv_msgs.srv import ActivateMode
+from dv_msgs.srv import ActivateMode, StartBag, StopBag
 
 from mission_control.interface_contract import (
+    AS_DRIVING,
     AS_OFF,
+    AS_READY,
     DV_EMERGENCY,
     DV_FAILED,
     DV_FINISHED,
+    DV_IDLE,
     DV_PREPARING,
+    DV_READY,
+    DV_RUNNING,
+    FREE_RUN_MISSION_ID,
     HEARTBEAT_STALE_S,
     SERVICE_FORCE_EBS,
     TOPIC_AMI_MISSION,
@@ -69,16 +76,18 @@ from mission_control.interface_contract import (
 )
 from mission_control.interface_qos import UPLINK_QOS
 from mission_control.reconcile import (
+    ActiveLevel,
     EbsAction,
     ReconcileAction,
+    effective_mission_id,
+    is_runnable_mission,
     next_action,
     next_ebs_action,
     should_request_ebs,
-    steady_dv_status,
     target_for,
 )
 
-from mode_manager.mode_registry import MISSION_ID_TO_NAME
+from mode_manager.mode_registry import CONTROL_NODE_NAME, MISSION_ID_TO_NAME
 from mode_manager.mode_manager_node import TRANSITION_SETUP
 
 
@@ -203,6 +212,14 @@ class MissionControlNode(LifecycleNode):
     def __init__(self) -> None:
         super().__init__(self.NODE_NAME)
 
+        # Free-run flag (default off). When true, the reconciler brings the
+        # autonomy floor (everything but control_node) up and records a rosbag
+        # whenever the uDV heartbeat is alive, regardless of AS state — for
+        # data collection during manual/OFF driving. Read in on_configure so a
+        # launch `free_run:=true` override is applied. See interface_contract.
+        self.declare_parameter("free_run", False)
+        self._free_run: bool = False
+
         self._mission_id_to_name: dict[int, str] = dict(MISSION_ID_TO_NAME)
 
         # Reentrant group: the reconcile timer issues async activate_mode
@@ -212,6 +229,8 @@ class MissionControlNode(LifecycleNode):
         # --- ROS handles (created in on_configure) ---
         self._activate_mode_client = None
         self._force_ebs_client = None
+        self._bag_start_client = None
+        self._bag_stop_client = None
         self._dv_status_pub = None
         self._dv_status_msg_pub = None
         self._ctrl_cmd_pub = None
@@ -232,7 +251,10 @@ class MissionControlNode(LifecycleNode):
 
         # --- pipeline lifecycle state ---
         self._prepared_mission_id: int = 0  # 0 = nothing configured
-        self._activated: bool = False
+        # Activation level: NONE / FLOOR (free-run data-collection floor —
+        # whole stack up, control logging only) / RUNNING (live run — control
+        # reset for the run, /ctrl/cmd relayed). Replaces the old activated bool.
+        self._active_level: ActiveLevel = ActiveLevel.NONE
         self._busy: bool = False            # an activate_mode call in flight
         self._pending_action: ReconcileAction | None = None
         self._tick_no: int = 0              # throttles /dv/status to 10 Hz
@@ -247,6 +269,10 @@ class MissionControlNode(LifecycleNode):
         # --- control relay cache ---
         self._latest_ctrl_cmd: ControlCommand = ControlCommand()
 
+        # --- rosbag (free-run auto-recording) ---
+        self._bag_active: bool = False   # a recording is running / being started
+        self._bag_future = None          # in-flight StartBag call, if any
+
         # --- web-spinner progress ---
         self._latest_progress: LifecycleProgress | None = None
 
@@ -254,14 +280,23 @@ class MissionControlNode(LifecycleNode):
     # Lifecycle transitions
     # ------------------------------------------------------------------
     def on_configure(self, state: State) -> TransitionCallbackReturn:
+        self._free_run = bool(self.get_parameter("free_run").value)
         self.get_logger().info(
-            "on_configure: creating reconciler I/O + activate_mode client")
+            "on_configure: creating reconciler I/O + activate_mode client "
+            f"(free_run={self._free_run})")
 
         self._activate_mode_client = self.create_client(
             ActivateMode, "/activate_mode", callback_group=self._cb_group)
         # mission_control CALLS the uDV's /force_ebs on emergency.
         self._force_ebs_client = self.create_client(
             SetBool, SERVICE_FORCE_EBS, callback_group=self._cb_group)
+        # Free-run rosbag auto-recording: mission_control drives the always-on
+        # bag_recorder_node (start/stop over these clients). Created regardless
+        # of the flag (cheap, idle when free_run is off).
+        self._bag_start_client = self.create_client(
+            StartBag, "/bag_recorder/start", callback_group=self._cb_group)
+        self._bag_stop_client = self.create_client(
+            StopBag, "/bag_recorder/stop", callback_group=self._cb_group)
 
         # Downlink to the uDV/emulator.
         self._dv_status_pub = self.create_lifecycle_publisher(
@@ -319,6 +354,9 @@ class MissionControlNode(LifecycleNode):
 
     def on_cleanup(self, state: State) -> TransitionCallbackReturn:
         self.get_logger().info("on_cleanup: tearing down I/O")
+        # Finalise any free-run recording so the bag isn't left truncated.
+        if self._bag_active:
+            self._stop_bag()
         if self._reconcile_timer is not None:
             self.destroy_timer(self._reconcile_timer)
             self._reconcile_timer = None
@@ -335,6 +373,9 @@ class MissionControlNode(LifecycleNode):
         self._ctrl_cmd_pub = None
         self._activate_mode_client = None
         self._force_ebs_client = None
+        self._bag_start_client = None
+        self._bag_stop_client = None
+        self._bag_future = None
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state: State) -> TransitionCallbackReturn:
@@ -372,16 +413,25 @@ class MissionControlNode(LifecycleNode):
 
         Event-driven: emit on every /ctrl/cmd_internal arrival so the
         relay tracks control_node's tick rate with no added phase — the
-        hot path in tight corners. The actuate gate is `_activated`; the
-        uDV applies the command only while it is itself in AS Driving, so
-        actuation is gated on both ends.
+        hot path in tight corners. The actuate gate is ActiveLevel.RUNNING
+        (a live run) — on the free-run FLOOR control runs and publishes
+        /ctrl/cmd_internal (recorded for pilot-vs-autonomy comparison) but
+        the level is FLOOR, so nothing is relayed; and the uDV applies the
+        command only while in AS Driving, so actuation is gated on both ends.
         """
         self._latest_ctrl_cmd = msg
-        if self._activated and not (self._emergency or self._finished):
+        if (self._active_level is ActiveLevel.RUNNING
+                and not (self._emergency or self._finished)):
             self._publish_ctrl_cmd()
 
     def _on_ctrl_emergency(self, msg: Bool) -> None:
-        if msg.data and not self._emergency:
+        # Only honour control's emergency channel during a live run. On the
+        # free-run FLOOR control is active (logging) while the human drives —
+        # a control-raised emergency there must NOT trip EBS mid-manual-lap.
+        # (control never asserts this today; the gate future-proofs it.) The
+        # AS-Emergency path in _tick is independent and always honoured.
+        if (msg.data and not self._emergency
+                and self._active_level is ActiveLevel.RUNNING):
             self.get_logger().warn(
                 "/ctrl/emergency rising — requesting EBS, stopping command relay")
             self._emergency = True
@@ -389,7 +439,11 @@ class MissionControlNode(LifecycleNode):
             self._publish_dv_status(DV_EMERGENCY)
 
     def _on_slam_finished(self, msg: Bool) -> None:
-        if msg.data and not self._finished:
+        # Only a live run (ActiveLevel.RUNNING) can "finish". While the
+        # free-run FLOOR is mapping, a slam lap-complete must NOT latch
+        # FINISHED — the floor is data collection, not a mission.
+        if (msg.data and not self._finished
+                and self._active_level is ActiveLevel.RUNNING):
             self.get_logger().info(
                 "/slam/finished rising — mission complete, stopping command relay")
             self._finished = True
@@ -419,8 +473,27 @@ class MissionControlNode(LifecycleNode):
         if not self._busy:
             self._reconcile(as_state)
 
+        # Free-run rosbag: record for the whole session the uDV is powered
+        # (heartbeat alive), across OFF / manual / armed alike. Gated ONLY on
+        # the flag + heartbeat, never on the AS state, so a manual lap is
+        # captured. Stops when the flag is off or the uDV goes away.
+        self._update_bag_recording(
+            free_run_active=self._free_run and self._heartbeat_alive())
+
         if self._tick_no % _DV_STATUS_EVERY_N == 0:
             self._publish_dv_status(self._current_dv_status())
+
+    def _heartbeat_alive(self) -> bool:
+        """True while the uDV's /assi/state heartbeat is present and fresh.
+
+        This is the "the uDV is powered on" signal the free-run floor gates
+        on — distinct from `_effective_as_state`, which folds a stale/absent
+        heartbeat into AS_OFF. A dead/absent heartbeat is NOT free-run-active:
+        we never run autonomy (or record) against a uDV that isn't there.
+        """
+        if self._as_state is None:
+            return False
+        return (time.monotonic() - self._as_state_stamp) <= _ASSI_STALE_S
 
     def _effective_as_state(self) -> int:
         """Latest AS state, or AS_OFF if the heartbeat is stale/absent."""
@@ -431,15 +504,29 @@ class MissionControlNode(LifecycleNode):
         return self._as_state
 
     def _reconcile(self, as_state: int) -> None:
+        # Free-run floor is active only while the flag is set AND the uDV is
+        # actually present (heartbeat fresh) — never against a dead uDV.
+        free_run = self._free_run and self._heartbeat_alive()
         desired = self._desired_mission_id
-        target = target_for(as_state, desired)
+        target = target_for(as_state, desired, free_run=free_run)
+        # Mission to prepare/run: operator selection when runnable, else the
+        # free-run fallback (autocross). This is what makes the hand-off warm —
+        # the floor already prepared what the driver will arm with.
+        eff = effective_mission_id(
+            desired, free_run=free_run, free_run_mission_id=FREE_RUN_MISSION_ID)
         action = next_action(
-            target, desired, self._prepared_mission_id, self._activated)
+            target, eff, self._prepared_mission_id, self._active_level)
 
-        # Clear sticky terminal flags once we are genuinely torn down so a
-        # fresh run can report clean status again.
-        if (action is ReconcileAction.NONE
-                and not self._activated and self._prepared_mission_id == 0):
+        # Clear sticky terminal flags once we are genuinely torn down and no
+        # emergency is still being asserted, so a fresh cycle reports clean
+        # status again. Deliberately NOT gated on `action is NONE`: under
+        # free-run the floor makes the torn-down action PREPARE (re-raising the
+        # floor), so an action==NONE gate would leave a past emergency/finished
+        # latched forever. `not should_request_ebs` keeps EBS asserted while
+        # the uDV is still in AS Emergency.
+        if (self._active_level is ActiveLevel.NONE
+                and self._prepared_mission_id == 0
+                and not should_request_ebs(as_state)):
             self._failed = self._finished = False
             self._emergency = False
             self._ebs_requested = False
@@ -449,13 +536,24 @@ class MissionControlNode(LifecycleNode):
             return
         if action is ReconcileAction.PREPARE:
             self._call_activate_mode(
-                self._mission_id_to_name.get(desired, ""), activate=False,
-                action=action, target_mission_id=desired)
-        elif action is ReconcileAction.ACTIVATE:
+                self._mission_id_to_name.get(eff, ""), activate=False,
+                action=action, target_mission_id=eff)
+        elif action in (ReconcileAction.ACTIVATE,
+                        ReconcileAction.ACTIVATE_FLOOR):
+            # Bring the whole stack up. Same call for both — the resulting
+            # ActiveLevel (RUNNING vs FLOOR) is what gates the /ctrl/cmd relay.
             self._call_activate_mode(
                 self._mission_id_to_name.get(self._prepared_mission_id, ""),
                 activate=True, action=action,
                 target_mission_id=self._prepared_mission_id)
+        elif action is ReconcileAction.RESET_CONTROL:
+            # Go hand-off: clean-cycle control_node for the run (fresh state);
+            # perception/SLAM stay warm.
+            self._call_activate_mode(
+                self._mission_id_to_name.get(self._prepared_mission_id, ""),
+                activate=True, action=action,
+                target_mission_id=self._prepared_mission_id,
+                reset_nodes=[CONTROL_NODE_NAME])
         elif action is ReconcileAction.TEARDOWN:
             self._call_activate_mode(
                 "", activate=False, action=action, target_mission_id=0)
@@ -463,6 +561,7 @@ class MissionControlNode(LifecycleNode):
     def _call_activate_mode(
         self, mission: str, *, activate: bool,
         action: ReconcileAction, target_mission_id: int,
+        reset_nodes: list[str] | None = None,
     ) -> None:
         if self._activate_mode_client is None:
             return
@@ -474,12 +573,15 @@ class MissionControlNode(LifecycleNode):
         if action is ReconcileAction.PREPARE:
             self._failed = False
             self._publish_dv_status(DV_PREPARING)
+        reset = list(reset_nodes or [])
         self.get_logger().info(
-            f"activate_mode(mission={mission!r}, activate={activate}) "
-            f"[{action.value}]")
+            f"activate_mode(mission={mission!r}, activate={activate}"
+            + (f", reset={reset}" if reset else "")
+            + f") [{action.value}]")
         req = ActivateMode.Request()
         req.mission = mission
         req.activate = activate
+        req.reset_nodes = reset
         future = self._activate_mode_client.call_async(req)
         future.add_done_callback(
             lambda f: self._on_activate_mode_done(f, action, target_mission_id))
@@ -507,27 +609,61 @@ class MissionControlNode(LifecycleNode):
 
         if action is ReconcileAction.PREPARE:
             self._prepared_mission_id = target_mission_id
-            self._activated = False
-        elif action is ReconcileAction.ACTIVATE:
-            self._activated = True
+            self._active_level = ActiveLevel.NONE
+        elif action is ReconcileAction.ACTIVATE_FLOOR:
+            self._active_level = ActiveLevel.FLOOR
+        elif action in (ReconcileAction.ACTIVATE,
+                        ReconcileAction.RESET_CONTROL):
+            self._active_level = ActiveLevel.RUNNING
         elif action is ReconcileAction.TEARDOWN:
             self._prepared_mission_id = 0
-            self._activated = False
+            self._active_level = ActiveLevel.NONE
         self._failed = False
 
     # ==================================================================
     # /dv/status + /ctrl/cmd + EBS
     # ==================================================================
     def _current_dv_status(self) -> int:
+        """The /dv/status byte the uDV consumes for its go-gate + handshake.
+
+        Deliberately keyed off the REAL AS state, NOT the internal active
+        level, so the free-run floor is invisible here: while OFF / manual
+        the byte stays DV_IDLE (the floor may be actively mapping + recording,
+        but the uDV is not in the go-gate and must never see "ready"). Only
+        once the driver actually arms does this advertise readiness for the
+        operator-SELECTED mission — identical to the non-free-run handshake,
+        so free-run can never perturb arm → Ready → Driving.
+        """
         if self._emergency:
             return DV_EMERGENCY
         if self._finished:
             return DV_FINISHED
         if self._failed:
             return DV_FAILED
+
+        real_as = self._effective_as_state()
+        # Not armed (OFF / manual / stale) → idle handshake regardless of the
+        # free-run floor. Also covers standalone missions (Inspection / EBS
+        # map to a non-runnable id): the pipeline stays out of them, exactly
+        # as when free_run is off.
+        if real_as not in (AS_READY, AS_DRIVING):
+            return DV_IDLE
+        if not is_runnable_mission(self._desired_mission_id):
+            return DV_IDLE
         if self._busy and self._pending_action is ReconcileAction.PREPARE:
             return DV_PREPARING
-        return steady_dv_status(self._prepared_mission_id, self._activated)
+        # Legacy steady mapping, keyed to the DESIRED (operator-selected)
+        # mission so the floor's autocross fallback never advertises readiness
+        # for a mission the driver didn't pick. Byte-for-byte identical to the
+        # pre-free-run handshake for a normal armed run: READY once prepared
+        # (on the floor control is up but not reset-for-the-run, so this stays
+        # READY, not RUNNING), RUNNING once control has been clean-reset for
+        # the run (the firmware holds the launch brakes until it sees RUNNING).
+        if self._prepared_mission_id != self._desired_mission_id:
+            return DV_IDLE
+        if self._active_level is ActiveLevel.RUNNING:
+            return DV_RUNNING
+        return DV_READY
 
     def _publish_dv_status(self, status: int) -> None:
         if self._dv_status_pub is not None:
@@ -602,6 +738,70 @@ class MissionControlNode(LifecycleNode):
                 "will retry")
         # Clear the in-flight handle so the next tick can retry if unacked.
         self._ebs_future = None
+
+    # ==================================================================
+    # free-run rosbag auto-recording
+    # ==================================================================
+    def _update_bag_recording(self, *, free_run_active: bool) -> None:
+        """Start / stop the free-run rosbag to match `free_run_active`.
+
+        Called every tick. Start is retried idempotently until the recorder
+        acks, so a bag_recorder_node that isn't up yet at container start
+        doesn't cost the session its recording.
+        """
+        if free_run_active and not self._bag_active:
+            self._start_bag()
+        elif not free_run_active and self._bag_active:
+            self._stop_bag()
+
+    def _compose_bag_name(self) -> str:
+        return f"freerun_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    def _start_bag(self) -> None:
+        if self._bag_start_client is None:
+            return
+        if self._bag_future is not None and not self._bag_future.done():
+            return  # a StartBag is already in flight
+        if not self._bag_start_client.service_is_ready():
+            self.get_logger().warn(
+                "free-run: /bag_recorder/start not up yet — will retry",
+                throttle_duration_sec=5.0)
+            return
+        req = StartBag.Request()
+        req.bag_name = self._compose_bag_name()
+        # Optimistic latch so we don't fire a duplicate start next tick; a
+        # failure ack clears it (see _on_bag_start_done) and the tick retries.
+        self._bag_active = True
+        self.get_logger().info(f"free-run: starting rosbag {req.bag_name!r}")
+        self._bag_future = self._bag_start_client.call_async(req)
+        self._bag_future.add_done_callback(self._on_bag_start_done)
+
+    def _on_bag_start_done(self, future) -> None:
+        try:
+            resp = future.result()
+        except Exception as ex:  # noqa: BLE001
+            self.get_logger().error(
+                f"free-run: StartBag raised: {ex!r} — will retry")
+            resp = None
+        if resp is not None and resp.ok:
+            self.get_logger().info(
+                f"free-run: rosbag recording → {resp.bag_path}")
+        else:
+            err = resp.error if resp is not None else "no response"
+            self.get_logger().error(
+                f"free-run: rosbag start failed ({err}) — will retry")
+            self._bag_active = False   # let the next tick retry
+        self._bag_future = None
+
+    def _stop_bag(self) -> None:
+        """Finalise the recording. Fire-and-forget — the recorder's StopBag
+        is idempotent, so a dropped call just leaves the bag to be closed on
+        recorder shutdown."""
+        self._bag_active = False
+        if self._bag_stop_client is None or not self._bag_stop_client.service_is_ready():
+            return
+        self.get_logger().info("free-run: stopping rosbag")
+        self._bag_stop_client.call_async(StopBag.Request())
 
 
 def main(args=None) -> None:

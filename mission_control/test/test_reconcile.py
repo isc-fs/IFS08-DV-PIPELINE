@@ -22,10 +22,13 @@ from mission_control.interface_contract import (  # noqa: E402
     DV_READY,
     DV_RUNNING,
 )
+from mission_control.interface_contract import FREE_RUN_MISSION_ID  # noqa: E402
 from mission_control.reconcile import (  # noqa: E402
+    ActiveLevel,
     EbsAction,
     ReconcileAction,
     Target,
+    effective_mission_id,
     is_runnable_mission,
     next_action,
     next_ebs_action,
@@ -36,6 +39,7 @@ from mission_control.reconcile import (  # noqa: E402
 
 
 TRACK = 1   # a runnable registry mission_id
+AUTOX = 2   # another runnable registry mission_id (== FREE_RUN_MISSION_ID)
 
 
 # --------------------------------------------------------------------
@@ -66,15 +70,18 @@ def test_non_runnable_mission_collapses_to_down_even_when_driving():
 # --------------------------------------------------------------------
 
 def test_down_from_idle_is_noop():
-    assert next_action(Target.DOWN, 0, 0, False) is ReconcileAction.NONE
+    assert next_action(Target.DOWN, 0, 0, ActiveLevel.NONE) is \
+        ReconcileAction.NONE
 
 
 def test_down_while_prepared_tears_down():
-    assert next_action(Target.DOWN, 0, TRACK, False) is ReconcileAction.TEARDOWN
+    assert next_action(Target.DOWN, 0, TRACK, ActiveLevel.NONE) is \
+        ReconcileAction.TEARDOWN
 
 
 def test_down_while_active_tears_down():
-    assert next_action(Target.DOWN, 0, TRACK, True) is ReconcileAction.TEARDOWN
+    assert next_action(Target.DOWN, 0, TRACK, ActiveLevel.RUNNING) is \
+        ReconcileAction.TEARDOWN
 
 
 # --------------------------------------------------------------------
@@ -82,23 +89,23 @@ def test_down_while_active_tears_down():
 # --------------------------------------------------------------------
 
 def test_prepared_from_idle_prepares():
-    assert next_action(Target.PREPARED, TRACK, 0, False) is \
+    assert next_action(Target.PREPARED, TRACK, 0, ActiveLevel.NONE) is \
         ReconcileAction.PREPARE
 
 
 def test_prepared_when_already_prepared_is_noop():
-    assert next_action(Target.PREPARED, TRACK, TRACK, False) is \
+    assert next_action(Target.PREPARED, TRACK, TRACK, ActiveLevel.NONE) is \
         ReconcileAction.NONE
 
 
 def test_prepared_with_wrong_mission_tears_down_first():
-    assert next_action(Target.PREPARED, TRACK, 2, False) is \
+    assert next_action(Target.PREPARED, TRACK, 2, ActiveLevel.NONE) is \
         ReconcileAction.TEARDOWN
 
 
 def test_prepared_while_active_tears_down():
     # AS dropped Driving→Ready: full teardown then re-prepare next tick.
-    assert next_action(Target.PREPARED, TRACK, TRACK, True) is \
+    assert next_action(Target.PREPARED, TRACK, TRACK, ActiveLevel.RUNNING) is \
         ReconcileAction.TEARDOWN
 
 
@@ -108,28 +115,135 @@ def test_prepared_while_active_tears_down():
 
 def test_running_from_idle_prepares_first():
     # Straight to Driving with nothing prepared → prepare before activate.
-    assert next_action(Target.RUNNING, TRACK, 0, False) is \
+    assert next_action(Target.RUNNING, TRACK, 0, ActiveLevel.NONE) is \
         ReconcileAction.PREPARE
 
 
 def test_running_when_prepared_activates():
-    assert next_action(Target.RUNNING, TRACK, TRACK, False) is \
+    assert next_action(Target.RUNNING, TRACK, TRACK, ActiveLevel.NONE) is \
         ReconcileAction.ACTIVATE
 
 
 def test_running_when_active_is_noop():
-    assert next_action(Target.RUNNING, TRACK, TRACK, True) is \
+    assert next_action(Target.RUNNING, TRACK, TRACK, ActiveLevel.RUNNING) is \
         ReconcileAction.NONE
 
 
 def test_running_mission_switch_midrun_tears_down():
     # Activated on mission 2 but AS now wants mission 1 → teardown first.
-    assert next_action(Target.RUNNING, TRACK, 2, True) is \
+    assert next_action(Target.RUNNING, TRACK, 2, ActiveLevel.RUNNING) is \
         ReconcileAction.TEARDOWN
 
 
 def test_running_wrong_mission_prepared_inactive_tears_down():
-    assert next_action(Target.RUNNING, TRACK, 2, False) is \
+    assert next_action(Target.RUNNING, TRACK, 2, ActiveLevel.NONE) is \
+        ReconcileAction.TEARDOWN
+
+
+# --------------------------------------------------------------------
+# free-run — target_for floor
+# --------------------------------------------------------------------
+
+def test_free_run_off_matches_legacy_targets():
+    # With the flag off, every mapping is exactly the pre-free-run table.
+    assert target_for(AS_OFF, TRACK, free_run=False) is Target.DOWN
+    assert target_for(AS_READY, TRACK, free_run=False) is Target.PREPARED
+    assert target_for(AS_DRIVING, TRACK, free_run=False) is Target.RUNNING
+
+
+def test_free_run_off_and_ready_no_mission_still_prepares_floor():
+    # OFF / Ready / unknown all raise the floor when free_run is on, even
+    # with no mission selected (the floor resolves autocross separately).
+    for st in (AS_OFF, AS_READY, 99):
+        assert target_for(st, 0, free_run=True) is Target.FLOOR
+
+
+def test_free_run_driving_runs_full_only_with_runnable_mission():
+    # A real selected mission + Driving → RUNNING (control reset + relay). A
+    # standalone/manual "drive" (no runnable mission) stays on the FLOOR:
+    # control keeps logging but the relay never opens.
+    assert target_for(AS_DRIVING, TRACK, free_run=True) is Target.RUNNING
+    assert target_for(AS_DRIVING, 0, free_run=True) is Target.FLOOR
+
+
+def test_free_run_terminal_states_still_down():
+    # Emergency + Finished win over the floor.
+    assert target_for(AS_EMERGENCY, TRACK, free_run=True) is Target.DOWN
+    assert target_for(AS_FINISHED, TRACK, free_run=True) is Target.DOWN
+
+
+# --------------------------------------------------------------------
+# free-run — effective_mission_id (selected-or-autocross)
+# --------------------------------------------------------------------
+
+def test_effective_mission_prefers_selection():
+    assert effective_mission_id(
+        TRACK, free_run=True, free_run_mission_id=AUTOX) == TRACK
+
+
+def test_effective_mission_falls_back_to_autocross_when_free_run():
+    assert effective_mission_id(
+        0, free_run=True, free_run_mission_id=AUTOX) == AUTOX
+
+
+def test_effective_mission_is_none_without_free_run():
+    assert effective_mission_id(
+        0, free_run=False, free_run_mission_id=AUTOX) == 0
+
+
+# --------------------------------------------------------------------
+# free-run — next_action for the floor + go hand-off
+# --------------------------------------------------------------------
+
+def test_floor_from_idle_prepares_all():
+    # First bring-up of the floor: configure the whole stack.
+    assert next_action(
+        Target.FLOOR, AUTOX, 0, ActiveLevel.NONE) is \
+        ReconcileAction.PREPARE
+
+
+def test_floor_when_prepared_activates_whole_stack():
+    # Prepared → bring the whole stack up as the FLOOR (control logging).
+    assert next_action(
+        Target.FLOOR, AUTOX, AUTOX, ActiveLevel.NONE) is \
+        ReconcileAction.ACTIVATE_FLOOR
+
+
+def test_floor_converged_is_noop():
+    assert next_action(
+        Target.FLOOR, AUTOX, AUTOX, ActiveLevel.FLOOR) is \
+        ReconcileAction.NONE
+
+
+def test_ready_to_driving_hand_off_resets_control():
+    # The go hand-off: floor up for the mission (FLOOR) and AS now wants
+    # RUNNING → clean-cycle control only, nothing torn down / re-prepared.
+    assert next_action(
+        Target.RUNNING, AUTOX, AUTOX, ActiveLevel.FLOOR) is \
+        ReconcileAction.RESET_CONTROL
+
+
+def test_running_straight_from_idle_activates_fresh():
+    # Straight to Driving with the stack prepared but never floored → a plain
+    # full activate already brings control up fresh (no reset needed).
+    assert next_action(
+        Target.RUNNING, AUTOX, AUTOX, ActiveLevel.NONE) is \
+        ReconcileAction.ACTIVATE
+
+
+def test_floor_from_running_tears_down_after_a_run():
+    # Dropped back from Driving (RUNNING) to a floor state → tear down +
+    # rebuild the floor clean.
+    assert next_action(
+        Target.FLOOR, AUTOX, AUTOX, ActiveLevel.RUNNING) is \
+        ReconcileAction.TEARDOWN
+
+
+def test_floor_mission_switch_tears_down_first():
+    # Floor active for autocross, selection changed to trackdrive → tear
+    # down before re-preparing the new mission.
+    assert next_action(
+        Target.FLOOR, TRACK, AUTOX, ActiveLevel.FLOOR) is \
         ReconcileAction.TEARDOWN
 
 
