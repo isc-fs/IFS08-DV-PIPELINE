@@ -72,7 +72,11 @@ from geometry_msgs.msg import Point, PoseStamped
 from transforms3d.euler import quat2euler, euler2quat
 
 from path_planning.core_types import Cone, Pose2D
-from path_planning.fasttube_adapter import FasttubeAdapter, PlanDebug
+from path_planning.fasttube_adapter import (
+    FasttubeAdapter,
+    PlanDebug,
+    warmup_numba_planner,
+)
 from path_planning.planner_strategies import (
     PATH_PLANNING_STRATEGY_MAP,
     PathPlannerStrategy,
@@ -247,6 +251,16 @@ class PathPlanningNode(BaseLifecycleNode):
             f"PathPlanner for behavior={self._behavior!r} "
             f"mission_type={mission_type.name}"
         )
+
+        # Numba JIT warmup — same rationale as cone_detection_node: pay
+        # the fsd_path_planning kernel compile here, during Phase-1
+        # warming_up (parallel fan-out, 120 s per-node budget), instead
+        # of on the first /Conos callback while the car is driving.
+        self.get_logger().info(
+            "warming up FaSTTUBe Numba kernels (~0.5 s cached, tens of s first ever)"
+        )
+        warm_s = warmup_numba_planner(mission_type)
+        self.get_logger().info(f"FaSTTUBe Numba warmup complete ({warm_s:.1f} s)")
 
         # Optional capture file
         self._capture_path = os.environ.get("DV_PLANNER_CAPTURE", "")

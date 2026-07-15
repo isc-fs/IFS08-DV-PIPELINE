@@ -15,6 +15,15 @@ Requires=microros-agent.service
 
 [Service]
 Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+# Persistent Numba JIT cache (mirrors NUMBA_CACHE_DIR in the sim's
+# docker-compose). Without it numba's cache=True writes next to each
+# module's source and FAILS SILENTLY where that isn't writable —
+# notably fsd_path_planning's pip-installed (often root-owned)
+# site-packages — so every race boot re-JITs those kernels from
+# scratch at node warmup. A fixed user-writable dir also keeps the
+# cone_detection/dv_ws cache out of the install tree, where colcon
+# rebuilds would wipe it. Numba creates the directory on demand.
+Environment=NUMBA_CACHE_DIR=/home/isc/.cache/dv_numba
 User=isc
 # ros2_ws first (hesai_ros_driver), then dv_ws (the pipeline).
 ExecStart=/bin/bash -c "source /opt/ros/humble/setup.bash && \
