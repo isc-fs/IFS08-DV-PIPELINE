@@ -1935,6 +1935,30 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         db = seg("commit", "dbupd")
         pub = (now - m["dbupd"]) * 1e3 if "dbupd" in m else float("nan")
 
+        # Structured sink for offline profiling (run_pipeline_benchmark):
+        # the replay sets `_prof_sink` to a callable and receives exactly
+        # the numbers logged below, without having to parse SLAM_PROF
+        # lines. Never set in production (attribute defaults to None).
+        sink = getattr(self, "_prof_sink", None)
+        if sink is not None:
+            sink(
+                {
+                    "tag": tag,
+                    "total_ms": total,
+                    "pre_ms": pre,
+                    "assoc_ms": assoc,
+                    "spawn_ms": spawn,
+                    "commit_ms": commit,
+                    "isam_update_ms": self._graph.prof_update_ms,
+                    "calc_estimate_ms": self._graph.prof_calcest_ms,
+                    "flushes": float(self._graph.prof_flushes),
+                    "db_ms": db,
+                    "pub_ms": pub,
+                    "n_obs": float(n_obs),
+                    "map_size": float(len(self._db)),
+                }
+            )
+
         self.get_logger().info(
             f"SLAM_PROF[{tag}] total={total:6.1f}ms "
             f"pre={pre:5.1f} assoc={assoc:5.1f} spawn={spawn:5.1f} "

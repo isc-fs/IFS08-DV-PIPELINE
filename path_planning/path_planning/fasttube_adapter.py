@@ -24,6 +24,7 @@ yaw recomputation the controller wants.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -111,6 +112,7 @@ class FasttubeAdapter:
 
     def plan(
         self, cones: List[Cone], pose: Pose2D,
+        stage_timings: "dict[str, float] | None" = None,
     ) -> "tuple[List[PathPoint], PlanDebug]":
         """Compute centerline path + per-tick debug payload.
 
@@ -125,18 +127,27 @@ class FasttubeAdapter:
         sides) so the node can publish a `/path_planning/debug` overlay.
         Returns `([], PlanDebug())` on degenerate input or library
         failure.
+
+        `stage_timings`, when given, is filled with per-stage wall times
+        (cull_ms / pack_ms / fsd_plan_ms / postprocess_ms) — same pattern
+        as cone_detection's `detect_cones`. Used by the offline pipeline
+        benchmark; no cost when omitted.
         """
         if not cones:
             return [], PlanDebug()
 
+        _t0 = time.perf_counter()
         # Cull cones to a forward-facing local window (#254). The library
         # is designed for a per-tick local view, not the full persistent
         # SLAM map — without culling, scoring passes over the entire
         # history poison the per-side sort.
         cones = _cull_cones(cones, pose, _CULL_RANGE_M)
+        if stage_timings is not None:
+            stage_timings["cull_ms"] = (time.perf_counter() - _t0) * 1000.0
         if not cones:
             return [], PlanDebug()
 
+        _t0 = time.perf_counter()
         global_cones = self._cones_to_arrays(cones)
         car_position = np.array([pose.x, pose.y], dtype=np.float64)
         # Unit vector form (preferred over yaw float per the README
@@ -144,7 +155,10 @@ class FasttubeAdapter:
         car_direction = np.array(
             [np.cos(pose.yaw), np.sin(pose.yaw)], dtype=np.float64
         )
+        if stage_timings is not None:
+            stage_timings["pack_ms"] = (time.perf_counter() - _t0) * 1000.0
 
+        _t0 = time.perf_counter()
         try:
             result = self._planner.calculate_path_in_global_frame(
                 global_cones, car_position, car_direction,
@@ -163,6 +177,9 @@ class FasttubeAdapter:
                 )
                 self._last_error_log_time = now
             return [], PlanDebug()
+        if stage_timings is not None:
+            stage_timings["fsd_plan_ms"] = (time.perf_counter() - _t0) * 1000.0
+        _t0 = time.perf_counter()
 
         # Tuple unpack: (path, left_sorted, right_sorted,
         #                left_with_virtual, right_with_virtual,
@@ -201,7 +218,10 @@ class FasttubeAdapter:
         kappa = np.asarray(path[within_cap, 3], dtype=np.float64)
         if xy.shape[0] < 2:
             return [], debug
-        return _xy_to_path_points(xy, kappa), debug
+        points = _xy_to_path_points(xy, kappa)
+        if stage_timings is not None:
+            stage_timings["postprocess_ms"] = (time.perf_counter() - _t0) * 1000.0
+        return points, debug
 
     @staticmethod
     def _cones_to_arrays(cones: List[Cone]) -> List[np.ndarray]:
@@ -247,6 +267,63 @@ def _cull_cones(cones: List[Cone], pose: Pose2D, max_range_m: float) -> List[Con
             continue
         out.append(c)
     return out
+
+
+def warmup_numba_planner(
+    mission: MissionTypes = MissionTypes.trackdrive,
+) -> float:
+    """Eager-run fsd_path_planning's Numba kernels; returns elapsed seconds.
+
+    The library JIT-compiles ~90 ``cache=True`` kernels (cone sorting,
+    cross-side matching, path parameterization) lazily on the first
+    ``calculate_path_in_global_frame`` call. Without this warmup that
+    compile lands on the first /Conos callback — mid-mission, while the
+    car is already driving. Cost there: ~0.3-0.5 s when the on-disk cache
+    is warm, tens of seconds when it is cold (fresh install, rebuilt
+    volume, numba upgrade, or an unwritable cache location — see
+    NUMBA_CACHE_DIR in deploy/dv-pipeline.service and docker-compose).
+    Calling this from ``PathPlanningNode.on_configure`` moves the cost
+    into Phase-1 ``warming_up``, where mode_manager's 120 s per-node
+    budget (parallel fan-out, same as cone_detection's warmup) absorbs it.
+
+    Replays the REAL adapter chain (cull → pack → plan) on a synthetic
+    two-row corridor instead of poking kernels directly: Numba
+    specializes per call pattern, so only the live call chain guarantees
+    the live signatures get compiled (an argument left to its default is
+    a different specialization than the same value passed explicitly).
+
+    Uses a throwaway adapter instance: skidpad/acceleration planners are
+    stateful, and the live instance must not see synthetic cone history.
+    The module-level Numba dispatchers being warmed are shared, so the
+    live adapter still benefits.
+
+    Never raises — warmup is best-effort; on failure the first real tick
+    simply pays the JIT as before.
+    """
+    t0 = time.perf_counter()
+    try:
+        adapter = FasttubeAdapter(mission)
+        # Gentle left-curving corridor, two rows 3 m apart, 4 m spacing —
+        # enough cones that the sorter, cross-side matcher, and spline
+        # fit all run (verified: produces a full path for trackdrive).
+        cones: List[Cone] = []
+        for i in range(12):
+            s = 4.0 * i + 2.0
+            theta = 0.02 * s
+            cx = s * math.cos(theta)
+            cy = s * math.sin(theta) + 0.5 * theta * s
+            hx, hy = math.cos(theta), math.sin(theta)
+            cones.append(Cone(x=cx - 1.5 * hy, y=cy + 1.5 * hx))
+            cones.append(Cone(x=cx + 1.5 * hy, y=cy - 1.5 * hx))
+        pose = Pose2D(x=0.0, y=0.0, yaw=0.05)
+        # Twice: the first call JIT-compiles / loads the disk cache; the
+        # second exercises warm-path branches (per-planner caches built
+        # during the first tick).
+        adapter.plan(cones, pose)
+        adapter.plan(cones, pose)
+    except Exception:  # pylint: disable=broad-except
+        logger.warning("fsd_path_planning Numba warmup failed", exc_info=True)
+    return time.perf_counter() - t0
 
 
 def _xy_to_path_points(xy: np.ndarray,
