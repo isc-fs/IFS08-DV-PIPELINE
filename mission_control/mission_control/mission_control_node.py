@@ -65,6 +65,7 @@ from mission_control.interface_contract import (
     DV_PREPARING,
     DV_READY,
     DV_RUNNING,
+    DV_STOPPING,
     FREE_RUN_MISSION_ID,
     HEARTBEAT_STALE_S,
     SERVICE_FORCE_EBS,
@@ -72,6 +73,7 @@ from mission_control.interface_contract import (
     TOPIC_ASSI_STATE,
     TOPIC_CTRL_CMD,
     TOPIC_DV_STATUS,
+    TOPIC_SLAM_STOP_REQUEST,
     ami_index_to_mission_id,
 )
 from mission_control.interface_qos import UPLINK_QOS
@@ -699,12 +701,6 @@ class MissionControlNode(LifecycleNode):
             return DV_EMERGENCY
         if self._finished:
             return DV_FINISHED
-        # Below FINISHED (once stopped we ARE finished) and below EMERGENCY (a
-        # real fault always outranks a tidy end-of-mission stop), but above
-        # FAILED: a prepare/activate error cannot happen mid-run, and if it
-        # somehow did, a car already braking to rest should keep braking.
-        if self._stopping:
-            return DV_STOPPING
         if self._failed:
             return DV_FAILED
 
@@ -717,6 +713,24 @@ class MissionControlNode(LifecycleNode):
             return DV_IDLE
         if not is_runnable_mission(self._desired_mission_id):
             return DV_IDLE
+        # Hard stop — ONLY while actually driving. Placement here is load
+        # bearing, not stylistic (uDV#176): the firmware compares /dv/status
+        # for equality against the bytes it acts on, so any byte it does not
+        # recognise — including 7 — reads as "DV not ready". In AS Ready that
+        # makes `dv_ready` false and the uDV REFUSES GO: the car silently
+        # never launches. Fail-safe on their side, a footgun on ours.
+        #
+        # The latch alone is not a sufficient guard. `_stopping` clears only
+        # once the stack is fully torn down (_active_level NONE and no
+        # prepared mission); a re-arm that beats that reset would sit in
+        # AS Ready with 7 on the wire. Gating on the REAL AS state closes
+        # that window regardless of latch timing.
+        #
+        # Priority: below EMERGENCY and FINISHED (a fault outranks a tidy
+        # stop; once stopped we ARE finished) and below the arming handshake,
+        # which is exactly the point.
+        if self._stopping and real_as == AS_DRIVING:
+            return DV_STOPPING
         if self._busy and self._pending_action is ReconcileAction.PREPARE:
             return DV_PREPARING
         # Legacy steady mapping, keyed to the DESIRED (operator-selected)
