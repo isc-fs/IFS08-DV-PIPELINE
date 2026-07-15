@@ -112,29 +112,75 @@ SIM_INTENT_READY  = 1   # armed / prepare (RES go not pressed)
 SIM_INTENT_GO     = 2   # RES go — run
 
 
-# AMI mission INDEX (uDV ws2812.c mission_colors) → pipeline registry
-# mission_id (mode_registry: trackdrive=1, autocross=2, accel=3,
-# skidpad=4). 0 = no autonomy mission / tear down. mission_control
-# maps the raw /ami/mission index through this so the uDV stays dumb (no
-# registry numbering baked into firmware). Moved here from the deleted
-# car_supervisor/policy.py; CONFIRM against AMI firmware.
+# AMI mission INDEX → pipeline registry mission_id (mode_registry:
+# trackdrive=1, autocross=2, accel=3, skidpad=4). 0 = no autonomy mission /
+# tear down. mission_control maps the raw /ami/mission index through this so
+# the uDV stays dumb (no registry numbering baked into firmware).
 #
-# EBS test (5) and Inspection (6) are STANDALONE uDV missions — the uDV
-# handles everything on-board, so the pipeline must do nothing. They map
-# to 0 (no mission) so mission_control keeps the autonomy stack torn down
-# and idle (never emits /ctrl/cmd) while the uDV runs them.
+# CONFIRMED against firmware source 2026-07-15 (uDV#178). The authority is
+# `Core/Inc/mission.h` (the AmiMission enum) + `Core/Src/mission_registry.cpp`
+# (the k_by_code[] dispatch table) — NOT ws2812.c, which this comment used to
+# name and which contains no mission mapping at all (it is the ASSI LED UART
+# bridge). Diffing against it was diffing against an empty set.
+#
+# `needs_pipeline` is the column that actually predicts our behaviour: it is
+# the firmware's answer to "does the uDV listen to the pipeline at all for this
+# mission". For codes 1–4 it is true, and our /dv/status bytes drive the run
+# (FINISHED ends it, EMERGENCY/FAILED and a stale heartbeat trip Emergency,
+# STOPPING brakes once uDV#176 lands). For codes 5–6 it is false and **every
+# byte we send is ignored** — those missions end on their own logic.
+#
+# Idx 0 is MANUAL, not a mission: the uDV deliberately refuses GO on it (manual
+# R2D is the ECU start-button path). 7 = SHUTDOWN, 8/9 are unassigned aux menu
+# entries. All are nullptr missions firmware-side, so GO is refused.
+#
+# Autonomous Demo has NO index assigned (the AmiMission enum stops at
+# SHUTDOWN=7). Unmapped indices fail safe on both sides — firmware returns a
+# nullptr mission → mission_valid=false → GO refused; we return 0 → torn down.
+# BLOCKED on the AMI owners: does the board actually emit a Demo selection, and
+# on what index? Nobody has claimed one. See uDV#178.
+#
+# ⚠️ Index 5 (EBS test) is **TBD, currently inert** — NOT a confirmed standalone
+# mission. Today `mission_ebstest.cpp` is a stub: it holds the wheels straight,
+# sets requests_r2d=false (it will not even enable the inverter), and never
+# self-finishes. It cannot move the car at all, so needs_pipeline=false is true
+# only in the trivial sense that a mission which does nothing needs nothing.
+# The FS EBS test requires driving to a set speed autonomously and verifying
+# deceleration — that is an on-car TODO, and whether it ends up standalone or
+# pipeline-driven is an OPEN DESIGN DECISION. If it goes the pipeline route,
+# this mapping changes. The uDV team will consult us before implementing it.
+#
+# Index 6 (Inspection) IS confirmed standalone, and genuinely so:
+# mission_inspection.cpp is fully implemented, sweeps the steering open-loop,
+# drives 15% torque through the real ECU R2D handshake, and self-finishes on
+# its own 30 s timer. No /dv/status, no /ctrl/cmd, no pipeline at any point.
 DEFAULT_AMI_TO_MISSION_ID: dict[int, int] = {
-    0: 0,   # Manual        → no autonomy mission
-    1: 3,   # Acceleration  → accel
-    2: 4,   # Skidpad       → skidpad
-    3: 2,   # Autocross     → autocross
-    4: 1,   # Track drive   → trackdrive
-    5: 0,   # EVS/EBS test  → no mission (uDV standalone)
-    6: 0,   # Inspection    → no mission (uDV standalone)
-    7: 0,   # Shutdown      → no mission
-    8: 0,   # Aux1          → no mission
-    9: 0,   # Aux2          → no mission
+    0: 0,   # MISSION_MANUAL     → no mission (human drives; uDV refuses GO)
+    1: 3,   # MISSION_ACCEL      → accel        (needs_pipeline=true)
+    2: 4,   # MISSION_SKIDPAD    → skidpad      (needs_pipeline=true)
+    3: 2,   # MISSION_AUTOCROSS  → autocross    (needs_pipeline=true)
+    4: 1,   # MISSION_TRACKDRIVE → trackdrive   (needs_pipeline=true)
+    5: 0,   # MISSION_EBS_TEST   → no mission — TBD, currently an inert stub;
+            #                      may become pipeline-driven. See above.
+    6: 0,   # MISSION_INSPECTION → no mission (confirmed standalone, real)
+    7: 0,   # MISSION_SHUTDOWN   → no mission (not a drive mission)
+    8: 0,   # aux1               → no mission (AMI menu only, unassigned)
+    9: 0,   # aux2               → no mission (AMI menu only, unassigned)
 }
+
+
+def is_known_ami_index(ami_index: int) -> bool:
+    """True if the AMI index is one the firmware actually defines.
+
+    Distinguishes "the operator picked a non-pipeline mission" (0, 5-9 — all
+    legitimate) from "we have no idea what this index is". Both map to mission
+    0 and both fail safe, so this exists purely so the caller can SAY which one
+    happened: an unmapped index means the AMI is sending something the table
+    has never heard of — e.g. an Autonomous Demo selection, which has no
+    assigned index (uDV#178). Firmware-side that shows up as a refused GO, and
+    a car that won't launch with no stated reason is a bad afternoon.
+    """
+    return int(ami_index) in DEFAULT_AMI_TO_MISSION_ID
 
 
 def ami_index_to_mission_id(

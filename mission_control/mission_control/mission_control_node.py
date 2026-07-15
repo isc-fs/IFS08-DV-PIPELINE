@@ -73,6 +73,7 @@ from mission_control.interface_contract import (
     TOPIC_CTRL_CMD,
     TOPIC_DV_STATUS,
     ami_index_to_mission_id,
+    is_known_ami_index,
 )
 from mission_control.interface_qos import UPLINK_QOS
 from mission_control.reconcile import (
@@ -393,6 +394,18 @@ class MissionControlNode(LifecycleNode):
         self._as_state_stamp = time.monotonic()
 
     def _on_ami_mission(self, msg: Int32) -> None:
+        # An index the table has never heard of maps to 0 like any other
+        # non-pipeline selection, so it is safe — but silently identical to
+        # "operator picked Manual", which makes it undiagnosable. Firmware-side
+        # it surfaces as a refused GO (uDV#178), i.e. a car that won't launch
+        # for no stated reason. Say so loudly instead. Autonomous Demo is the
+        # live example: it has no assigned AMI index at all.
+        if not is_known_ami_index(int(msg.data)):
+            self.get_logger().warn(
+                f"/ami/mission index {msg.data} is NOT in the AMI table — "
+                f"treating as no-mission (stack stays torn down). If the AMI "
+                f"board really emits this, the table needs an entry: see "
+                f"isc-fs/IFS08-DV-uDV#178.")
         mission_id = ami_index_to_mission_id(int(msg.data))
         if mission_id != self._desired_mission_id:
             self.get_logger().info(
