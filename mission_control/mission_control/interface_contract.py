@@ -54,6 +54,17 @@ DV_FINISHED  = 4   # mission complete (was RuntimeControl outcome=finished)
 DV_EMERGENCY = 5   # pipeline raised EBS (was outcome=emergency)
 DV_FAILED    = 6   # prepare/activate error (was Result success=false/error)
 
+# Free-run (always-on data-collection) default mission. When the free_run
+# flag is set, mission_control brings the autonomy floor — everything but
+# control_node — up even while the uDV is OFF / in manual driving, so
+# perception, SLAM and planning run and a rosbag records without the car
+# ever being armed (ASMS need not be powered). The floor prepares the
+# operator-selected mission when one is dialed in on /ami/mission, else
+# this default. autocross (registry id 2) is the most general profile:
+# SLAM maps an unknown track as it goes, no prior map assumed. Kept in
+# lockstep with mode_registry by hand (autocross.mission_id == 2).
+FREE_RUN_MISSION_ID = 2
+
 # Interface topic / service names — single source of truth so the
 # reconciler, the emulator and any tooling never drift.
 TOPIC_ASSI_STATE  = "/assi/state"

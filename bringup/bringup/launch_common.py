@@ -94,6 +94,7 @@ def auto_active(
     executable: str,
     name: str,
     remappings: Iterable[tuple[str, str]] | None = None,
+    parameters: list | None = None,
 ) -> list:
     """Return [LifecycleNode, configure_event, activate_handler].
 
@@ -101,6 +102,9 @@ def auto_active(
     launch start. Used for the management trio whose action/service
     endpoints must be live before mode_manager fans out change_state
     to the autonomy nodes.
+
+    `parameters` are appended after use_sim_time (e.g. mission_control's
+    free_run flag); each launch file owns what it passes.
     """
     node = LifecycleNode(
         package=package,
@@ -109,7 +113,7 @@ def auto_active(
         namespace="",
         output="screen",
         remappings=list(remappings or []),
-        parameters=use_sim_time_params(),
+        parameters=use_sim_time_params() + list(parameters or []),
     )
     configure = EmitEvent(event=ChangeState(
         lifecycle_node_matcher=matches_action(node),
@@ -204,7 +208,10 @@ def autonomy_actions(profile: str = "sim") -> list:
     ]
 
 
-def management_actions(include_sim_supervisor: bool = True) -> list:
+def management_actions(
+    include_sim_supervisor: bool = True,
+    free_run=None,
+) -> list:
     """Pre-baked management trio, all auto-active.
 
     Bring-up order: mode_manager first (its activate_mode service must
@@ -217,11 +224,21 @@ def management_actions(include_sim_supervisor: bool = True) -> list:
         include_sim_supervisor: True for sim/full builds (the
             supervisor sits between control_node and the bridge);
             False for car builds (the on-vehicle uDV replaces it).
+        free_run: if given (a LaunchConfiguration or bool), sets
+            mission_control's `free_run` parameter — the always-on
+            data-collection floor. None (sim/full) leaves the node
+            default (off).
     """
     actions: list = []
     actions += auto_active("mode_manager", "mode_manager_node", "mode_manager_node")
+    mc_params = None
+    if free_run is not None:
+        mc_params = [{
+            "free_run": ParameterValue(free_run, value_type=bool),
+        }]
     actions += auto_active(
         "mission_control", "mission_control_node", "mission_control_node",
+        parameters=mc_params,
     )
     if include_sim_supervisor:
         # sim_supervisor needs /imu + /motor_rpm + /steering + /brake +

@@ -71,6 +71,39 @@ mission_control is a **reconciler**: it reads `/assi/state` +
 lifecycle converges to what the AS state demands. Decision logic is the
 pure, unit-tested `mission_control/reconcile.py`.
 
+### Free-run — always-on data collection (`free_run`, default **on**)
+
+`car_pipeline.launch.py` declares `free_run:=true` by default. With it on,
+mission_control raises an autonomy **floor** whenever the uDV is powered on
+(heartbeat alive) — *regardless of AS state*, including AS OFF and manual
+driving with the ASMS unpowered:
+
+- The **whole** autonomy stack runs — perception, SLAM, planning **and
+  `control_node`**. control computes its would-be commands onto
+  `/ctrl/cmd_internal`, which the `bag_recorder_node` captures in a
+  `freerun_<UTC>` bag alongside the pilot's actuals (`/steering_angle`,
+  `/motor_rpm`) — a ready-made **pilot-vs-autonomy** comparison dataset. The
+  pipeline does **not** relay those commands (see invariants).
+- The floor prepares the **operator-selected** mission when one is dialed in,
+  else **autocross** (`FREE_RUN_MISSION_ID`) — the most general profile
+  (SLAM maps an unknown track). This is what makes the arm hand-off *warm*:
+  the floor already runs the mission the driver will arm with.
+- **Hand-off:** arming to AS Ready keeps the floor up (no teardown); the go
+  edge to AS Driving **clean-cycles `control_node`** (`ActivateMode.reset_nodes`:
+  deactivate→activate control only) so the real run starts with fresh
+  controller state — no SLAM reset, no Numba re-JIT of perception. Changing
+  the AMI selection mid-floor re-preps (accepted cost).
+- **Safety invariants:** the floor never publishes `/ctrl/cmd` (the relay
+  opens only at `ActiveLevel.RUNNING`, i.e. a live armed run), and
+  `/dv/status` still tracks the *real* AS state (OFF/manual → `IDLE`,
+  standalone missions → `IDLE`), so the byte the uDV gates its go on is
+  byte-for-byte the pre-free-run handshake — free-run cannot perturb arm →
+  Ready → Driving. AS Emergency/Finished still win over the floor.
+
+Turn it off for a lighter-CPU competition build:
+`ros2 launch bringup car_pipeline.launch.py free_run:=false`. Sim/full
+pipelines default it off (mission_control's node default).
+
 ---
 
 ## 2. What replaced car_sensor_bridge / car_supervisor
