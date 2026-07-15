@@ -18,9 +18,21 @@ PipelineWatchdogNode class through real scenarios on an injected clock.
 It is deliberately NOT a substitute for a bench run: it cannot catch DDS QoS
 mismatches, which is exactly why the /dv/status QoS is pinned by comment and
 by test_watchdog_contract instead. It catches wiring, not transport.
+
+ISOLATION — read before touching the stubs
+------------------------------------------
+The stubs are installed into sys.modules only for as long as it takes to exec
+the node module, then removed again. This is not fussiness: an earlier version
+left them installed, and in an environment where ROS *is* present (the humble
+container) the contract test then imported the already-stubbed module from
+sys.modules and silently asserted against the FAKE node instead of the real
+one. A test that quietly tests a stub is worse than no test. The loaded module
+keeps working after the restore because its class bases and globals are bound
+at exec time; sys.modules is left exactly as we found it.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 import types
@@ -32,6 +44,13 @@ ROOT = os.path.abspath(os.path.join(_HERE, os.pardir))
 REPO = os.path.abspath(os.path.join(_HERE, os.pardir, os.pardir))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(REPO, "mission_control"))
+
+_STUBBED = (
+    "rclpy", "rclpy.node", "rclpy.qos",
+    "std_msgs", "std_msgs.msg",
+    "nav_msgs", "nav_msgs.msg",
+    "fs_msgs", "fs_msgs.msg",
+)
 
 
 # --------------------------------------------------------------- stubs
@@ -107,11 +126,11 @@ class _FakeNode:
 
 
 def _install_stubs() -> None:
-    """Install the narrow rclpy/msg surface the node imports."""
-    if "rclpy" in sys.modules and getattr(
-            sys.modules["rclpy"], "_is_watchdog_stub", False):
-        return
+    """Install the narrow rclpy/msg surface the node imports.
 
+    Callers MUST pair this with a restore (see _load_node_module) — leaving
+    these in sys.modules makes every later test in the session import the fake.
+    """
     rclpy = types.ModuleType("rclpy")
     rclpy._is_watchdog_stub = True
     rclpy.init = lambda **kw: None
@@ -185,19 +204,47 @@ def _install_stubs() -> None:
     sys.modules["fs_msgs.msg"] = fs_msgs.msg
 
 
-_install_stubs()
+def _load_node_module():
+    """Exec the real node module against the stubs, then restore sys.modules.
+
+    The returned module keeps working — its class bases and globals are bound
+    during exec_module — while the rest of the pytest session sees the genuine
+    rclpy (or no rclpy) exactly as it did before.
+    """
+    saved = {name: sys.modules.get(name) for name in _STUBBED}
+    _install_stubs()
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_pipeline_watchdog_node_stubbed",
+            os.path.join(ROOT, "pipeline_watchdog", "pipeline_watchdog_node.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        for name, prev in saved.items():
+            if prev is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = prev
+        # Never leave the stubbed node module discoverable under the real name.
+        sys.modules.pop("_pipeline_watchdog_node_stubbed", None)
+
+
+_node_mod = _load_node_module()
+PipelineWatchdogNode = _node_mod.PipelineWatchdogNode
+# Take the message classes from the loaded module's own globals — they are the
+# stub types it was exec'd against, whatever sys.modules holds now.
+Bool = _node_mod.Bool
+UInt8 = _node_mod.UInt8
+Odometry = _node_mod.Odometry
+ControlCommand = _node_mod.ControlCommand
 
 from mission_control.interface_contract import (  # noqa: E402
     DV_IDLE,
     DV_RUNNING,
     TOPIC_WATCHDOG_EMERGENCY,
 )
-from pipeline_watchdog.pipeline_watchdog_node import (  # noqa: E402
-    PipelineWatchdogNode,
-)
-from std_msgs.msg import Bool, UInt8  # noqa: E402
-from nav_msgs.msg import Odometry  # noqa: E402
-from fs_msgs.msg import ControlCommand  # noqa: E402
 
 
 # --------------------------------------------------------------- helpers
@@ -249,6 +296,28 @@ class Harness:
 @pytest.fixture
 def h():
     return Harness()
+
+
+# ------------------------------------------------------------- isolation
+
+def test_stubs_do_not_leak_into_sys_modules():
+    """Regression guard. An earlier version left the stubs installed, and in
+    the ROS container the contract test then imported the stubbed module from
+    sys.modules and asserted against the FAKE node while looking green.
+
+    If rclpy is real here, it must still be real after this module imported.
+    If rclpy is absent here, it must still be absent — not silently faked.
+    """
+    rclpy_now = sys.modules.get("rclpy")
+    assert not getattr(rclpy_now, "_is_watchdog_stub", False), \
+        "fake rclpy leaked into sys.modules — other tests will import the stub"
+    assert "_pipeline_watchdog_node_stubbed" not in sys.modules
+
+
+def test_harness_drives_the_real_node_class():
+    """The harness must exercise the genuine node source, not a copy of it."""
+    src = os.path.join(ROOT, "pipeline_watchdog", "pipeline_watchdog_node.py")
+    assert os.path.samefile(_node_mod.__file__, src)
 
 
 # ---------------------------------------------------------------- wiring
