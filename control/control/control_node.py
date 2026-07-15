@@ -105,6 +105,12 @@ class ControlNode(BaseLifecycleNode):
         # in odom frame (see _on_orange / _stop_distance).
         self._stop_anchor_xy: Optional[tuple[float, float]] = None
         self._stop_latched: bool = False
+        # Gate for the stop anchor — see _on_orange. Defaults TRUE so a stack
+        # with no /slam/final_lap publisher behaves exactly as it did before
+        # this gate existed (stop at the first gate past stop_latch_min_travel).
+        # Defaulting False would mean "never stop", which is the failure that
+        # actually hurts.
+        self._final_lap: bool = True
         # Travel distance (odom-frame) used as the gate-latch guard.
         self._travelled: float = 0.0
         self._last_pose_xy: Optional[tuple[float, float]] = None
@@ -130,6 +136,7 @@ class ControlNode(BaseLifecycleNode):
         self._sub_pose = None
         self._sub_odom = None
         self._sub_orange = None
+        self._sub_final_lap = None
         self._tick_timer = None
 
     # ------------------------------------------------------------------
@@ -202,6 +209,7 @@ class ControlNode(BaseLifecycleNode):
         self._latest_path_kappas = []
         self._stop_anchor_xy = None
         self._stop_latched = False
+        self._final_lap = True
         self._travelled = 0.0
         self._last_pose_xy = None
         self._last_throttle = 0.0
@@ -233,6 +241,17 @@ class ControlNode(BaseLifecycleNode):
             Odometry, "/odom", self._on_odom, 10)
         self._sub_orange = self.create_subscription(
             MarkerArray, "/Conos_Orange", self._on_orange, 10)
+        # /slam/final_lap — "the next finish gate is the closing one". SLAM
+        # publishes it TRANSIENT_LOCAL; match durability or we would never
+        # receive the value it latched before we activated, and trackdrive
+        # would sit at _final_lap=True (the safe default) and stop on lap 1.
+        final_lap_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._sub_final_lap = self.create_subscription(
+            Bool, "/slam/final_lap", self._on_final_lap, final_lap_qos)
 
         # 40 Hz tick
         self._tick_timer = self.create_timer(
@@ -245,13 +264,14 @@ class ControlNode(BaseLifecycleNode):
     ) -> TransitionCallbackReturn:
         self.get_logger().info("on_deactivate: dropping timers + subs")
         for sub in (self._sub_path, self._sub_pose, self._sub_odom,
-                    self._sub_orange):
+                    self._sub_orange, self._sub_final_lap):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_path = None
         self._sub_pose = None
         self._sub_odom = None
         self._sub_orange = None
+        self._sub_final_lap = None
         if self._tick_timer is not None:
             self.destroy_timer(self._tick_timer)
         self._tick_timer = None
@@ -262,13 +282,14 @@ class ControlNode(BaseLifecycleNode):
     ) -> TransitionCallbackReturn:
         self.get_logger().info("on_cleanup: destroying publishers + TF")
         for sub in (self._sub_path, self._sub_pose, self._sub_odom,
-                    self._sub_orange):
+                    self._sub_orange, self._sub_final_lap):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_path = None
         self._sub_pose = None
         self._sub_odom = None
         self._sub_orange = None
+        self._sub_final_lap = None
         if self._tick_timer is not None:
             self.destroy_timer(self._tick_timer)
         self._tick_timer = None
@@ -469,6 +490,21 @@ class ControlNode(BaseLifecycleNode):
         # _pose_stamped for the encoding rationale.
         self._latest_path_kappas = [p.pose.position.z for p in msg.poses]
 
+    def _on_final_lap(self, msg: Bool) -> None:
+        """Track SLAM's 'the next gate is the closing one' signal.
+
+        Only ever consulted by _on_orange. Note this is NOT latched-once: SLAM
+        resets it per run, and control resets to True on activate, so a
+        deactivate→activate cycle re-reads the current value from the latched
+        topic rather than inheriting the last run's.
+        """
+        value = bool(msg.data)
+        if value != self._final_lap:
+            self.get_logger().info(
+                f"/slam/final_lap → {value}"
+                + ("" if value else " — holding stop anchor until the closing lap"))
+        self._final_lap = value
+
     def _on_orange(self, msg: MarkerArray) -> None:
         """Latch a stop anchor on the first tick we see ≥2 big-orange cones,
         AFTER the car has travelled at least stop_latch_min_travel metres
@@ -493,6 +529,19 @@ class ControlNode(BaseLifecycleNode):
         if len(msg.markers) < 2:
             return
         if self._travelled < self.get_parameter("stop_latch_min_travel").value:
+            return
+        # Lap gate: only latch on the CLOSING lap's gate. Without this,
+        # trackdrive brakes to a stop at the first big-orange gate past
+        # stop_latch_min_travel — i.e. the end of lap 1 — and can never reach
+        # its 10 laps. SLAM owns the lap count and publishes /slam/final_lap;
+        # this node stays dumb about mission rules.
+        #
+        # Defaults TRUE (see _final_lap init) so a missing publisher degrades
+        # to the historical behaviour — stop at the first gate — rather than
+        # to "never stop", which would be the dangerous failure. For autocross
+        # (1 lap), accel and skidpad, SLAM publishes true immediately, so this
+        # gate is transparent and only trackdrive's behaviour changes.
+        if not self._final_lap:
             return
         # Centroid in base_link
         n = len(msg.markers)
