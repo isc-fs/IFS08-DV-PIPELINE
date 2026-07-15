@@ -153,18 +153,58 @@ only while AS Driving. Measure the real full-lock command and the sign
 confirm the `/steering_angle` deg→rad conversion measures road-wheel vs
 column angle.
 
-### G4 — Mission-finished path to the uDV
-On `slam/finished`, mission_control publishes `/dv/status = FINISHED`.
-The uDV should react (DRIVING→FINISHED) — confirm it does, either via
-`/dv/status` or its own RES/standstill logic.
+### G4 — Mission-finished path to the uDV ✅ CONFIRMED (uDV#177)
+**Byte 4 drives DRIVING→FINISHED. Implemented firmware-side; nothing to do.**
+`app_task.cpp` builds `as_in.dv_finished = dv_fresh && (dv_status ==
+DV_STATUS_FINISHED)`; `as_transition.hpp` consumes it. AS Finished then fires
+the EBS and opens the SDC, latching until ASMS-off.
 
-### G5 — AMI → mission mapping
-`interface_contract.DEFAULT_AMI_TO_MISSION_ID` maps the AMI index (uDV
-`ws2812.c`: 4=Track drive) to the registry (trackdrive=1, autocross=2,
-accel=3, skidpad=4). Confirm against AMI firmware; the firmware table
-(index 4 = Track drive) is authoritative. AMI 5 "EVS/EBS test" + AMI 6
-"Inspection" are **standalone uDV missions** and map to `0` (no mission):
-the uDV runs them on-board, so the pipeline stays torn down and idle.
+> ⚠️ **The uDV does NOT check standstill.** Send `FINISHED` while the car is
+> rolling and it enters AS Finished *immediately* — EBS fired and **SDC opened
+> at speed**. The rules only allow AS Finished at standstill, so **the
+> standstill gate is entirely ours**. It lives in `cone_slam.lap_counter`
+> (`finished` = criterion met AND `speed <= standstill_mps`). Do not weaken it,
+> and do not let anything else publish byte 4.
+
+⚠️ **Byte 4 only applies to pipeline missions** (`mission_needs_pipeline`):
+AMI 1–4 yes; AMI 5–6 no — standalone missions end on their own
+`mission_complete` and ignore every byte we send.
+
+**Correction:** the earlier "or its own RES/standstill logic" alternative was
+wrong. `state_manager.cpp` (`StateManager::updateState()`) *looks* like it gates
+FINISHED on standstill, but it is **dead code** — its `getState()` is read only
+by firmware host tests. The live AS state is `as_next_state()`, which has no
+standstill term at all. Do not rely on it.
+
+### G5 — AMI → mission mapping ✅ MOSTLY CONFIRMED (uDV#178)
+Indices 0–9 **confirmed against firmware source**; our table is correct
+(1=accel, 2=skidpad, 3=autocross, 4=trackdrive).
+
+**The authority is `Core/Inc/mission.h` + `Core/Src/mission_registry.cpp`, NOT
+`ws2812.c`** — which this doc used to name and which has no mission mapping in
+it at all (it is the ASSI LED UART bridge). Track those two files.
+
+Two items remain open:
+
+- ⚠️ **AMI 5 (EBS test) is NOT confirmed standalone** — treat it as *TBD,
+  currently inert*. `mission_ebstest.cpp` is a stub: wheels straight,
+  `requests_r2d=false` (it won't even enable the inverter), never
+  self-finishes. It cannot move the car, so `needs_pipeline=false` is true only
+  in the trivial sense that a mission doing nothing needs nothing. The real
+  FS EBS test must reach a set speed autonomously — an open design decision
+  (standalone vs pipeline-driven). If it goes pipeline, our mapping changes.
+- ⚠️ **Autonomous Demo has no AMI index.** The `AmiMission` enum stops at
+  `SHUTDOWN=7`; 8/9 are unassigned. Unmapped fails safe both sides (firmware
+  refuses GO; we tear down), and `mission_control` now logs a warning rather
+  than idling silently. **Blocked on the AMI owners: does the board emit a Demo
+  selection, and on what index?**
+
+**AMI 6 (Inspection) IS confirmed standalone** and genuinely implemented —
+open-loop steering sweep, 15% torque via the real ECU R2D handshake,
+self-finishes on a 30 s timer. No pipeline at any point.
+
+**`needs_pipeline` is the column that predicts our behaviour**: codes 1–4 the
+uDV listens to `/dv/status`; codes 5–6 **every byte we send is ignored**.
 
 ### G6 — IMU / LiDAR frames + TF
 `cone_detection` reads `header.frame_id`; provide the static TFs
