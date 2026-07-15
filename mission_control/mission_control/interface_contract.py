@@ -62,21 +62,40 @@ DV_FAILED    = 6   # prepare/activate error (was Result success=false/error)
 # and relayed but does nothing on the vehicle, so the car only coasts. The EBS
 # is the only thing that can actually stop it.
 #
-# *** REQUIRES FIRMWARE SUPPORT — INERT UNTIL uDV IMPLEMENTS IT. ***
-# mission_control only emits this byte when its `hard_stop_on_finish`
-# parameter is true, which defaults FALSE precisely because current firmware
-# has no case for byte 7 and its behaviour on an unknown value is unverified.
-# Do not enable until the uDV side lands and the pairing is bench-checked.
+# *** FULL BRAKE PRESSURE. END-OF-MISSION ONLY. NEVER TO MODULATE SPEED. ***
+# There is NO service brake on the IFS08 (uDV#176): the only brake pneumatics
+# are the two EBS actuators, and they are BINARY — fire or release, nothing to
+# ramp or PWM. So this byte is not "brake a bit", it is "stop, now, hard". It
+# buys exactly one thing: reaching standstill at the end of a mission so
+# AS Finished becomes reachable. Using it mid-run to trim speed would be an
+# emergency stop at every application, and the uDV team asked explicitly that
+# `hard_stop_on_finish` stay strictly end-of-mission. `LapCounter.target_met`
+# enforces that — it only latches on the mission's completion criterion.
 #
-# *** UNRESOLVED — the semantics are a rules question, not a code question. ***
-# The FS AS state table has no state with the EBS ACTUATED and the SDC CLOSED:
-# in AS Driving the EBS is "Armed", and both AS Finished and AS Emergency
-# actuate it *and* open the SDC. So "actuate the brakes but stay in AS Driving"
-# is only legitimate if the pneumatics have an actuation path that is NOT the
-# EBS trigger — i.e. if this is the autonomous SERVICE brake, which is normal
-# and expected. If the only path is the EBS trigger, this asks the firmware to
-# fire the EBS without its mandated SDC opening, and that needs a rules /
-# scrutineering answer before anyone implements it. See isc-fs/IFS08-DV-uDV.
+# *** RULES QUESTION: ANSWERED (uDV#176). ***
+# The earlier worry — "the FS AS state table has no row with the EBS actuated
+# and the SDC closed" — was a misreading. That table describes AS states, not
+# an electrical constraint. The uDV drives the two EBS actuators (D1/D2) and
+# the SDC (D4) as three INDEPENDENT GPIOs; the coupling lives in as_actuation
+# policy, not in a wire. And "brakes actuated + SDC closed" is not a new state
+# at all — it is already the steady state of AS Ready (and of the T15.2 init
+# self-check, which fires each actuator in turn with the SDC closed on every
+# boot). The car is routinely braked-with-SDC-closed before it ever moves.
+# The uDV team will still run the narrow end-of-mission form past scrutineering
+# before a real run; if that push-back comes, this stays gated off.
+#
+# *** SAFE TO SHIP AHEAD OF FIRMWARE — but keep the gate closed for now. ***
+# The firmware compares /dv/status for EQUALITY against only the bytes it acts
+# on (READY=2, FINISHED=4, EMERGENCY=5, FAILED=6), so byte 7 is inert on today's
+# build — RUNNING=3 has always been "unknown" to it in exactly the same way. No
+# lockstep flash needed. `hard_stop_on_finish` still defaults FALSE, now for a
+# different reason than when it was written: not "unknown byte, unknown risk"
+# (that is resolved) but "the pairing has not been bench-validated yet".
+#
+# ONE EXCEPTION, and it is a footgun: in AS READY an unrecognised byte makes
+# `dv_ready` false and the uDV REFUSES GO — the car silently never launches.
+# So this byte must never be emitted while arming. mission_control gates its
+# emission on the real AS state being AS_DRIVING; see _current_dv_status.
 DV_STOPPING  = 7   # hard stop requested — brake to standstill, SDC stays closed
 
 # Free-run (always-on data-collection) default mission. When the free_run

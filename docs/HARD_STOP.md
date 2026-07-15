@@ -1,7 +1,9 @@
 # Hard stop on mission completion (DV_STOPPING)
 
-**Status: pipeline side implemented, INERT by default. Blocked on uDV firmware
-and on an unresolved rules question. Do not enable on the car yet.**
+**Status: pipeline side implemented and INERT by default. The rules question is
+ANSWERED and the firmware side is implemented (uDV#176, branch
+`feat/176-dv-stopping`). Remaining gate: joint bench validation. Do not enable
+on the car until that runs.**
 
 ## The problem
 
@@ -34,37 +36,46 @@ On mission completion (accel, autocross, trackdrive, skidpad): actuate the
 A "hard stop", not an emergency manoeuvre. Once at rest, the normal
 `/slam/finished` → `DV_FINISHED` → AS Finished path runs as it does today.
 
-## ⚠️ The unresolved question — read this before implementing the firmware side
+## The question we asked, and the answer (uDV#176)
 
-**The FS AS state table has no state with the EBS actuated and the SDC closed.**
+We asked: *the FS AS state table has no state with the EBS actuated and the SDC
+closed — so is there an actuation path to the pneumatics that is NOT the EBS
+trigger?*
 
-| AS state | EBS | SDC |
-|---|---|---|
-| AS Off | unavailable → armed | open |
-| AS Ready | **armed** | closed |
-| AS Driving | **armed** | closed |
-| AS Finished | **activated** | **open** |
-| AS Emergency | **activated** | **open** |
+**Answered, and the premise was a misreading.** That table describes **AS
+states, not an electrical constraint**.
 
-In AS Driving the EBS is *armed* — charged and ready — not *activated*. Both
-states that activate it also open the SDC. So "actuate the brakes but stay in
-AS Driving" is outside the state table as written.
+- **Independent of the SDC: yes.** The uDV drives the two EBS actuators
+  (`D1`/`D2`) and the AS SDC (`D4`) as **three independent GPIOs**. The coupling
+  between "fire the brakes" and "open the SDC" is a *policy* in
+  `as_actuation.hpp` — not a wire.
+- **"Brakes actuated + SDC closed" is not a new state at all.** It is already
+  the **steady state of AS Ready**: the EBS is released only in AS Driving or
+  with the ASMS off, and fired in every other state, while `sdc_open` is true
+  only in Finished/Emergency. On top of that the T15.2 init self-check fires
+  each actuator in turn, with the SDC closed, on **every boot**. The car is
+  routinely braked-with-SDC-closed before it ever moves.
+- **Independent of the EBS: no.** There is **no separate service brake**. The
+  only brake pneumatics *are* the two EBS actuators, and they are **binary** —
+  fire or release. Nothing to modulate, nothing to ramp.
 
-Whether that is legitimate reduces to one question for the mech/uDV side:
+### What that means for scope
 
-> **Is there an actuation path to the brake pneumatics that is NOT the EBS
-> trigger?**
+Because the actuators are binary, this is **not** an autonomous service brake
+and must not be used as one. It buys exactly one thing: **reaching standstill at
+the very end of the mission so AS Finished becomes reachable.**
 
-- **If yes** — the pneumatics can be commanded independently of the EBS
-  fail-safe trigger — then this is simply the **autonomous service brake**.
-  Normal, expected, and what the rules assume brings the car to rest before
-  AS Finished. Implement it; nothing here is controversial.
-- **If no** — the only path is the EBS trigger — then this asks the firmware to
-  fire the EBS *without* its mandated SDC opening. That is a **rules and
-  scrutineering question, not a code question**, and must be answered by a
-  human against the specific ruleset before anyone wires it up.
+> ⚠️ **`DV_STOPPING` is full brake pressure, every time. Keep
+> `hard_stop_on_finish` strictly end-of-mission. Never use it to modulate speed
+> during a run** — every application is an emergency-grade stop.
 
-This document does not answer that question. Tracked in `isc-fs/IFS08-DV-uDV`.
+`LapCounter.target_met` enforces this structurally: it only latches on the
+mission's completion criterion, so there is no path that applies it mid-run.
+
+The uDV team assessed that the narrow end-of-mission form does not need a rules
+escalation — it is the EBS bringing the car to rest at mission end, which is
+what it is for. They will still run it past scrutineering before a real run and
+report back on uDV#176. If scrutineering pushes back, this stays gated off.
 
 ## The contract
 
@@ -113,18 +124,47 @@ always outranks a tidy end-of-mission stop; once stopped, we are finished.
 
 ## Safety gating (pipeline side)
 
-1. **`hard_stop_on_finish` parameter, default FALSE.** Current firmware has no
-   case for byte 7 and its behaviour on an unknown `/dv/status` value is
-   unverified, so the byte is never emitted until the team enables it. With it
-   off the pipeline behaves exactly as today: the car coasts and finishes on
-   standstill.
+1. **`hard_stop_on_finish` parameter, default FALSE.** Note the reason has
+   changed since this was written. Unknown-byte risk is **resolved**: the
+   firmware compares `/dv/status` for equality against only the bytes it acts
+   on, so byte 7 is inert on today's build (`RUNNING=3` has always been
+   "unknown" to it in exactly the same way) and we can ship ahead of the
+   firmware with no lockstep flash. The gate now exists solely because **the
+   pairing has not been bench-validated**. With it off the pipeline behaves
+   exactly as today: the car coasts and finishes on standstill.
 2. **`ActiveLevel.RUNNING` only.** The free-run floor maps while a human drives;
    a stop request there would slam the brakes mid-manual-lap.
-3. **Latched.** `target_met` latches in the counter and `_stopping` latches in
+3. **Never while arming — `AS_DRIVING` only.** In AS Ready an unrecognised byte
+   makes `dv_ready` false and the uDV **refuses GO**: the car silently never
+   launches, with no obvious cause. `_current_dv_status` gates emission on the
+   real AS state, not just on the latch — the latch clears only on full
+   teardown, so a re-arm beating that reset would otherwise sit in AS Ready
+   asserting 7.
+4. **Latched.** `target_met` latches in the counter and `_stopping` latches in
    `mission_control`, so a flickering topic can never release a stop already
    under way.
-4. **Never for a mission with no completion criterion.** Skidpad has none today,
+5. **Never for a mission with no completion criterion.** Skidpad has none today,
    so it never requests a hard stop — see below.
+
+### Firmware-side safety properties (uDV#176)
+
+Worth knowing, because they shape what our side does *not* have to guard:
+
+- **ASMS-off wins.** A marshal pushing the car gets released brakes even if a
+  live pipeline is still asserting `STOPPING`. A stale 7 can never lock the
+  wheels during recovery.
+- **The byte can only ADD braking, never remove it** (asserted as a firmware
+  invariant).
+- **It never touches the SDC** — that is what keeps it a stop and not an
+  emergency.
+- **A stale link mid-stop does not release the brakes.** `dv_lost_driving`
+  trips Emergency on the same tick, which fires the EBS anyway. The failure
+  mode is "brakes stay on", not "car rolls".
+- **Gated on `mission_needs_pipeline`**, so a stray 7 cannot brake a standalone
+  mission.
+- **Torque is zeroed** (`0x507`) so the car does not brake against its own
+  drive. Steering is deliberately **not** inhibited — the wheels stay where you
+  put them rather than snapping to centre mid-stop.
 
 ## Per-mission status
 
@@ -156,5 +196,28 @@ un-latching `target_met` (releases a stop mid-brake), and colliding
 
 **Not covered:** the `cone_slam` node cannot run in the container (no gtsam), so
 its publish wiring is compile-checked only. And no test can prove the firmware
-side — that pairing needs a bench check once the uDV lands, starting with
-"does the car actually stop, and does the SDC stay closed?"
+pairing.
+
+## Joint bench validation (agreed on uDV#176)
+
+The firmware ships `BENCH_STUB_DV_STOPPING` (default 0, so dev stays
+flight-clean):
+
+```bash
+make BENCH="-DBENCH_STUB_DV_STOPPING=1"
+```
+
+With the stub, byte 7 is received, keeps the heartbeat fresh, and shows on
+`/debug` and in the pit-diag stub mask (`0x40`) — but does **not** fire the EBS
+and does **not** inhibit torque. So the whole handshake can be exercised while
+the car still only coasts. Each real stop costs an air recharge, which is why
+the first runs go this way.
+
+Agreed order:
+
+1. **Stub build** — emit `STOPPING`, confirm the handshake, `/debug`, and that
+   no valve fires.
+2. **Stub off, stationary** — confirm the valves fire and the SDC stays closed.
+3. **Rolling** — confirm stop → `FINISHED` → AS Finished.
+
+Only after (3) should `hard_stop_on_finish` be enabled for a real run.
