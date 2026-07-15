@@ -122,3 +122,72 @@ def test_reset_clears_state() -> None:
     c.reset()
     assert not c.finished and c.lap_count == 0
     assert c.update(0.0, 0.0, STOPPED) is False        # fresh: not armed yet
+
+
+# ---------------------------------------------------------------------
+# final_lap — the stop-anchor gate (#384 follow-up)
+#
+# Why this exists: control_node latched its stop anchor on the FIRST
+# big-orange gate past stop_latch_min_travel, so trackdrive braked to a stop
+# at the end of lap 1 and could never reach 10. It needs to know it is on the
+# closing lap BEFORE the gate. It cannot use `finished` for that — `finished`
+# requires standstill and the car only stops BECAUSE control braked, so gating
+# the anchor on it would deadlock.
+# ---------------------------------------------------------------------
+
+def test_final_lap_true_immediately_for_single_lap_missions():
+    """Autocross (1 lap): the first gate past the travel guard IS the finish,
+    so the gate must be transparent from tick zero."""
+    c = LapCounter(LapCounterConfig(laps_to_finish=1))
+    assert c.final_lap is True
+
+
+def test_final_lap_true_for_distance_missions():
+    """Accel finishes on distance, not laps — nothing to gate on."""
+    c = LapCounter(LapCounterConfig(finish_distance_m=75.0))
+    assert c.final_lap is True
+
+
+def test_final_lap_true_when_no_criterion():
+    """Skidpad has no completion criterion; must not silently disarm the
+    stop anchor and leave the car unable to ever stop."""
+    c = LapCounter(LapCounterConfig())
+    assert c.final_lap is True
+
+
+def test_final_lap_false_until_closing_lap_for_trackdrive():
+    """The actual fix: 10 laps → armed only for the 10th crossing."""
+    c = LapCounter(LapCounterConfig(laps_to_finish=10))
+    assert c.final_lap is False, "armed at lap 0 — would stop on lap 1"
+    for lap in range(1, 9):
+        _drive_out_and_back(c, MOVING)
+        assert c.lap_count == lap
+        assert c.final_lap is False, f"armed too early at lap {lap}"
+    _drive_out_and_back(c, MOVING)          # 9th crossing complete
+    assert c.lap_count == 9
+    assert c.final_lap is True, "not armed for the closing lap"
+
+
+def test_final_lap_stays_true_past_the_target():
+    """Overshoot must not disarm the anchor and send the car round again."""
+    c = LapCounter(LapCounterConfig(laps_to_finish=2))
+    _drive_out_and_back(c, MOVING)
+    assert c.final_lap is True
+    _drive_out_and_back(c, MOVING)
+    assert c.lap_count == 2
+    assert c.final_lap is True
+
+
+def test_trackdrive_finishes_only_after_ten_laps_and_standstill():
+    """End-to-end on the pure core: 10 laps then stop → finished exactly once."""
+    c = LapCounter(LapCounterConfig(laps_to_finish=10))
+    for _ in range(9):
+        _drive_out_and_back(c, MOVING)
+    assert not c.finished
+    # 10th crossing while still rolling — target met but not stopped yet.
+    c.update(20.0, 0.0, MOVING)
+    assert c.update(0.0, 0.0, MOVING) is False, "finished while still moving"
+    assert c.lap_count == 10
+    # Control brakes at the anchor; the car comes to rest on the line.
+    assert c.update(0.0, 0.0, STOPPED) is True
+    assert c.finished

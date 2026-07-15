@@ -522,6 +522,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # in a follow-up. Stays latched so a late mission_control
         # subscriber inherits the current value.
         self._finished_pub = None
+        self._final_lap_pub = None
 
     # ------------------------------------------------------------------
     # Run-memory reset
@@ -572,6 +573,9 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # set in on_configure) so counts start clean; a fresh node with no
         # resolved config yet gets a disabled counter (never finishes).
         self._lap_counter = LapCounter(getattr(self, "_finish_cfg", None))
+        # Last value published on /slam/final_lap; None = nothing sent yet, so
+        # a fresh run always re-announces even if it matches the last run's.
+        self._final_lap_published = None
 
     # ------------------------------------------------------------------
     # Lifecycle transitions
@@ -700,6 +704,16 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         )
         self._finished_pub = self.create_lifecycle_publisher(
             Bool, "/slam/finished", finished_qos
+        )
+        # /slam/final_lap — "the next finish gate is the closing one".
+        # control_node gates its stop-anchor latch on this so trackdrive
+        # brakes at lap 10 instead of lap 1. Deliberately separate from
+        # /slam/finished: that one requires standstill, and the car only
+        # stops BECAUSE control braked — gating the anchor on it deadlocks.
+        # Same latched QoS: control must inherit the current value whenever
+        # it (re)activates mid-run, not wait for the next edge.
+        self._final_lap_pub = self.create_lifecycle_publisher(
+            Bool, "/slam/final_lap", finished_qos
         )
 
         # TF broadcaster — non-lifecycle (tf2 doesn't ship lifecycle
@@ -835,6 +849,11 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # activate sees a defined latched state.
         if self._finished_pub is not None:
             self._finished_pub.publish(Bool(data=False))
+        # Same for /slam/final_lap — publish the mission's STARTING value,
+        # not a blanket false: for autocross/accel/skidpad final_lap is true
+        # from the first tick, and control must see that immediately or it
+        # would never arm its stop anchor for those missions.
+        self._publish_final_lap(force=True)
 
         return super().on_activate(state)
 
@@ -907,6 +926,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._gt_aligned_pub = None
         self._gt_error_pub = None
         self._finished_pub = None
+        self._final_lap_pub = None
 
         # tf2 broadcasters are not lifecycle-aware; drop the ref.
         # The static map→odom broadcaster was retired in #382 (map→odom
@@ -1217,6 +1237,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                         predicted_pose.x(), predicted_pose.y(),
                         self._current_speed()):
                     self._publish_finished()
+                self._publish_final_lap()
                 self._localize_scan(msg, stamp, predicted_pose, v_world)
                 return
             predicted_pose = self._graph.stage_odom_motion_step(
@@ -1356,6 +1377,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # it keeps counting after the first lap freezes mapping.
         if self._lap_counter.update(pred_x, pred_y, self._current_speed()):
             self._publish_finished()
+        self._publish_final_lap()
 
         # Mahalanobis DA stays disabled. Three variants tested on
         # 2026-04-29:
@@ -2252,6 +2274,29 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         )
         if self._finished_pub is not None:
             self._finished_pub.publish(Bool(data=True))
+
+    def _publish_final_lap(self, force: bool = False) -> None:
+        """Publish `/slam/final_lap` on change (latched, so edges suffice).
+
+        Edge-triggered rather than per-scan: the topic is TRANSIENT_LOCAL, so a
+        late or re-activating control_node inherits the last value anyway, and
+        republishing at 10 Hz would add nothing but bag weight. `force` fires
+        the initial value on activate regardless of the cached state.
+        """
+        if self._final_lap_pub is None:
+            return
+        value = self._lap_counter.final_lap
+        if not force and value == self._final_lap_published:
+            return
+        self._final_lap_published = value
+        self._final_lap_pub.publish(Bool(data=value))
+        self.get_logger().info(
+            f"/slam/final_lap → {value} ({self._lap_counter.summary()}) — "
+            f"control_node may now arm its stop anchor"
+            if value else
+            f"/slam/final_lap → {value} ({self._lap_counter.summary()}) — "
+            f"stop anchor held off until the closing lap"
+        )
 
     def _publish_cone_map(self, stamp) -> None:
         """Publish the persistent cone landmark database to /Conos.

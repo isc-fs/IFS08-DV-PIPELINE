@@ -74,6 +74,32 @@ class LapCounter:
     def enabled(self) -> bool:
         return self.cfg.laps_to_finish > 0 or self.cfg.finish_distance_m > 0.0
 
+    @property
+    def final_lap(self) -> bool:
+        """True once the NEXT finish-line crossing is the closing one.
+
+        This is what control_node gates its stop-anchor on. It needs to know it
+        is on the closing lap BEFORE it reaches the gate, so it can brake AT
+        the line instead of a lap early — which is why this cannot be derived
+        from `finished`: `finished` requires standstill, and the car only
+        reaches standstill BECAUSE control braked at the anchor. Gating the
+        anchor on `finished` would deadlock (never brake → never stop → never
+        finish). Hence a separate, earlier signal.
+
+        Missions with no lap criterion (accel's distance mode, skidpad) report
+        True: they have no lap to gate on, so the stop anchor keeps its
+        historical behaviour and `stop_latch_min_travel` remains the only gate.
+        Autocross (1 lap) is True from the start for the same reason — its
+        first gate past the travel threshold IS the finish.
+
+        Trackdrive (10 laps) is the only mission this actually changes: False
+        for laps 0..8, True from lap 9, so the anchor arms for the 10th and
+        final crossing.
+        """
+        if self.cfg.laps_to_finish <= 0:
+            return True
+        return self.lap_count >= self.cfg.laps_to_finish - 1
+
     def update(self, pose_x: float, pose_y: float, speed_mps: float) -> bool:
         """Feed one pose sample (SLAM-absolute, metres) plus the current
         planar speed (m/s). Returns True exactly once — on the scan where
