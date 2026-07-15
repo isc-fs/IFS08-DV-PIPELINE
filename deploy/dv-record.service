@@ -1,4 +1,4 @@
-# dv-record.service — race telemetry rosbag recorder.
+# dv-record.service — race rosbag recorder (full graph + raw /lidar_points).
 # Pulled in automatically by dv-pipeline.service (WantedBy below + enable),
 # so every racing start (race boot, `dv race`, `dv restart`) records a bag.
 # PartOf= propagates stop/restart from the pipeline: `dv stop` also stops
@@ -10,7 +10,7 @@
 #   sudo ~/dv_ws/src/IFS08-DV-PIPELINE/deploy/install_dv_pipeline_service.sh
 
 [Unit]
-Description=ISC DV rosbag recorder (race telemetry)
+Description=ISC DV rosbag recorder (full graph + raw lidar cloud)
 Documentation=https://github.com/isc-fs/IFS08-DV-PIPELINE
 After=dv-pipeline.service
 PartOf=dv-pipeline.service
