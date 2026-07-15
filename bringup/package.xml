@@ -47,6 +47,9 @@
   <exec_depend>mode_manager</exec_depend>
   <exec_depend>mission_control</exec_depend>
   <exec_depend>sim_supervisor</exec_depend>
+  <!-- Independent pipeline supervisor, launched by management_actions() on
+       both the sim and car profiles (see launch_common.watchdog_action). -->
+  <exec_depend>pipeline_watchdog</exec_depend>
   <exec_depend>cone_detection</exec_depend>
   <exec_depend>cone_slam</exec_depend>
   <exec_depend>path_planning</exec_depend>
