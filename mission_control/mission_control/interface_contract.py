@@ -53,6 +53,31 @@ DV_RUNNING   = 3   # activated, emitting /ctrl/cmd
 DV_FINISHED  = 4   # mission complete (was RuntimeControl outcome=finished)
 DV_EMERGENCY = 5   # pipeline raised EBS (was outcome=emergency)
 DV_FAILED    = 6   # prepare/activate error (was Result success=false/error)
+# DV_STOPPING — "mission over, bring the car to rest NOW, but this is not an
+# emergency". Requested when the mission criterion is met while the car is
+# still rolling; the pipeline holds it until standstill, then reports
+# DV_FINISHED and the uDV runs the normal AS Finished actuation.
+#
+# It exists because the pipeline has NO braking authority: regen is commanded
+# and relayed but does nothing on the vehicle, so the car only coasts. The EBS
+# is the only thing that can actually stop it.
+#
+# *** REQUIRES FIRMWARE SUPPORT — INERT UNTIL uDV IMPLEMENTS IT. ***
+# mission_control only emits this byte when its `hard_stop_on_finish`
+# parameter is true, which defaults FALSE precisely because current firmware
+# has no case for byte 7 and its behaviour on an unknown value is unverified.
+# Do not enable until the uDV side lands and the pairing is bench-checked.
+#
+# *** UNRESOLVED — the semantics are a rules question, not a code question. ***
+# The FS AS state table has no state with the EBS ACTUATED and the SDC CLOSED:
+# in AS Driving the EBS is "Armed", and both AS Finished and AS Emergency
+# actuate it *and* open the SDC. So "actuate the brakes but stay in AS Driving"
+# is only legitimate if the pneumatics have an actuation path that is NOT the
+# EBS trigger — i.e. if this is the autonomous SERVICE brake, which is normal
+# and expected. If the only path is the EBS trigger, this asks the firmware to
+# fire the EBS without its mandated SDC opening, and that needs a rules /
+# scrutineering answer before anyone implements it. See isc-fs/IFS08-DV-uDV.
+DV_STOPPING  = 7   # hard stop requested — brake to standstill, SDC stays closed
 
 # Free-run (always-on data-collection) default mission. When the free_run
 # flag is set, mission_control brings the autonomy floor — everything but
@@ -72,6 +97,12 @@ TOPIC_AMI_MISSION = "/ami/mission"
 TOPIC_DV_STATUS   = "/dv/status"
 TOPIC_CTRL_CMD    = "/ctrl/cmd"
 SERVICE_FORCE_EBS = "/force_ebs"
+
+# DVPC-INTERNAL: slam → mission_control. "The mission criterion is met but the
+# car is still rolling" — the trigger for the DV_STOPPING hard stop. Distinct
+# from /slam/finished, which additionally requires standstill; see
+# cone_slam.lap_counter for why the two must not be conflated.
+TOPIC_SLAM_STOP_REQUEST = "/slam/stop_request"
 
 # Heartbeat liveness bound (seconds) — the canonical value shared by both
 # directions. Each byte topic above is the other side's liveness heartbeat;

@@ -220,6 +220,19 @@ class MissionControlNode(LifecycleNode):
         self.declare_parameter("free_run", False)
         self._free_run: bool = False
 
+        # hard_stop_on_finish — emit DV_STOPPING when the mission criterion is
+        # met while the car is still rolling, asking the uDV to brake it to
+        # rest (SDC closed, NOT an emergency). See interface_contract.
+        #
+        # Defaults FALSE and MUST stay false until the firmware side lands:
+        # current uDV has no case for byte 7 and its behaviour on an unknown
+        # /dv/status value is unverified, so shipping this enabled would be
+        # changing car behaviour on an unproven contract. With it off the
+        # pipeline behaves exactly as before — the car coasts to rest and
+        # finishes on standstill.
+        self.declare_parameter("hard_stop_on_finish", False)
+        self._hard_stop_on_finish: bool = False
+
         self._mission_id_to_name: dict[int, str] = dict(MISSION_ID_TO_NAME)
 
         # Reentrant group: the reconcile timer issues async activate_mode
@@ -240,6 +253,7 @@ class MissionControlNode(LifecycleNode):
         self._sub_ctrl_cmd = None
         self._sub_ctrl_emergency = None
         self._sub_slam_finished = None
+        self._sub_slam_stop_request = None
         self._sub_mode_manager_progress = None
 
         # --- uDV uplink state ---
@@ -263,6 +277,10 @@ class MissionControlNode(LifecycleNode):
         self._failed: bool = False
         self._finished: bool = False
         self._emergency: bool = False
+        # Hard-stop request in flight: mission criterion met, car not yet
+        # stopped. Latched for the run — a flicker must never release a stop
+        # already under way. Cleared with the other latches on a fresh cycle.
+        self._stopping: bool = False
         self._ebs_requested: bool = False   # set only when /force_ebs acks
         self._ebs_future = None             # in-flight /force_ebs call, if any
 
@@ -281,9 +299,12 @@ class MissionControlNode(LifecycleNode):
     # ------------------------------------------------------------------
     def on_configure(self, state: State) -> TransitionCallbackReturn:
         self._free_run = bool(self.get_parameter("free_run").value)
+        self._hard_stop_on_finish = bool(
+            self.get_parameter("hard_stop_on_finish").value)
         self.get_logger().info(
             "on_configure: creating reconciler I/O + activate_mode client "
-            f"(free_run={self._free_run})")
+            f"(free_run={self._free_run}, "
+            f"hard_stop_on_finish={self._hard_stop_on_finish})")
 
         self._activate_mode_client = self.create_client(
             ActivateMode, "/activate_mode", callback_group=self._cb_group)
@@ -332,6 +353,9 @@ class MissionControlNode(LifecycleNode):
         self._sub_slam_finished = self.create_subscription(
             Bool, "/slam/finished", self._on_slam_finished, _LATCHED_QOS,
             callback_group=self._cb_group)
+        self._sub_slam_stop_request = self.create_subscription(
+            Bool, TOPIC_SLAM_STOP_REQUEST, self._on_slam_stop_request,
+            _LATCHED_QOS, callback_group=self._cb_group)
         self._sub_mode_manager_progress = self.create_subscription(
             LifecycleProgress, "/mode_manager/progress",
             self._on_mode_manager_progress, 20, callback_group=self._cb_group)
@@ -438,6 +462,42 @@ class MissionControlNode(LifecycleNode):
             self._request_ebs()
             self._publish_dv_status(DV_EMERGENCY)
 
+    def _on_slam_stop_request(self, msg: Bool) -> None:
+        """SLAM says the mission criterion is met while the car is still
+        rolling → ask the uDV for a hard stop (DV_STOPPING).
+
+        This is NOT an emergency and must not be treated as one: no /force_ebs,
+        no DV_EMERGENCY, no AS Emergency. The uDV is expected to actuate the
+        brakes, hold the SDC closed and stay in AS Driving until the car is at
+        rest, at which point /slam/finished rises and the normal AS Finished
+        actuation takes over.
+
+        Gated three ways, all deliberate:
+          * `hard_stop_on_finish` (default FALSE) — the byte is inert until the
+            firmware implements it. Current uDV has no case for byte 7 and its
+            behaviour on an unknown value is unverified, so this must not ship
+            enabled.
+          * ActiveLevel.RUNNING — the free-run floor maps while a human drives;
+            a stop request there would slam the brakes mid-manual-lap.
+          * latched — once requested it stays requested for the run, so a
+            flickering topic cannot release a stop already under way.
+        """
+        if not msg.data or self._stopping:
+            return
+        if self._active_level is not ActiveLevel.RUNNING:
+            return
+        if not self._hard_stop_on_finish:
+            self.get_logger().info(
+                f"{TOPIC_SLAM_STOP_REQUEST} rising but hard_stop_on_finish is "
+                f"off — not requesting DV_STOPPING; the car will coast to rest "
+                f"and finish on standstill as before")
+            return
+        self.get_logger().warn(
+            f"{TOPIC_SLAM_STOP_REQUEST} rising — requesting DV_STOPPING "
+            f"(hard stop to standstill; SDC stays closed, NOT an emergency)")
+        self._stopping = True
+        self._publish_dv_status(DV_STOPPING)
+
     def _on_slam_finished(self, msg: Bool) -> None:
         # Only a live run (ActiveLevel.RUNNING) can "finish". While the
         # free-run FLOOR is mapping, a slam lap-complete must NOT latch
@@ -529,6 +589,7 @@ class MissionControlNode(LifecycleNode):
                 and not should_request_ebs(as_state)):
             self._failed = self._finished = False
             self._emergency = False
+            self._stopping = False
             self._ebs_requested = False
             self._ebs_future = None
 
@@ -638,6 +699,12 @@ class MissionControlNode(LifecycleNode):
             return DV_EMERGENCY
         if self._finished:
             return DV_FINISHED
+        # Below FINISHED (once stopped we ARE finished) and below EMERGENCY (a
+        # real fault always outranks a tidy end-of-mission stop), but above
+        # FAILED: a prepare/activate error cannot happen mid-run, and if it
+        # somehow did, a car already braking to rest should keep braking.
+        if self._stopping:
+            return DV_STOPPING
         if self._failed:
             return DV_FAILED
 
