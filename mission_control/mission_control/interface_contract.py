@@ -73,6 +73,15 @@ TOPIC_DV_STATUS   = "/dv/status"
 TOPIC_CTRL_CMD    = "/ctrl/cmd"
 SERVICE_FORCE_EBS = "/force_ebs"
 
+# DVPC-INTERNAL emergency channel — not part of the uDV wire contract above.
+# pipeline_watchdog (the independent supervisor) latches this true when the
+# autonomy stack goes stale while running; mission_control turns the rising
+# edge into /force_ebs + DV_EMERGENCY, exactly as it does for /ctrl/emergency.
+# It lives here — rather than in pipeline_watchdog — because pipeline_watchdog
+# already depends on this module for DV_RUNNING, and defining it the other way
+# round would make the two packages circular.
+TOPIC_WATCHDOG_EMERGENCY = "/watchdog/emergency"
+
 # Heartbeat liveness bound (seconds) — the canonical value shared by both
 # directions. Each byte topic above is the other side's liveness heartbeat;
 # a side reconciles/trips to its safe state when the other's heartbeat has
