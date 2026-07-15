@@ -99,6 +99,19 @@ class ConeDetectionConfig:
     dbscan_eps: float = 0.3
     dbscan_min_samples: int = 2
 
+    # Tall-column veto (tire walls, fences, people): before DBSCAN, drop EVERY
+    # point whose xy grid cell (3x3-dilated) contains a return more than
+    # tall_column_veto_height_m above the fitted ground plane. No cone exceeds
+    # cluster_height_max_m, so such a return proves non-cone structure in that
+    # column; vetoing the whole column also removes the structure's cone-height
+    # low band, which a plain z-crop would leave behind as truncated stumps.
+    # Tire-wall scans (~40-90k DBSCAN points, seconds) collapse back to normal
+    # (~ms) at zero measured cone change; scans with nothing tall skip the
+    # masking entirely.
+    tall_column_veto: bool = True
+    tall_column_veto_height_m: float = 0.75
+    tall_column_veto_cell_m: float = 0.30
+
     # Template (a, b) solver: "gn" = in-process Numba Gauss-Newton/LM
     # (production default); any scipy.optimize.minimize method name
     # (e.g. "L-BFGS-B", the previous default) selects the scipy path for A/B.
@@ -176,6 +189,34 @@ def _fit_cluster(
     )
 
 
+# Grid cells are keyed as i * stride + j, injective while |j| < stride / 2.
+# With the 25 m input crop and the 0.3 m default cell, |i|, |j| <= ~90.
+_VETO_KEY_STRIDE = 1 << 20
+
+
+def _tall_column_veto_mask(
+    xy: np.ndarray, height_above_ground: np.ndarray, cfg: ConeDetectionConfig
+) -> np.ndarray | None:
+    """Keep-mask over points, vetoing xy columns that contain a tall return.
+
+    Returns ``None`` when no point exceeds ``tall_column_veto_height_m`` (the
+    common case) so the caller can skip masking entirely.
+    """
+    tall = height_above_ground > cfg.tall_column_veto_height_m
+    if not tall.any():
+        return None
+    ij = np.floor(xy / cfg.tall_column_veto_cell_m).astype(np.int64)
+    keys = ij[:, 0] * _VETO_KEY_STRIDE + ij[:, 1]
+    tall_keys = np.unique(keys[tall])
+    # 3x3 dilation in key space: cell (i+di, j+dj) has key + di*stride + dj.
+    offsets = np.array(
+        [di * _VETO_KEY_STRIDE + dj for di in (-1, 0, 1) for dj in (-1, 0, 1)],
+        dtype=np.int64,
+    )
+    veto_keys = np.unique((tall_keys[:, None] + offsets).ravel())
+    return ~np.isin(keys, veto_keys)
+
+
 def clustering_separation_rt(
     data: np.ndarray,
     config: ConeDetectionConfig | None = None,
@@ -235,6 +276,27 @@ def clustering_separation_rt(
         if stage_timings is not None:
             stage_timings["dbscan_ms"] = 0.0
         return np.array([]), data, def_coefs
+    if cfg.tall_column_veto:
+        t_veto = time.perf_counter()
+        # Ground height in the rotated frame: distance from the LiDAR origin
+        # to the plane (same formula as the per-cluster floor cull below).
+        v = np.array([0, 0, -1 * def_coefs[0]])
+        w = np.array(def_coefs[1:])
+        floor_z = np.dot(v, w) / np.linalg.norm(w)
+        keep = _tall_column_veto_mask(data[:, :2], data[:, 2] - floor_z, cfg)
+        n_vetoed = 0
+        if keep is not None:
+            n_vetoed = int(len(keep) - keep.sum())
+            data = data[keep]
+        if stage_timings is not None:
+            stage_timings["column_veto_ms"] = (
+                time.perf_counter() - t_veto
+            ) * 1000.0
+            stage_timings["n_vetoed"] = float(n_vetoed)
+        if len(data) == 0:
+            if stage_timings is not None:
+                stage_timings["dbscan_ms"] = 0.0
+            return np.array([]), data, def_coefs
     clust_model = clustering_class(
         eps=cfg.dbscan_eps, min_samples=cfg.dbscan_min_samples
     )
@@ -322,15 +384,16 @@ class RealtimeConeDetector:
         residuals_kept: list[float] = []
         t_fit = time.perf_counter()
 
+        v = np.array([0, 0, -1 * def_coefs[0]])
+        w = np.array(def_coefs[1:])
+        lidar_distance_to_floor = np.dot(v, w) / np.linalg.norm(w)
+
         for cone in separated_data:
             if len(cone) < cfg.min_cluster_points:
                 continue
             if debug_counters is not None:
                 debug_counters["after_min_pts"] += 1
 
-            v = np.array([0, 0, -1 * def_coefs[0]])
-            w = np.array(def_coefs[1:])
-            lidar_distance_to_floor = np.dot(v, w) / np.linalg.norm(w)
             clean_cone = cone[cone[:, 2] > cfg.floor_margin_m + lidar_distance_to_floor]
             if len(clean_cone) == 0:
                 continue
