@@ -58,27 +58,30 @@ dv stop           # stop everything (pipeline + manual)
 dv status         # shows dv-manual + dv-automission state + last bag
 ```
 
-### Automatic on AMI Manual (the default)
+### Recording is gated on mission selection
 
-You normally don't run `dv manual` by hand. `dv-automission.service` (enabled at
-boot) watches `/ami/mission` and reconciles the manual recorder to it:
+You don't run `dv manual` by hand. `dv-automission.service` (enabled at boot)
+watches `/ami/mission` and starts the manual recorder **only when you confirm
+Manual** on the AMI — recording is gated on the mission you select:
 
-| AMI selection | Automission does |
-|---|---|
-| **Manual (0)**, no pipeline | **starts** `dv-manual` → records |
-| a real DV mission (1–9) | **stops** `dv-manual` (so `dv race` gets a clean Hesai + its own recorder) |
-| `/ami/mission` not seen | leaves current state (no thrash on an agent blip) |
-| `/etc/dv/norecord` present | stops + stays idle |
+| `/ami/mission` | Meaning | Automission does |
+|---|---|---|
+| **0** | Manual **confirmed** | **starts** `dv-manual` → sensor bag |
+| **1–9** | a real mission confirmed | **stops** `dv-manual` (`dv race` records the full bag) |
+| **-1** | up, nothing confirmed | leaves state (not Manual — no recording) |
+| not seen | uDV/agent silent | leaves state (no thrash) |
+| `/etc/dv/norecord` | opt-out | stops + stays idle |
 
-Manual is index 0 = the default, so **power on with the dial at Manual → it
-records itself**, no pipeline, no commands to the car. Dial a real mission and
-`dv race`; dial back to Manual after `dv stop` and it resumes (within ~2 s).
+**To record a manual bag: select + confirm Manual on the AMI.** Nothing records
+until you do — so there's no stray power-on bag and no clash with `dv race` over
+the lidar. Confirm a real mission instead → the manual recorder releases and
+`dv race` records the full mission bag (`dv race` also stops `dv-manual` first,
+belt-and-braces, so the two never fight over the Hesai driver).
 
-> ⚠️ **Blocked on isc-fs/IFS08-DV-uDV#189.** Auto-trigger only fires if the uDV
-> publishes `/ami/mission` with the **ASMS off** (manual driving). Until that
-> lands, `/ami/mission` isn't seen in this state and the watcher stays **idle** —
-> `dv manual` by hand still works. Once the uDV confirms, no pipeline change is
-> needed.
+> Per uDV#189 the AMI emits an index only on **confirm** (not dial position), and
+> `/ami/mission` publishes continuously with the ASMS off — so confirming Manual
+> works during manual driving with no pipeline. `dv manual` by hand still works
+> too.
 
 **Opt out:** `touch /etc/dv/norecord` (honoured live) or
 `sudo systemctl disable --now dv-automission.service`.
