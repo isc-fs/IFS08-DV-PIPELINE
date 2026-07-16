@@ -37,6 +37,12 @@ Public API used by the launch files:
                          sits between control_node and the bridge) and
                          the real-car layout (supervisor omitted, the
                          on-vehicle uDV handles the same role).
+                         Also brings up the independent pipeline
+                         watchdog on both profiles.
+
+  watchdog_action()      The independent pipeline supervisor — a plain
+                         Node (never lifecycle) so mode_manager cannot
+                         tear down the thing that watches it.
 """
 from __future__ import annotations
 
@@ -45,7 +51,7 @@ from typing import Iterable
 from launch.actions import EmitEvent, RegisterEventHandler
 from launch.events import matches_action
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import LifecycleNode
+from launch_ros.actions import LifecycleNode, Node
 from launch_ros.event_handlers import OnStateTransition
 from launch_ros.events.lifecycle import ChangeState
 from launch_ros.parameter_descriptions import ParameterValue
@@ -208,9 +214,33 @@ def autonomy_actions(profile: str = "sim") -> list:
     ]
 
 
+def watchdog_action() -> list:
+    """The independent pipeline supervisor (pipeline_watchdog_node).
+
+    Deliberately a PLAIN Node — not a LifecycleNode, and not part of
+    autonomy_actions(): it comes up with the management trio and stays up for
+    the whole session, so mode_manager can never configure, deactivate or tear
+    down the thing that supervises it. It needs no launch-time mission wiring
+    because it arms itself off /dv/status == DV_RUNNING.
+
+    Included in BOTH the sim and car profiles: a watchdog that only exists on
+    one of them is a watchdog whose false-trip behaviour is discovered on the
+    vehicle.
+    """
+    return [Node(
+        package="pipeline_watchdog",
+        executable="pipeline_watchdog_node",
+        name="pipeline_watchdog_node",
+        namespace="",
+        output="screen",
+        parameters=use_sim_time_params(),
+    )]
+
+
 def management_actions(
     include_sim_supervisor: bool = True,
     free_run=None,
+    hard_stop_on_finish=None,
 ) -> list:
     """Pre-baked management trio, all auto-active.
 
@@ -228,18 +258,30 @@ def management_actions(
             mission_control's `free_run` parameter — the always-on
             data-collection floor. None (sim/full) leaves the node
             default (off).
+        hard_stop_on_finish: if given, sets mission_control's
+            `hard_stop_on_finish` parameter — emit DV_STOPPING (an ASB
+            hard stop to standstill) at mission end. SAFETY-CRITICAL:
+            leave None / false for every normal run; only ever set true
+            for a bench-validated run with byte-7 firmware flashed. See
+            docs/HARD_STOP.md and docs/HARD_STOP_BENCH.md. None leaves the
+            node default (false).
     """
     actions: list = []
     actions += auto_active("mode_manager", "mode_manager_node", "mode_manager_node")
-    mc_params = None
+    mc_params_dict = {}
     if free_run is not None:
-        mc_params = [{
-            "free_run": ParameterValue(free_run, value_type=bool),
-        }]
+        mc_params_dict["free_run"] = ParameterValue(free_run, value_type=bool)
+    if hard_stop_on_finish is not None:
+        mc_params_dict["hard_stop_on_finish"] = ParameterValue(
+            hard_stop_on_finish, value_type=bool)
+    mc_params = [mc_params_dict] if mc_params_dict else None
     actions += auto_active(
         "mission_control", "mission_control_node", "mission_control_node",
         parameters=mc_params,
     )
+    # Independent supervisor, after mission_control so /dv/status has a
+    # publisher to latch from at discovery (DDS would cope either way).
+    actions += watchdog_action()
     if include_sim_supervisor:
         # sim_supervisor needs /imu + /motor_rpm + /steering + /brake +
         # /control_command remapped onto /fsds/* so its OdometryFilter

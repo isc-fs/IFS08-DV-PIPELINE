@@ -34,22 +34,37 @@ mkdir -p "$BK"
 
 for f in /etc/systemd/system/dv-pipeline.service \
          /etc/systemd/system/dv-record.service \
+         /etc/systemd/system/dv-manual.service \
+         /etc/systemd/system/dv-automission.service \
          /usr/local/bin/dv \
          /usr/local/bin/dv_mode_boot.sh \
          /usr/local/bin/dv_detect_mode.sh \
          /usr/local/bin/dv_record.sh \
+         /usr/local/bin/dv_manual.sh \
+         /usr/local/bin/dv_automission.sh \
          /usr/local/bin/dv_warm_numba.sh \
          /etc/profile.d/zz-dv-mode-prompt.sh; do
   [ -f "$f" ] && cp -a "$f" "$BK/" && echo "backed up $f"
 done
 
-install -m 644 "$HERE/dv-pipeline.service" /etc/systemd/system/dv-pipeline.service
-install -m 644 "$HERE/dv-record.service"   /etc/systemd/system/dv-record.service
-install -m 755 "$HERE/dv"                  /usr/local/bin/dv
-install -m 755 "$HERE/dv_mode_boot.sh"     /usr/local/bin/dv_mode_boot.sh
-install -m 755 "$HERE/dv_detect_mode.sh"   /usr/local/bin/dv_detect_mode.sh
-install -m 755 "$HERE/dv_record.sh"        /usr/local/bin/dv_record.sh
-install -m 755 "$HERE/dv_warm_numba.sh"    /usr/local/bin/dv_warm_numba.sh
+install -m 644 "$HERE/dv-pipeline.service"   /etc/systemd/system/dv-pipeline.service
+install -m 644 "$HERE/dv-record.service"     /etc/systemd/system/dv-record.service
+install -m 644 "$HERE/dv-manual.service"     /etc/systemd/system/dv-manual.service
+install -m 644 "$HERE/dv-automission.service" /etc/systemd/system/dv-automission.service
+install -m 755 "$HERE/dv"                     /usr/local/bin/dv
+install -m 755 "$HERE/dv_mode_boot.sh"        /usr/local/bin/dv_mode_boot.sh
+install -m 755 "$HERE/dv_detect_mode.sh"      /usr/local/bin/dv_detect_mode.sh
+install -m 755 "$HERE/dv_record.sh"           /usr/local/bin/dv_record.sh
+install -m 755 "$HERE/dv_manual.sh"           /usr/local/bin/dv_manual.sh
+install -m 755 "$HERE/dv_automission.sh"      /usr/local/bin/dv_automission.sh
+install -m 755 "$HERE/dv_warm_numba.sh"       /usr/local/bin/dv_warm_numba.sh
+
+# Enable the auto-record watcher at boot so "dial at Manual → record" is the
+# default. It is inert until the uDV publishes /ami/mission with the ASMS off
+# (isc-fs/IFS08-DV-uDV#189), and honours /etc/dv/norecord as the opt-out.
+systemctl daemon-reload
+systemctl enable dv-automission.service
+echo "enabled dv-automission.service (auto-record on AMI Manual; opt out: touch /etc/dv/norecord)"
 
 # Boot-mode override dir: isc-owned so `dv mode {race|umbilical|auto}` can
 # write /etc/dv/mode without sudo. dv_detect_mode.sh reads it (root) at boot.

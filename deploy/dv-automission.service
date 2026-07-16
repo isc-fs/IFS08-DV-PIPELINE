@@ -1,0 +1,32 @@
+# dv-automission.service — record a manual sensor bag when Manual is confirmed.
+# Always-on watcher: subscribes /ami/mission and starts dv-manual.service (the
+# sensors-only recorder) when Manual (index 0) is CONFIRMED on the AMI and the
+# pipeline is not running; stops it when a real mission is confirmed. Recording
+# is GATED ON MISSION SELECTION — nothing records until you confirm a mission,
+# so no spurious power-on bag and no Hesai clash with `dv race`. No autonomy, no
+# commands to the car — read /ami/mission, drive a local systemd unit.
+#
+# ENABLED at boot by the installer. To record a manual bag: select + confirm
+# Manual on the AMI (one deliberate action; per uDV#189 the AMI emits an index
+# only on confirm). Opt out with `touch /etc/dv/norecord` (live) or
+# `sudo systemctl disable --now dv-automission.service`.
+#
+# Versioned in IFS08-DV-PIPELINE/deploy/ — install with
+#   sudo ~/dv_ws/src/IFS08-DV-PIPELINE/deploy/install_dv_pipeline_service.sh
+
+[Unit]
+Description=ISC DV manual-bag recorder, gated on AMI Manual confirm (/ami/mission)
+Documentation=https://github.com/isc-fs/IFS08-DV-PIPELINE
+# Needs the uDV micro-ROS stream to see /ami/mission at all.
+After=network.target microros-agent.service
+Wants=microros-agent.service
+
+[Service]
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+User=isc
+ExecStart=/usr/local/bin/dv_automission.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

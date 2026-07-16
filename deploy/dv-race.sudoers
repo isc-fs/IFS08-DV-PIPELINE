@@ -5,4 +5,7 @@
 # before the real-pipeline switch, and that rename missed THIS file, so
 # `sudo -n systemctl start dv-pipeline.service` needed a password and both
 # `[r]` and `dv race` failed with "Could not start automatically".
-isc ALL=(root) NOPASSWD: /usr/bin/systemctl start dv-pipeline.service, /usr/bin/systemctl stop dv-pipeline.service, /usr/bin/systemctl restart dv-pipeline.service
+# dv-manual.service is the manual-driving recorder (sensors only) started by
+# `dv manual` / stopped by `dv manual stop` or `dv stop` (which stops both
+# units in one call, hence dv-manual named alongside dv-pipeline in the stop rule).
+isc ALL=(root) NOPASSWD: /usr/bin/systemctl start dv-pipeline.service, /usr/bin/systemctl stop dv-pipeline.service, /usr/bin/systemctl restart dv-pipeline.service, /usr/bin/systemctl start dv-manual.service, /usr/bin/systemctl stop dv-manual.service, /usr/bin/systemctl stop dv-pipeline.service dv-manual.service

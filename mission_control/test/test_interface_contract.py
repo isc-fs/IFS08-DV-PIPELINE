@@ -28,9 +28,11 @@ from mission_control.interface_contract import (  # noqa: E402
     DV_FINISHED,
     DV_EMERGENCY,
     DV_FAILED,
+    DV_STOPPING,
     HEARTBEAT_STALE_S,
     HEARTBEAT_STALE_CAP_S,
     ami_index_to_mission_id,
+    is_known_ami_index,
     mission_id_to_ami_index,
 )
 
@@ -43,9 +45,20 @@ def test_as_state_bytes_match_fs_rules():
 
 def test_dv_status_bytes_are_distinct_and_ordered():
     bytes_ = [DV_IDLE, DV_PREPARING, DV_READY, DV_RUNNING,
-              DV_FINISHED, DV_EMERGENCY, DV_FAILED]
-    assert bytes_ == [0, 1, 2, 3, 4, 5, 6]
+              DV_FINISHED, DV_EMERGENCY, DV_FAILED, DV_STOPPING]
+    assert bytes_ == [0, 1, 2, 3, 4, 5, 6, 7]
     assert len(set(bytes_)) == len(bytes_)
+
+
+def test_dv_stopping_is_not_an_emergency_byte():
+    """DV_STOPPING is a HARD STOP, not an emergency: the uDV must brake to
+    rest with the SDC closed and stay in AS Driving. If this ever collides
+    with DV_EMERGENCY the firmware would open the SDC on a normal mission
+    end — a DNF at best. The byte is mirrored by hand in uDV dv_interface.h
+    (no build-time link), so pin it here."""
+    assert DV_STOPPING == 7
+    assert DV_STOPPING != DV_EMERGENCY
+    assert DV_STOPPING != DV_FINISHED
 
 
 def test_heartbeat_stale_window_is_under_fs_rules_cap():
@@ -134,3 +147,43 @@ def test_mission_id_to_ami_index_round_trips():
 def test_mission_id_to_ami_index_zero_is_manual():
     assert mission_id_to_ami_index(0) == 0
     assert mission_id_to_ami_index(99) == 0
+
+
+# ---------------------------------------------------------------------
+# AMI table — confirmed against firmware source 2026-07-15 (uDV#178).
+# Authority: Core/Inc/mission.h + Core/Src/mission_registry.cpp.
+# ---------------------------------------------------------------------
+
+def test_ami_table_matches_confirmed_firmware_codes():
+    """Pins the mapping the uDV team verified against mission_registry.cpp."""
+    assert ami_index_to_mission_id(1) == 3   # MISSION_ACCEL      → accel
+    assert ami_index_to_mission_id(2) == 4   # MISSION_SKIDPAD    → skidpad
+    assert ami_index_to_mission_id(3) == 2   # MISSION_AUTOCROSS  → autocross
+    assert ami_index_to_mission_id(4) == 1   # MISSION_TRACKDRIVE → trackdrive
+
+
+def test_non_pipeline_ami_codes_map_to_no_mission():
+    """0 Manual, 5 EBS test (TBD/inert), 6 Inspection (standalone),
+    7 Shutdown, 8/9 aux — the uDV ignores our bytes for all of these."""
+    for idx in (0, 5, 6, 7, 8, 9):
+        assert ami_index_to_mission_id(idx) == 0
+
+
+def test_known_vs_unknown_ami_index_is_distinguishable():
+    """Both map to 0, but they are NOT the same event. An unmapped index means
+    the AMI is sending something the table has never heard of — Autonomous Demo
+    being the live example, which has no assigned index. Firmware-side that is
+    a refused GO, so a car that won't launch for no stated reason. The node
+    logs a warning off this; without it the two are indistinguishable."""
+    for idx in range(10):
+        assert is_known_ami_index(idx), f"index {idx} should be in the table"
+    for idx in (10, 11, 99, -1):
+        assert not is_known_ami_index(idx)
+        assert ami_index_to_mission_id(idx) == 0   # still fails safe
+
+
+def test_unknown_ami_index_never_starts_a_mission():
+    """The fail-safe half: whatever we log, an unknown index must never
+    dispatch a runnable mission."""
+    for idx in (10, 42, -5, 1000):
+        assert ami_index_to_mission_id(idx) == 0

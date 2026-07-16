@@ -29,9 +29,28 @@
 #                             incl. /lidar_points). e.g. '^/lidar_points$'
 #   DV_RECORD_BEST_EFFORT     space-separated topics to force a best-effort
 #                             reader on          (default "/lidar_points")
-#   DV_RECORD_WARMUP_TIMEOUT  seconds to wait for /dv/status  (default 90)
+#   DV_RECORD_WARMUP_TIMEOUT  seconds to wait for the warmup topic (default 90)
 #   DV_RECORD_MIN_FREE_GB     refuse to record below this free space (default 20)
+#   DV_RECORD_WARMUP_TOPIC    topic whose presence means "graph is up"
+#                             (default /dv/status — the pipeline heartbeat)
+#   DV_RECORD_WARMUP_METHOD   how to test it: "echo" (default; needs a RELIABLE
+#                             topic like /dv/status) or "exists" (topic merely
+#                             advertised in `ros2 topic list` — use for
+#                             best-effort sensor topics like /lidar_points,
+#                             which a reliable `echo` reader never sees)
+#   DV_RECORD_MODE_LABEL      bag-name prefix. If unset, the label is the
+#                             CONFIRMED AMI mission name (accel / skidpad /
+#                             autocross / trackdrive) so pipeline bags are named
+#                             by the mission they ran; falls back to /run/dv_mode
+#                             (race / umbilical) when unresolved. dv_manual.sh
+#                             sets "manual".
 # Opt-out: `touch /etc/dv/norecord` (isc-owned dir) disables recording.
+#
+# Manual driving (no pipeline): deploy/dv_manual.sh launches ONLY the sensor
+# layer and execs this script with WARMUP_TOPIC=/lidar_points, METHOD=exists,
+# MODE_LABEL=manual — so the same record core captures a manual-driving bag
+# (full sensor graph incl. the cloud) without mission_control ever coming up.
+# The defaults below preserve the race path exactly.
 #
 # The unit sends SIGINT on stop (KillSignal) so rosbag2 finalizes the bag. A
 # hard kill — or copying the bag while it is still recording — leaves an
@@ -60,6 +79,8 @@ EXCLUDE="${DV_RECORD_EXCLUDE-}"                       # default: exclude NOTHING
 BEST_EFFORT="${DV_RECORD_BEST_EFFORT-/lidar_points}"
 WARMUP_TIMEOUT="${DV_RECORD_WARMUP_TIMEOUT:-90}"
 MIN_FREE_GB="${DV_RECORD_MIN_FREE_GB:-20}"
+WARMUP_TOPIC="${DV_RECORD_WARMUP_TOPIC:-/dv/status}"  # race: pipeline heartbeat
+WARMUP_METHOD="${DV_RECORD_WARMUP_METHOD:-echo}"      # echo (reliable) | exists
 
 mkdir -p "$OUTDIR"
 
@@ -69,17 +90,22 @@ if [ "$free_gb" -lt "$MIN_FREE_GB" ]; then
   exit 1
 fi
 
-# Warmup: wait for mission_control's /dv/status heartbeat (the last node up).
-# /dv/status is RELIABLE so `topic echo` works on it — unlike the best-effort
-# cloud, which a default (reliable) reader would never see.
-LOG "waiting up to ${WARMUP_TIMEOUT}s for pipeline warmup (/dv/status)…"
+# Warmup: wait for the graph to be up. Default gate is mission_control's
+# /dv/status heartbeat (RELIABLE, so `topic echo` works). Manual mode gates on a
+# best-effort sensor topic instead, via method=exists (mere advertisement in
+# `ros2 topic list`) — a reliable `echo` reader never sees a best-effort topic.
+LOG "waiting up to ${WARMUP_TIMEOUT}s for warmup (${WARMUP_TOPIC}, method=${WARMUP_METHOD})…"
 up=0
 for _ in $(seq 1 "$WARMUP_TIMEOUT"); do
-  if timeout 3 ros2 topic echo --once /dv/status >/dev/null 2>&1; then up=1; break; fi
+  if [ "$WARMUP_METHOD" = "exists" ]; then
+    if ros2 topic list 2>/dev/null | grep -qxF "$WARMUP_TOPIC"; then up=1; break; fi
+  else
+    if timeout 3 ros2 topic echo --once "$WARMUP_TOPIC" >/dev/null 2>&1; then up=1; break; fi
+  fi
   sleep 1
 done
 if [ "$up" != 1 ]; then
-  LOG "pipeline never warmed up (/dv/status silent after ${WARMUP_TIMEOUT}s) — giving up."
+  LOG "graph never warmed up (${WARMUP_TOPIC} absent after ${WARMUP_TIMEOUT}s) — giving up."
   exit 1
 fi
 sleep 2   # let the rest of the topic graph register with discovery
@@ -101,7 +127,41 @@ if [ -n "$BEST_EFFORT" ]; then
   fi
 fi
 
-MODE=$(cat /run/dv_mode 2>/dev/null || echo run)
+# Bag-name label. Priority:
+#   1. DV_RECORD_MODE_LABEL if set  — the manual path forces "manual".
+#   2. the CONFIRMED AMI mission     — so a pipeline run is named by the mission
+#      it ran (accel / skidpad / autocross / trackdrive), which is exactly what
+#      differentiates one pipeline bag from another.
+#   3. /run/dv_mode                  — fallback (race / umbilical) when the
+#      mission can't be resolved (agent down, or nothing confirmed = -1).
+mission_label_from_ami(){
+  # /ami/mission is BEST_EFFORT and carries the CONFIRMED mission index
+  # (uDV#189). Map index → name; mirrors interface_contract
+  # DEFAULT_AMI_TO_MISSION_ID. Empty on -1 / unknown / unresolved.
+  local idx
+  idx=$(timeout 3 ros2 topic echo --once --qos-reliability best_effort /ami/mission \
+        2>/dev/null | awk '/^data:/{gsub(/[^0-9-]/,"",$2); print $2; exit}')
+  case "$idx" in
+    1) echo accel ;;
+    2) echo skidpad ;;
+    3) echo autocross ;;
+    4) echo trackdrive ;;
+    0) echo manual ;;
+    *) echo "" ;;
+  esac
+}
+
+if [ -n "${DV_RECORD_MODE_LABEL:-}" ]; then
+  MODE="$DV_RECORD_MODE_LABEL"
+else
+  MODE=$(mission_label_from_ami)
+  if [ -n "$MODE" ]; then
+    LOG "bag named by confirmed AMI mission: ${MODE}"
+  else
+    MODE=$(cat /run/dv_mode 2>/dev/null || echo run)
+    LOG "no confirmed mission on /ami/mission — bag labelled '${MODE}' (fallback)"
+  fi
+fi
 OUT="$OUTDIR/${MODE}_$(date +%Y%m%d_%H%M%S)"
 if [ -n "$EXCLUDE" ]; then
   LOG "recording -> $OUT (all topics except '$EXCLUDE')  [${free_gb} GB free]"

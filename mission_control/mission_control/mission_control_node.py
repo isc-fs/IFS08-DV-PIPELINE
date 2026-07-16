@@ -65,6 +65,7 @@ from mission_control.interface_contract import (
     DV_PREPARING,
     DV_READY,
     DV_RUNNING,
+    DV_STOPPING,
     FREE_RUN_MISSION_ID,
     HEARTBEAT_STALE_S,
     SERVICE_FORCE_EBS,
@@ -72,7 +73,10 @@ from mission_control.interface_contract import (
     TOPIC_ASSI_STATE,
     TOPIC_CTRL_CMD,
     TOPIC_DV_STATUS,
+    TOPIC_SLAM_STOP_REQUEST,
+    TOPIC_WATCHDOG_EMERGENCY,
     ami_index_to_mission_id,
+    is_known_ami_index,
 )
 from mission_control.interface_qos import UPLINK_QOS
 from mission_control.reconcile import (
@@ -220,6 +224,19 @@ class MissionControlNode(LifecycleNode):
         self.declare_parameter("free_run", False)
         self._free_run: bool = False
 
+        # hard_stop_on_finish — emit DV_STOPPING when the mission criterion is
+        # met while the car is still rolling, asking the uDV to brake it to
+        # rest (SDC closed, NOT an emergency). See interface_contract.
+        #
+        # Defaults FALSE and MUST stay false until the firmware side lands:
+        # current uDV has no case for byte 7 and its behaviour on an unknown
+        # /dv/status value is unverified, so shipping this enabled would be
+        # changing car behaviour on an unproven contract. With it off the
+        # pipeline behaves exactly as before — the car coasts to rest and
+        # finishes on standstill.
+        self.declare_parameter("hard_stop_on_finish", False)
+        self._hard_stop_on_finish: bool = False
+
         self._mission_id_to_name: dict[int, str] = dict(MISSION_ID_TO_NAME)
 
         # Reentrant group: the reconcile timer issues async activate_mode
@@ -239,7 +256,9 @@ class MissionControlNode(LifecycleNode):
         self._sub_ami = None
         self._sub_ctrl_cmd = None
         self._sub_ctrl_emergency = None
+        self._sub_watchdog_emergency = None
         self._sub_slam_finished = None
+        self._sub_slam_stop_request = None
         self._sub_mode_manager_progress = None
 
         # --- uDV uplink state ---
@@ -263,6 +282,10 @@ class MissionControlNode(LifecycleNode):
         self._failed: bool = False
         self._finished: bool = False
         self._emergency: bool = False
+        # Hard-stop request in flight: mission criterion met, car not yet
+        # stopped. Latched for the run — a flicker must never release a stop
+        # already under way. Cleared with the other latches on a fresh cycle.
+        self._stopping: bool = False
         self._ebs_requested: bool = False   # set only when /force_ebs acks
         self._ebs_future = None             # in-flight /force_ebs call, if any
 
@@ -281,9 +304,12 @@ class MissionControlNode(LifecycleNode):
     # ------------------------------------------------------------------
     def on_configure(self, state: State) -> TransitionCallbackReturn:
         self._free_run = bool(self.get_parameter("free_run").value)
+        self._hard_stop_on_finish = bool(
+            self.get_parameter("hard_stop_on_finish").value)
         self.get_logger().info(
             "on_configure: creating reconciler I/O + activate_mode client "
-            f"(free_run={self._free_run})")
+            f"(free_run={self._free_run}, "
+            f"hard_stop_on_finish={self._hard_stop_on_finish})")
 
         self._activate_mode_client = self.create_client(
             ActivateMode, "/activate_mode", callback_group=self._cb_group)
@@ -329,9 +355,20 @@ class MissionControlNode(LifecycleNode):
         self._sub_ctrl_emergency = self.create_subscription(
             Bool, "/ctrl/emergency", self._on_ctrl_emergency, _LATCHED_QOS,
             callback_group=self._cb_group)
+        # Independent supervisor's emergency channel (pipeline_watchdog).
+        # Separate topic from /ctrl/emergency on purpose: control raising an
+        # emergency and the watchdog catching control being stale are
+        # different faults, and a bag must say which one fired. Both land on
+        # the same handler — the response (EBS + DV_EMERGENCY) is identical.
+        self._sub_watchdog_emergency = self.create_subscription(
+            Bool, TOPIC_WATCHDOG_EMERGENCY, self._on_watchdog_emergency,
+            _LATCHED_QOS, callback_group=self._cb_group)
         self._sub_slam_finished = self.create_subscription(
             Bool, "/slam/finished", self._on_slam_finished, _LATCHED_QOS,
             callback_group=self._cb_group)
+        self._sub_slam_stop_request = self.create_subscription(
+            Bool, TOPIC_SLAM_STOP_REQUEST, self._on_slam_stop_request,
+            _LATCHED_QOS, callback_group=self._cb_group)
         self._sub_mode_manager_progress = self.create_subscription(
             LifecycleProgress, "/mode_manager/progress",
             self._on_mode_manager_progress, 20, callback_group=self._cb_group)
@@ -361,12 +398,15 @@ class MissionControlNode(LifecycleNode):
             self.destroy_timer(self._reconcile_timer)
             self._reconcile_timer = None
         for sub in (self._sub_assi, self._sub_ami, self._sub_ctrl_cmd,
-                    self._sub_ctrl_emergency, self._sub_slam_finished,
+                    self._sub_ctrl_emergency, self._sub_watchdog_emergency,
+                    self._sub_slam_finished, self._sub_slam_stop_request,
                     self._sub_mode_manager_progress):
             if sub is not None:
                 self.destroy_subscription(sub)
         self._sub_assi = self._sub_ami = self._sub_ctrl_cmd = None
         self._sub_ctrl_emergency = self._sub_slam_finished = None
+        self._sub_watchdog_emergency = None
+        self._sub_slam_stop_request = None
         self._sub_mode_manager_progress = None
         self._dv_status_pub = None
         self._dv_status_msg_pub = None
@@ -393,6 +433,18 @@ class MissionControlNode(LifecycleNode):
         self._as_state_stamp = time.monotonic()
 
     def _on_ami_mission(self, msg: Int32) -> None:
+        # An index the table has never heard of maps to 0 like any other
+        # non-pipeline selection, so it is safe — but silently identical to
+        # "operator picked Manual", which makes it undiagnosable. Firmware-side
+        # it surfaces as a refused GO (uDV#178), i.e. a car that won't launch
+        # for no stated reason. Say so loudly instead. Autonomous Demo is the
+        # live example: it has no assigned AMI index at all.
+        if not is_known_ami_index(int(msg.data)):
+            self.get_logger().warn(
+                f"/ami/mission index {msg.data} is NOT in the AMI table — "
+                f"treating as no-mission (stack stays torn down). If the AMI "
+                f"board really emits this, the table needs an entry: see "
+                f"isc-fs/IFS08-DV-uDV#178.")
         mission_id = ami_index_to_mission_id(int(msg.data))
         if mission_id != self._desired_mission_id:
             self.get_logger().info(
@@ -430,13 +482,76 @@ class MissionControlNode(LifecycleNode):
         # a control-raised emergency there must NOT trip EBS mid-manual-lap.
         # (control never asserts this today; the gate future-proofs it.) The
         # AS-Emergency path in _tick is independent and always honoured.
+        self._raise_emergency(msg, "/ctrl/emergency")
+
+    def _on_watchdog_emergency(self, msg: Bool) -> None:
+        # pipeline_watchdog arms itself off /dv/status == DV_RUNNING, so the
+        # RUNNING gate below is belt-and-braces: two independent reasons a
+        # watchdog trip can never fire the EBS during the free-run floor,
+        # where the human is driving and a stale autonomy stack is expected.
+        self._raise_emergency(msg, TOPIC_WATCHDOG_EMERGENCY)
+
+    def _raise_emergency(self, msg: Bool, source: str) -> None:
+        """Rising-edge emergency from an in-pipeline source.
+
+        The response is identical whichever channel raised it — request EBS,
+        stop relaying, report DV_EMERGENCY. `source` only names the culprit in
+        the log, so the bag says which fault actually fired.
+        """
         if (msg.data and not self._emergency
                 and self._active_level is ActiveLevel.RUNNING):
             self.get_logger().warn(
-                "/ctrl/emergency rising — requesting EBS, stopping command relay")
+                f"{source} rising — requesting EBS, stopping command relay")
             self._emergency = True
             self._request_ebs()
             self._publish_dv_status(DV_EMERGENCY)
+
+    def _on_slam_stop_request(self, msg: Bool) -> None:
+        """SLAM says the mission criterion is met while the car is still
+        rolling → ask the uDV for a hard stop (DV_STOPPING).
+
+        This asks for an **ASB actuation** — autonomous brake actuation with the
+        EBS armed but NOT activated (FS-Rules T14.8.1: "activated" means the
+        T15.2.2 supply path is cut, and the actuator lines are not in it). It is
+        NOT an emergency and must not be treated as one: no /force_ebs, no
+        DV_EMERGENCY, no AS Emergency. The uDV applies the brakes, holds the
+        **SDC closed** — which is load bearing, the SDC relay is one of the four
+        T15.2.2 supply elements — and stays in AS Driving until the car is at
+        rest. Then /slam/finished rises and the normal AS Finished actuation
+        takes over, which DOES activate the EBS (AS Finished requires it; see
+        interface_contract.DV_STOPPING for the full rules argument).
+
+        Gated three ways, all deliberate:
+          * `hard_stop_on_finish` (default FALSE) — NOTE the reason changed:
+            byte 7 is confirmed inert on current firmware (uDV#176 — it only
+            compares /dv/status for equality against the bytes it acts on, and
+            RUNNING=3 has always been "unknown" to it the same way), so we can
+            ship ahead with no lockstep flash. The gate now exists solely
+            because the pairing has not been BENCH-VALIDATED.
+          * ActiveLevel.RUNNING — the free-run floor maps while a human drives;
+            a stop request there would slam the brakes mid-manual-lap.
+          * latched — once requested it stays requested for the run, so a
+            flickering topic cannot release a stop already under way.
+
+        A fourth gate lives in _current_dv_status: the byte is only ever put on
+        the wire while the real AS state is AS_DRIVING, because an unrecognised
+        byte in AS Ready makes the uDV refuse GO.
+        """
+        if not msg.data or self._stopping:
+            return
+        if self._active_level is not ActiveLevel.RUNNING:
+            return
+        if not self._hard_stop_on_finish:
+            self.get_logger().info(
+                f"{TOPIC_SLAM_STOP_REQUEST} rising but hard_stop_on_finish is "
+                f"off — not requesting DV_STOPPING; the car will coast to rest "
+                f"and finish on standstill as before")
+            return
+        self.get_logger().warn(
+            f"{TOPIC_SLAM_STOP_REQUEST} rising — requesting DV_STOPPING "
+            f"(hard stop to standstill; SDC stays closed, NOT an emergency)")
+        self._stopping = True
+        self._publish_dv_status(DV_STOPPING)
 
     def _on_slam_finished(self, msg: Bool) -> None:
         # Only a live run (ActiveLevel.RUNNING) can "finish". While the
@@ -529,6 +644,7 @@ class MissionControlNode(LifecycleNode):
                 and not should_request_ebs(as_state)):
             self._failed = self._finished = False
             self._emergency = False
+            self._stopping = False
             self._ebs_requested = False
             self._ebs_future = None
 
@@ -650,6 +766,24 @@ class MissionControlNode(LifecycleNode):
             return DV_IDLE
         if not is_runnable_mission(self._desired_mission_id):
             return DV_IDLE
+        # Hard stop — ONLY while actually driving. Placement here is load
+        # bearing, not stylistic (uDV#176): the firmware compares /dv/status
+        # for equality against the bytes it acts on, so any byte it does not
+        # recognise — including 7 — reads as "DV not ready". In AS Ready that
+        # makes `dv_ready` false and the uDV REFUSES GO: the car silently
+        # never launches. Fail-safe on their side, a footgun on ours.
+        #
+        # The latch alone is not a sufficient guard. `_stopping` clears only
+        # once the stack is fully torn down (_active_level NONE and no
+        # prepared mission); a re-arm that beats that reset would sit in
+        # AS Ready with 7 on the wire. Gating on the REAL AS state closes
+        # that window regardless of latch timing.
+        #
+        # Priority: below EMERGENCY and FINISHED (a fault outranks a tidy
+        # stop; once stopped we ARE finished) and below the arming handshake,
+        # which is exactly the point.
+        if self._stopping and real_as == AS_DRIVING:
+            return DV_STOPPING
         if self._busy and self._pending_action is ReconcileAction.PREPARE:
             return DV_PREPARING
         # Legacy steady mapping, keyed to the DESIRED (operator-selected)
