@@ -5,11 +5,18 @@ manual driving — for offline replay (perception / SLAM / odom development).
 
 ## TL;DR
 
-| You run | Unit | Records | Bag prefix |
+Recording captures **everything available on the graph** (`-a`), which differs
+by mode because the pipeline only runs for real missions:
+
+| You run | Unit | Records | Bag name |
 |---|---|---|---|
-| `dv race` (or race boot) | `dv-pipeline` + `dv-record` | full graph incl. `/lidar_points`, once the pipeline is up | `race_` / `umbilical_` |
-| `dv manual` | `dv-manual` | full **sensor** graph incl. `/lidar_points`, no autonomy | `manual_` |
+| `dv race` for a mission | `dv-pipeline` + `dv-record` | **everything** — sensors + cones + SLAM + path + control commands (`/ctrl/cmd_internal`) | `<mission>_<ts>` (accel / skidpad / autocross / trackdrive) |
+| `dv manual` (manual driving) | `dv-manual` | **sensors only** — `/imu`, `/lidar_points`, `/motor_rpm`, `/steering_angle` (no pipeline → no autonomy topics exist) | `manual_<ts>` |
 | `dv stop` | — | stops both | — |
+
+The pipeline bag is named by the **confirmed AMI mission** (falls back to
+`race_`/`umbilical_` from `/run/dv_mode` if the mission can't be read). Manual
+bags are `manual_`. So every bag's filename tells you what it is.
 
 Bags land in `/home/isc/bags/`. **Always `dv stop` before copying a bag off the
 car** — a hard kill leaves an unfinalized mcap (no footer/index).
