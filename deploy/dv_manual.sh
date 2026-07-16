@@ -54,19 +54,59 @@ SENSORS_PID=$!
 # graph — take the whole unit down.
 trap 'kill "$SENSORS_PID" 2>/dev/null' EXIT
 
-# Hand off to the shared record core, gated on the sensor topic (best-effort →
-# method=exists, not echo) and labelled "manual". The recorder execs
-# `ros2 bag record`, replacing this shell; the backgrounded sensor launch stays
-# in the cgroup and is reaped by systemd's control-group kill on stop.
-WARMUP_TOPIC="/lidar_points"
-[ "$WITH_LIDAR" = "true" ] || WARMUP_TOPIC="/imu"   # no lidar → wait on the IMU
+# The uDV's proprioceptive sensors — /imu, /motor_rpm, /steering_angle — come
+# over microros-agent.service, NOT from car_sensors. The unit Wants= that agent
+# (so starting `dv manual` starts it too), but a manual bag with only the cloud
+# and no IMU/wheel/steer is nearly useless for the offline odom/SLAM replay this
+# is FOR — so we verify the full car sensor set is live before recording and
+# warn loudly if any is missing, rather than silently shipping a lidar-only bag.
+UDV_SENSORS="/imu /motor_rpm /steering_angle"
+EXPECTED="$UDV_SENSORS"
+[ "$WITH_LIDAR" = "true" ] && EXPECTED="/lidar_points $UDV_SENSORS"
 
-export DV_RECORD_WARMUP_TOPIC="$WARMUP_TOPIC"
+# microros-agent status, for the log (Wants= should have started it).
+LOG "microros-agent: $(systemctl is-active microros-agent.service 2>/dev/null || echo unknown)"
+
+# Pre-flight: wait up to SENSOR_WAIT s for the expected topics to appear, then
+# report present/missing. Best-effort topics only need to be ADVERTISED, so we
+# check `ros2 topic list` (a reliable echo reader never sees them).
+SENSOR_WAIT="${DV_MANUAL_SENSOR_WAIT:-30}"
+LOG "waiting up to ${SENSOR_WAIT}s for the car sensor set: ${EXPECTED}…"
+present=""; missing=""
+for _ in $(seq 1 "$SENSOR_WAIT"); do
+  have=$(ros2 topic list 2>/dev/null)
+  present=""; missing=""
+  for t in $EXPECTED; do
+    if printf '%s\n' "$have" | grep -qxF "$t"; then present="$present $t"; else missing="$missing $t"; fi
+  done
+  [ -z "$missing" ] && break
+  sleep 1
+done
+LOG "sensors present:$present"
+if [ -n "$missing" ]; then
+  LOG "⚠ MISSING sensors:$missing — recording anyway, but this bag will not have them."
+  case "$missing" in
+    *"/imu"*|*"/motor_rpm"*|*"/steering_angle"*)
+      LOG "⚠ uDV proprioceptive data missing — check microros-agent.service and the uDV link." ;;
+  esac
+fi
+# Refuse a completely empty run: if NOTHING is up, there is nothing to record.
+if [ -z "$present" ]; then
+  LOG "no expected sensor topic appeared after ${SENSOR_WAIT}s — giving up (nothing to record)."
+  exit 1
+fi
+
+# Hand off to the shared record core. Gate its own warmup on a topic we know is
+# present (first of the present set), method=exists (best-effort), label manual.
+# The recorder execs `ros2 bag record`, replacing this shell; the backgrounded
+# sensor launch stays in the cgroup and is reaped by systemd's control-group
+# kill on stop.
+export DV_RECORD_WARMUP_TOPIC="$(printf '%s' "$present" | awk '{print $1}')"
 export DV_RECORD_WARMUP_METHOD="exists"
 export DV_RECORD_MODE_LABEL="manual"
-# The IMU/RPM/steering come from the uDV best-effort too; force best-effort
-# readers on them as well as the cloud so a manual bag isn't silently empty.
-export DV_RECORD_BEST_EFFORT="${DV_RECORD_BEST_EFFORT-/lidar_points /imu /motor_rpm /steering_angle}"
+# Force best-effort readers on every uDV + lidar topic, else a best-effort
+# publisher is invisible to rosbag's default reliable reader and records ZERO.
+export DV_RECORD_BEST_EFFORT="${DV_RECORD_BEST_EFFORT-/lidar_points $UDV_SENSORS}"
 
-LOG "handing off to dv_record.sh (warmup ${WARMUP_TOPIC} exists, label manual)…"
+LOG "handing off to dv_record.sh (warmup ${DV_RECORD_WARMUP_TOPIC} exists, label manual)…"
 exec /usr/local/bin/dv_record.sh

@@ -51,16 +51,42 @@ dv stop           # stop everything (pipeline + manual)
 dv status         # shows dv-manual state + last bag
 ```
 
-Notes:
-- The uDV topics (`/imu`, `/motor_rpm`, `/steering_angle`) come from
-  `microros-agent.service`, independent of this — they're in the manual bag iff
-  that service is up (it normally is). The lidar cloud is started by
-  `dv-manual` itself.
+### The full car sensor set
+
+A manual bag captures **all four** on-vehicle sensors, from two sources:
+
+| Topic | Type | Source | Started by |
+|---|---|---|---|
+| `/lidar_points` | PointCloud2 | Hesai ATX driver | `dv-manual` (car_sensors) |
+| `/imu` | Imu | uDV | `microros-agent.service` |
+| `/motor_rpm` | Float32 | uDV | `microros-agent.service` |
+| `/steering_angle` | Float32 | uDV | `microros-agent.service` |
+
+The lidar cloud alone is not enough for offline odom/SLAM replay — you need the
+uDV's IMU + wheel-speed + steering too. Those come over `microros-agent.service`,
+which `dv-manual` pulls in (`Wants=`), so it starts even during pure manual
+driving with no pipeline.
+
+`dv_manual.sh` **verifies the full set is live before recording** and logs
+present/missing. If the uDV topics are absent (agent down / uDV link dead) it
+records anyway (a cloud bag beats no bag) but **warns loudly** in the journal —
+so a proprioceptive-less bag is never a silent surprise. It only refuses to
+start if *nothing* is present.
+
+> After `dv manual`, sanity-check: `dv status` (dv-manual active), then
+> `ros2 bag info` on the `manual_<ts>` bag — confirm **non-zero message counts**
+> for `/imu`, `/motor_rpm`, `/steering_angle` **and** `/lidar_points`, not just
+> that the topics exist. The best-effort QoS override is what makes those counts
+> non-zero; a wrong reader records the topic with zero messages.
+
+### Other notes
 - **Don't run `dv manual` while the pipeline is up** — both launch the Hesai
   driver. `dv manual` refuses to start if `dv-pipeline` is active; `dv stop`
   first.
 - Same disk floor (`DV_RECORD_MIN_FREE_GB`, default 20) and `/etc/dv/norecord`
   opt-out as the race recorder.
+- No GPS/GSS/brake sensor exists on the car — the four above are the complete
+  proprioceptive + perception set the EKF and SLAM consume.
 
 ## Architecture (why it's split this way)
 
