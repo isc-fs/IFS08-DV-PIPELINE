@@ -38,8 +38,12 @@
 #                             advertised in `ros2 topic list` — use for
 #                             best-effort sensor topics like /lidar_points,
 #                             which a reliable `echo` reader never sees)
-#   DV_RECORD_MODE_LABEL      bag-name prefix (default: /run/dv_mode, e.g.
-#                             race/umbilical). dv_manual.sh sets "manual".
+#   DV_RECORD_MODE_LABEL      bag-name prefix. If unset, the label is the
+#                             CONFIRMED AMI mission name (accel / skidpad /
+#                             autocross / trackdrive) so pipeline bags are named
+#                             by the mission they ran; falls back to /run/dv_mode
+#                             (race / umbilical) when unresolved. dv_manual.sh
+#                             sets "manual".
 # Opt-out: `touch /etc/dv/norecord` (isc-owned dir) disables recording.
 #
 # Manual driving (no pipeline): deploy/dv_manual.sh launches ONLY the sensor
@@ -123,7 +127,41 @@ if [ -n "$BEST_EFFORT" ]; then
   fi
 fi
 
-MODE="${DV_RECORD_MODE_LABEL:-$(cat /run/dv_mode 2>/dev/null || echo run)}"
+# Bag-name label. Priority:
+#   1. DV_RECORD_MODE_LABEL if set  — the manual path forces "manual".
+#   2. the CONFIRMED AMI mission     — so a pipeline run is named by the mission
+#      it ran (accel / skidpad / autocross / trackdrive), which is exactly what
+#      differentiates one pipeline bag from another.
+#   3. /run/dv_mode                  — fallback (race / umbilical) when the
+#      mission can't be resolved (agent down, or nothing confirmed = -1).
+mission_label_from_ami(){
+  # /ami/mission is BEST_EFFORT and carries the CONFIRMED mission index
+  # (uDV#189). Map index → name; mirrors interface_contract
+  # DEFAULT_AMI_TO_MISSION_ID. Empty on -1 / unknown / unresolved.
+  local idx
+  idx=$(timeout 3 ros2 topic echo --once --qos-reliability best_effort /ami/mission \
+        2>/dev/null | awk '/^data:/{gsub(/[^0-9-]/,"",$2); print $2; exit}')
+  case "$idx" in
+    1) echo accel ;;
+    2) echo skidpad ;;
+    3) echo autocross ;;
+    4) echo trackdrive ;;
+    0) echo manual ;;
+    *) echo "" ;;
+  esac
+}
+
+if [ -n "${DV_RECORD_MODE_LABEL:-}" ]; then
+  MODE="$DV_RECORD_MODE_LABEL"
+else
+  MODE=$(mission_label_from_ami)
+  if [ -n "$MODE" ]; then
+    LOG "bag named by confirmed AMI mission: ${MODE}"
+  else
+    MODE=$(cat /run/dv_mode 2>/dev/null || echo run)
+    LOG "no confirmed mission on /ami/mission — bag labelled '${MODE}' (fallback)"
+  fi
+fi
 OUT="$OUTDIR/${MODE}_$(date +%Y%m%d_%H%M%S)"
 if [ -n "$EXCLUDE" ]; then
   LOG "recording -> $OUT (all topics except '$EXCLUDE')  [${free_gb} GB free]"
