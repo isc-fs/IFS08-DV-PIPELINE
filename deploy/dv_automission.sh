@@ -1,25 +1,32 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dv_automission.sh — auto-record manual driving when the AMI selects Manual.
+# dv_automission.sh — auto-record manual driving when Manual is confirmed on AMI.
 #
 # Always-on watcher (dv-automission.service, enabled at boot). Subscribes to the
 # uDV's /ami/mission and reconciles the manual recorder to it:
 #
-#   mission 0 (Manual) + pipeline NOT running  →  start dv-manual.service
-#   mission 1..9 (a real DV mission)           →  stop  dv-manual.service
-#   /ami/mission not seen (uDV/agent silent)   →  leave current state untouched
-#   /etc/dv/norecord present                   →  stop + stay idle (opt-out)
+#   mission 0 (Manual CONFIRMED) + pipeline NOT running → start dv-manual.service
+#   mission 1..9 (a real DV mission confirmed)          → stop  dv-manual.service
+#   mission -1 (up, nothing confirmed yet)              → leave state untouched
+#   /ami/mission not seen (uDV/agent silent)            → leave state untouched
+#   /etc/dv/norecord present                            → stop + stay idle
 #
-# So: power on with the dial at Manual (index 0 = the default) → the manual
-# sensor bag records itself, with NO pipeline and NO commands to the car. Select
-# a real mission and `dv race` → this releases the recorder (pipeline's own
-# recorder takes over); dial back to Manual after `dv stop` → it resumes.
+# ONE OPERATOR STEP (uDV#189): the AMI board only puts an index on the bus after
+# the operator CONFIRMS a mission — it does NOT broadcast the dial position. So
+# /ami/mission latches -1 until a mission is confirmed; confirming Manual makes
+# it a latched 0, republished at ~10 Hz with the ASMS off. There is therefore no
+# true "power-on-at-Manual = record" zero-touch: reaching a positive 0 costs one
+# button press (select Manual + confirm). True zero-touch would need the AMI
+# board to broadcast the dial index continuously — an IFS08-DV_AMI change, not a
+# uDV one. -1 is deliberately NOT treated as Manual (it's also the pre-arm state
+# of every mission and the fresh-boot state).
 #
-# ⚠ BLOCKED ON uDV: this only fires if the uDV publishes /ami/mission with the
-# ASMS OFF and no pipeline (isc-fs/IFS08-DV-uDV#189). Until then /ami/mission is
-# simply never seen in this state and the watcher stays idle — inert, not
-# broken. It never sends anything to the car; it only reads /ami/mission and
-# starts/stops a local systemd unit.
+# After confirming Manual → records, with NO pipeline and NO commands to the car.
+# Confirm a real mission + `dv race` → this releases the recorder (pipeline's own
+# recorder takes over); confirm Manual again after `dv stop` → it resumes.
+#
+# It never sends anything to the car; it only reads /ami/mission and starts/stops
+# a local systemd unit.
 #
 # Reconcile loop (not edge-triggered): re-evaluates every DV_AUTOMISSION_POLL
 # seconds so the pipeline-guard is rechecked too — e.g. dial-to-Manual while the
@@ -59,23 +66,31 @@ while true; do
 
   m=$(read_mission)
   case "$m" in
-    "")
-      # uDV/agent silent — we don't know the mission. Do NOT thrash the
-      # recorder on a transient blip; leave whatever is running as-is.
+    ""|-*)
+      # "" = uDV/agent silent; -1 = uDV+agent UP but NO mission confirmed on the
+      # AMI yet (fresh boot, or post-reset). Per uDV#189: /ami/mission latches
+      # -1 until the operator *confirms* a mission on the AMI — Manual is index
+      # 0 only AFTER it is confirmed, it is NOT emitted from the dial position.
+      # So -1 is NOT "Manual" and must not start OR stop recording: leave the
+      # current state as-is (don't force-drop an in-progress manual bag on a
+      # transient reset, don't start one on a bare boot).
       : ;;
     0)
-      # Manual selected. Record unless the pipeline owns the sensors.
+      # Manual was CONFIRMED on the AMI (dial to Manual + press confirm) — the
+      # uDV now latches 0 and republishes it at ~10 Hz, ASMS-off. Record unless
+      # the pipeline owns the sensors.
       if pipeline_active; then
         : # a real run is up; the pipeline's recorder is in charge
       elif ! manual_active; then
-        LOG "AMI Manual (0) selected, no pipeline → starting manual recording"
+        LOG "AMI Manual (0) confirmed, no pipeline → starting manual recording"
         sudo -n systemctl start dv-manual.service || LOG "failed to start dv-manual.service"
       fi ;;
     *)
-      # A real DV mission is dialled in → the manual recorder must release
-      # (whoever runs `dv race` gets a clean Hesai driver + its own recorder).
+      # A real DV mission (1..9) was CONFIRMED → the manual recorder must
+      # release (whoever runs `dv race` gets a clean Hesai driver + its own
+      # recorder). Note: -1 is handled above, so this is only positive indices.
       if manual_active; then
-        LOG "AMI mission $m selected → stopping manual recording"
+        LOG "AMI mission $m confirmed → stopping manual recording"
         sudo -n systemctl stop dv-manual.service || LOG "failed to stop dv-manual.service"
       fi ;;
   esac

@@ -1,15 +1,13 @@
-# dv-automission.service — auto-record manual driving on AMI Manual selection.
+# dv-automission.service — auto-record manual driving on AMI Manual confirm.
 # Always-on watcher: subscribes /ami/mission and starts dv-manual.service (the
-# sensors-only recorder) whenever Manual (index 0) is selected and the pipeline
-# is not running; stops it when a real mission is dialled in. No autonomy, no
-# commands to the car — read /ami/mission, drive a local systemd unit.
+# sensors-only recorder) when Manual (index 0) is CONFIRMED on the AMI and the
+# pipeline is not running; stops it when a real mission is confirmed. No
+# autonomy, no commands to the car — read /ami/mission, drive a local unit.
 #
-# ENABLED at boot by the installer, so "power on, dial at Manual" records with
-# zero operator steps. Opt out with `touch /etc/dv/norecord` (honoured live) or
-# `sudo systemctl disable --now dv-automission.service`.
-#
-# ⚠ Inert until isc-fs/IFS08-DV-uDV#189: it only fires if the uDV publishes
-# /ami/mission with the ASMS off. Until then it watches and does nothing.
+# ENABLED at boot by the installer. Per uDV#189 the AMI emits an index only on
+# CONFIRM (not dial position), so recording starts after one button press
+# (select Manual + confirm), not on power-on alone. Opt out with
+# `touch /etc/dv/norecord` (live) or `systemctl disable --now dv-automission`.
 #
 # Versioned in IFS08-DV-PIPELINE/deploy/ — install with
 #   sudo ~/dv_ws/src/IFS08-DV-PIPELINE/deploy/install_dv_pipeline_service.sh
