@@ -200,8 +200,10 @@ def test_trackdrive_finishes_only_after_ten_laps_and_standstill():
 # does nothing on the vehicle), so it cannot reach standstill unaided and
 # `finished` would never fire. target_met is the earliest honest moment to say
 # "the mission is over, bring it to rest" WITHOUT asserting a standstill that
-# has not happened. Conflating the two would signal AS Finished at speed —
-# which fires the EBS *and* opens the SDC.
+# has not happened. Conflating the two would signal AS Finished at speed — which
+# opens the SDC, cutting the EBS supply path and activating the EBS (T14.8.1),
+# i.e. a full-pressure stop with the TS cut. target_met instead drives an ASB
+# actuation (DV_STOPPING) with the EBS left armed.
 # ---------------------------------------------------------------------
 
 def test_target_met_false_before_the_criterion():

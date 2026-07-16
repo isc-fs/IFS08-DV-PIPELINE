@@ -510,21 +510,32 @@ class MissionControlNode(LifecycleNode):
         """SLAM says the mission criterion is met while the car is still
         rolling → ask the uDV for a hard stop (DV_STOPPING).
 
-        This is NOT an emergency and must not be treated as one: no /force_ebs,
-        no DV_EMERGENCY, no AS Emergency. The uDV is expected to actuate the
-        brakes, hold the SDC closed and stay in AS Driving until the car is at
-        rest, at which point /slam/finished rises and the normal AS Finished
-        actuation takes over.
+        This asks for an **ASB actuation** — autonomous brake actuation with the
+        EBS armed but NOT activated (FS-Rules T14.8.1: "activated" means the
+        T15.2.2 supply path is cut, and the actuator lines are not in it). It is
+        NOT an emergency and must not be treated as one: no /force_ebs, no
+        DV_EMERGENCY, no AS Emergency. The uDV applies the brakes, holds the
+        **SDC closed** — which is load bearing, the SDC relay is one of the four
+        T15.2.2 supply elements — and stays in AS Driving until the car is at
+        rest. Then /slam/finished rises and the normal AS Finished actuation
+        takes over, which DOES activate the EBS (AS Finished requires it; see
+        interface_contract.DV_STOPPING for the full rules argument).
 
         Gated three ways, all deliberate:
-          * `hard_stop_on_finish` (default FALSE) — the byte is inert until the
-            firmware implements it. Current uDV has no case for byte 7 and its
-            behaviour on an unknown value is unverified, so this must not ship
-            enabled.
+          * `hard_stop_on_finish` (default FALSE) — NOTE the reason changed:
+            byte 7 is confirmed inert on current firmware (uDV#176 — it only
+            compares /dv/status for equality against the bytes it acts on, and
+            RUNNING=3 has always been "unknown" to it the same way), so we can
+            ship ahead with no lockstep flash. The gate now exists solely
+            because the pairing has not been BENCH-VALIDATED.
           * ActiveLevel.RUNNING — the free-run floor maps while a human drives;
             a stop request there would slam the brakes mid-manual-lap.
           * latched — once requested it stays requested for the run, so a
             flickering topic cannot release a stop already under way.
+
+        A fourth gate lives in _current_dv_status: the byte is only ever put on
+        the wire while the real AS state is AS_DRIVING, because an unrecognised
+        byte in AS Ready makes the uDV refuse GO.
         """
         if not msg.data or self._stopping:
             return

@@ -401,13 +401,16 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # Lap/distance completion detector (see lap_counter.LapCounter).
         # Origin ≈ spawn ≈ start/finish, so lap counting reuses the
         # loop_close_* geometry above (arm >= min_radius, close <= radius).
-        # Finish is gated on standstill: entering AS Finished fires the EBS
-        # + opens the SDC on the firmware, so signalling at speed would
-        # hard-brake the car (FS rules also require standstill). Per-mission
-        # defaults live in _resolve_finish_config (autocross=1 lap,
-        # trackdrive=10, accel=75 m distance). -1 => use the mission
-        # default; >= 0 overrides. trackdrive won't actually fire until
-        # control_node holds its stop-anchor to the final lap (follow-up).
+        # Finish is gated on standstill: entering AS Finished OPENS THE SDC,
+        # which cuts the EBS supply path and thereby ACTIVATES the EBS
+        # (FS-Rules T14.8.1/T15.2.2). The firmware does NOT check standstill on
+        # that byte (uDV#177), so signalling at speed would full-pressure stop
+        # the car with the TS cut. FS rules also require standstill for
+        # AS Finished. Per-mission defaults live in _resolve_finish_config
+        # (autocross=1 lap, trackdrive=10, accel=75 m distance). -1 => use the
+        # mission default; >= 0 overrides. Trackdrive additionally needs
+        # control_node to hold its stop-anchor to the closing lap — that is
+        # what /slam/final_lap drives.
         self.declare_parameter("laps_to_finish", -1)
         self.declare_parameter("finish_distance_m", -1.0)
         self.declare_parameter("finish_standstill_speed_mps", 0.5)

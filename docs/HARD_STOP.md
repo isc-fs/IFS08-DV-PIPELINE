@@ -1,9 +1,13 @@
 # Hard stop on mission completion (DV_STOPPING)
 
-**Status: pipeline side implemented and INERT by default. The rules question is
-ANSWERED and the firmware side is implemented (uDV#176, branch
-`feat/176-dv-stopping`). Remaining gate: joint bench validation. Do not enable
-on the car until that runs.**
+**Status: pipeline side implemented and INERT by default. Checked against
+FS-Rules 2026 v1.1 and **compliant** (see below). Firmware side implemented
+(uDV#176, branch `feat/176-dv-stopping`). Remaining gate: joint bench
+validation. Do not enable on the car until that runs.**
+
+> **Terminology, and it matters:** this is an **ASB actuation**, not an
+> "EBS trigger". Those are different things in FS-Rules T14/T15, and the
+> difference *is* the compliance argument. See "Why this is legal" below.
 
 ## The problem
 
@@ -18,64 +22,91 @@ The pipeline cannot stop the car.
 So the car coasts. `v_max = 3.0 m/s` is what makes that tolerable today.
 
 This breaks mission completion. `/slam/finished` is gated on standstill — and
-correctly so, because entering AS Finished fires the EBS **and opens the SDC**,
-so signalling it at speed would hard-stop the car mid-track. But with no braking
+correctly so: entering AS Finished **opens the SDC**, which cuts the T15.2.2
+supply path and thereby **activates the EBS** (T14.8.1) — so signalling it at
+speed would hard-stop the car mid-track with the TS cut. But with no braking
 authority the car only coasts down, so standstill arrives late, imprecisely, or
-not at all on any gradient. The **EBS is the only thing that can actually stop
-the car**, which is why we want to use it deliberately rather than as a fault
-response.
+not at all on any gradient. The **ASB is the only thing that can actually stop
+the car**, which is why we want to actuate it deliberately at mission end
+rather than only ever as a fault response.
 
 ## The intent
 
-On mission completion (accel, autocross, trackdrive, skidpad): actuate the
-**pneumatic EBS components** to bring the car to a standstill, while
+On mission completion (accel, autocross, trackdrive, skidpad): perform an
+**ASB brake actuation** to bring the car to a standstill, while
 
-- **keeping the SDC closed**, and
+- **keeping the SDC closed** — load bearing, see below, and
 - **staying in AS Driving** — this is *not* AS Emergency.
 
 A "hard stop", not an emergency manoeuvre. Once at rest, the normal
-`/slam/finished` → `DV_FINISHED` → AS Finished path runs as it does today.
+`/slam/finished` → `DV_FINISHED` → AS Finished path runs as it does today —
+and *that* step genuinely does activate the EBS.
 
-## The question we asked, and the answer (uDV#176)
+The brake hardware is shared (T15.1.1: the ASB "features an EBS ... as part of
+it"), which is exactly why the wording has to be precise: applying the brakes
+is **not** the same as activating the EBS.
 
-We asked: *the FS AS state table has no state with the EBS actuated and the SDC
-closed — so is there an actuation path to the pneumatics that is NOT the EBS
-trigger?*
+## Why this is legal (FS-Rules 2026 v1.1)
 
-**Answered, and the premise was a misreading.** That table describes **AS
-states, not an electrical constraint**.
+The worry was: *the AS state table has no state with the EBS actuated and the
+SDC closed, so "brake but stay in AS Driving" must be illegal.* That is wrong,
+for a precise reason.
 
-- **Independent of the SDC: yes.** The uDV drives the two EBS actuators
-  (`D1`/`D2`) and the AS SDC (`D4`) as **three independent GPIOs**. The coupling
-  between "fire the brakes" and "open the SDC" is a *policy* in
-  `as_actuation.hpp` — not a wire.
-- **"Brakes actuated + SDC closed" is not a new state at all.** It is already
-  the **steady state of AS Ready**: the EBS is released only in AS Driving or
-  with the ASMS off, and fired in every other state, while `sdc_open` is true
-  only in Finished/Emergency. On top of that the T15.2 init self-check fires
-  each actuator in turn, with the SDC closed, on **every boot**. The car is
-  routinely braked-with-SDC-closed before it ever moves.
-- **Independent of the EBS: no.** There is **no separate service brake**. The
-  only brake pneumatics *are* the two EBS actuators, and they are **binary** —
-  fire or release. Nothing to modulate, nothing to ramp.
+**T14.8.1 defines the term narrowly.** The EBS is "activated" **only if the
+T15.2.2 power supply path is cut** — not merely when the brakes are applied.
+And T15.2.2 lists that path exhaustively:
 
-### What that means for scope
+> The EBS must be supplied by • **LVMS** • **ASMS** • the normally open contact
+> of the relay according to T14.3.5 (RES bypass) • **a relay which is supplied
+> by the SDC**
 
-Because the actuators are binary, this is **not** an autonomous service brake
-and must not be used as one. It buys exactly one thing: **reaching standstill at
-the very end of the mission so AS Finished becomes reachable.**
+**The actuator lines are not in that list.** So with all four supply elements
+intact — LVMS on, ASMS on, RES relay closed, and crucially **the SDC closed** —
+asserting the actuators applies brake pressure while the EBS remains armed and
+*not activated*. Figure 15 (T14.8.3) then takes its **left** branch, `R2D?` is
+still true, and the car is legitimately **AS Driving** while braking.
 
-> ⚠️ **`DV_STOPPING` is full brake pressure, every time. Keep
-> `hard_stop_on_finish` strictly end-of-mission. Never use it to modulate speed
-> during a run** — every application is an emergency-grade stop.
+**AS Ready is the existence proof.** T14.4.1 closes the SDC precisely *because*
+"sufficient brake pressure is built up, i.e. brakes are closed". Brakes applied
++ SDC closed + EBS not activated is the state every FS car sits in before every
+run. If actuating the brakes counted as EBS activation, no car could ever arm.
 
-`LapCounter.target_met` enforces this structurally: it only latches on the
-mission's completion criterion, so there is no path that applies it mid-run.
+T14.4.1 also names the concept outright in its manual-driving clause — "the AS
+has checked that **ASB is deactivated, i.e. no autonomous brake actuation
+possible**". **Autonomous brake actuation** is a first-class rules concept,
+distinct from EBS activation. That is what `DV_STOPPING` requests.
 
-The uDV team assessed that the narrow end-of-mission form does not need a rules
-escalation — it is the EBS bringing the car to rest at mission end, which is
-what it is for. They will still run it past scrutineering before a real run and
-report back on uDV#176. If scrutineering pushes back, this stays gated off.
+### The corollary: why `DV_FINISHED` is different
+
+Figure 15's **right** branch — the only route to AS Finished — requires
+`EBS activated? yes`. So the uDV opening the SDC at standstill is not
+incidental: cutting the supply path is *what makes AS Finished reachable*.
+
+> `DV_FINISHED` genuinely **does** activate the EBS.
+> `DV_STOPPING` genuinely **does not**.
+> Do not conflate them.
+
+```
+AS Driving, R2D, EBS armed but not activated
+  → DV_STOPPING : ASB applies brakes; T15.2.2 supply intact; SDC CLOSED
+  → still AS Driving ✓        (left branch — nothing exits R2D)
+  → standstill
+  → DV_FINISHED : SDC opens → supply path cut → EBS activated
+  → "EBS activated? yes" → "mission finished & at standstill? yes"
+  → "SDC open at RES?" NO     ← opened by the AS, not by the RES
+  → AS Finished ✓
+```
+
+### What is NOT resolved by the rules
+
+- **Scrutineering.** The uDV team will run this past scrutineering before a real
+  run and report on uDV#176. If they push back, it stays gated off.
+- **The schematic.** The argument holds provided the actuator lines sit
+  *downstream* of the T15.2.2 supply chain rather than being series elements in
+  it. T14.5.4 and the fact that AS Ready works both point that way, but the uDV
+  team owns that detail.
+- **T14.11.1** requires the ASF to document the whole AS *"including ASB"* —
+  describe this there as an ASB actuation, not an EBS trigger.
 
 ## The contract
 
@@ -155,8 +186,9 @@ Worth knowing, because they shape what our side does *not* have to guard:
   wheels during recovery.
 - **The byte can only ADD braking, never remove it** (asserted as a firmware
   invariant).
-- **It never touches the SDC** — that is what keeps it a stop and not an
-  emergency.
+- **It never touches the SDC** — which is exactly what keeps the EBS
+  un-activated: the SDC relay is one of the four T15.2.2 supply elements, so
+  leaving it closed keeps the supply path intact and the car in AS Driving.
 - **A stale link mid-stop does not release the brakes.** `dv_lost_driving`
   trips Emergency on the same tick, which fires the EBS anyway. The failure
   mode is "brakes stay on", not "car rolls".
@@ -208,8 +240,8 @@ make BENCH="-DBENCH_STUB_DV_STOPPING=1"
 ```
 
 With the stub, byte 7 is received, keeps the heartbeat fresh, and shows on
-`/debug` and in the pit-diag stub mask (`0x40`) — but does **not** fire the EBS
-and does **not** inhibit torque. So the whole handshake can be exercised while
+`/debug` and in the pit-diag stub mask (`0x40`) — but does **not** actuate the
+ASB (no valve fires) and does **not** inhibit torque. So the whole handshake can be exercised while
 the car still only coasts. Each real stop costs an air recharge, which is why
 the first runs go this way.
 
