@@ -28,6 +28,7 @@ from mission_control.interface_contract import (  # noqa: E402
     DV_FINISHED,
     DV_EMERGENCY,
     DV_FAILED,
+    DV_STOPPING,
     HEARTBEAT_STALE_S,
     HEARTBEAT_STALE_CAP_S,
     ami_index_to_mission_id,
@@ -44,9 +45,20 @@ def test_as_state_bytes_match_fs_rules():
 
 def test_dv_status_bytes_are_distinct_and_ordered():
     bytes_ = [DV_IDLE, DV_PREPARING, DV_READY, DV_RUNNING,
-              DV_FINISHED, DV_EMERGENCY, DV_FAILED]
-    assert bytes_ == [0, 1, 2, 3, 4, 5, 6]
+              DV_FINISHED, DV_EMERGENCY, DV_FAILED, DV_STOPPING]
+    assert bytes_ == [0, 1, 2, 3, 4, 5, 6, 7]
     assert len(set(bytes_)) == len(bytes_)
+
+
+def test_dv_stopping_is_not_an_emergency_byte():
+    """DV_STOPPING is a HARD STOP, not an emergency: the uDV must brake to
+    rest with the SDC closed and stay in AS Driving. If this ever collides
+    with DV_EMERGENCY the firmware would open the SDC on a normal mission
+    end — a DNF at best. The byte is mirrored by hand in uDV dv_interface.h
+    (no build-time link), so pin it here."""
+    assert DV_STOPPING == 7
+    assert DV_STOPPING != DV_EMERGENCY
+    assert DV_STOPPING != DV_FINISHED
 
 
 def test_heartbeat_stale_window_is_under_fs_rules_cap():

@@ -401,13 +401,16 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # Lap/distance completion detector (see lap_counter.LapCounter).
         # Origin ≈ spawn ≈ start/finish, so lap counting reuses the
         # loop_close_* geometry above (arm >= min_radius, close <= radius).
-        # Finish is gated on standstill: entering AS Finished fires the EBS
-        # + opens the SDC on the firmware, so signalling at speed would
-        # hard-brake the car (FS rules also require standstill). Per-mission
-        # defaults live in _resolve_finish_config (autocross=1 lap,
-        # trackdrive=10, accel=75 m distance). -1 => use the mission
-        # default; >= 0 overrides. trackdrive won't actually fire until
-        # control_node holds its stop-anchor to the final lap (follow-up).
+        # Finish is gated on standstill: entering AS Finished OPENS THE SDC,
+        # which cuts the EBS supply path and thereby ACTIVATES the EBS
+        # (FS-Rules T14.8.1/T15.2.2). The firmware does NOT check standstill on
+        # that byte (uDV#177), so signalling at speed would full-pressure stop
+        # the car with the TS cut. FS rules also require standstill for
+        # AS Finished. Per-mission defaults live in _resolve_finish_config
+        # (autocross=1 lap, trackdrive=10, accel=75 m distance). -1 => use the
+        # mission default; >= 0 overrides. Trackdrive additionally needs
+        # control_node to hold its stop-anchor to the closing lap — that is
+        # what /slam/final_lap drives.
         self.declare_parameter("laps_to_finish", -1)
         self.declare_parameter("finish_distance_m", -1.0)
         self.declare_parameter("finish_standstill_speed_mps", 0.5)
@@ -523,6 +526,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # subscriber inherits the current value.
         self._finished_pub = None
         self._final_lap_pub = None
+        self._stop_request_pub = None
 
     # ------------------------------------------------------------------
     # Run-memory reset
@@ -576,6 +580,8 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # Last value published on /slam/final_lap; None = nothing sent yet, so
         # a fresh run always re-announces even if it matches the last run's.
         self._final_lap_published = None
+        # Last /slam/stop_request value published; None = nothing sent yet.
+        self._stop_request_published = None
 
     # ------------------------------------------------------------------
     # Lifecycle transitions
@@ -714,6 +720,16 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # it (re)activates mid-run, not wait for the next edge.
         self._final_lap_pub = self.create_lifecycle_publisher(
             Bool, "/slam/final_lap", finished_qos
+        )
+        # /slam/stop_request — "criterion met, car still rolling: stop it".
+        # mission_control turns this into DV_STOPPING so the uDV can brake.
+        # Distinct from /slam/finished, which requires standstill — the car
+        # has no service brake, so it can never reach standstill unaided and
+        # /slam/finished would never fire. Latched for the same reason as its
+        # siblings: a late/re-activating consumer must inherit the request,
+        # not miss the edge and leave the car rolling.
+        self._stop_request_pub = self.create_lifecycle_publisher(
+            Bool, "/slam/stop_request", finished_qos
         )
 
         # TF broadcaster — non-lifecycle (tf2 doesn't ship lifecycle
@@ -854,6 +870,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # from the first tick, and control must see that immediately or it
         # would never arm its stop anchor for those missions.
         self._publish_final_lap(force=True)
+        self._publish_stop_request(force=True)
 
         return super().on_activate(state)
 
@@ -927,6 +944,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._gt_error_pub = None
         self._finished_pub = None
         self._final_lap_pub = None
+        self._stop_request_pub = None
 
         # tf2 broadcasters are not lifecycle-aware; drop the ref.
         # The static map→odom broadcaster was retired in #382 (map→odom
@@ -1238,6 +1256,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                         self._current_speed()):
                     self._publish_finished()
                 self._publish_final_lap()
+                self._publish_stop_request()
                 self._localize_scan(msg, stamp, predicted_pose, v_world)
                 return
             predicted_pose = self._graph.stage_odom_motion_step(
@@ -1378,6 +1397,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         if self._lap_counter.update(pred_x, pred_y, self._current_speed()):
             self._publish_finished()
         self._publish_final_lap()
+        self._publish_stop_request()
 
         # Mahalanobis DA stays disabled. Three variants tested on
         # 2026-04-29:
@@ -2321,6 +2341,27 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             f"/slam/final_lap → {value} ({self._lap_counter.summary()}) — "
             f"stop anchor held off until the closing lap"
         )
+
+    def _publish_stop_request(self, force: bool = False) -> None:
+        """Publish `/slam/stop_request` on change — "criterion met, still moving".
+
+        Rises when the mission target is met and the car has not yet stopped;
+        stays true through the stop (the counter latches `target_met`), so a
+        flicker can never release a stop already under way. Edge-triggered: the
+        topic is TRANSIENT_LOCAL, so a late consumer inherits the value.
+        """
+        if self._stop_request_pub is None:
+            return
+        value = bool(self._lap_counter.target_met)
+        if not force and value == self._stop_request_published:
+            return
+        self._stop_request_published = value
+        self._stop_request_pub.publish(Bool(data=value))
+        if value:
+            self.get_logger().info(
+                f"/slam/stop_request → true ({self._lap_counter.summary()}) — "
+                f"mission criterion met, requesting hard stop to standstill"
+            )
 
     def _publish_cone_map(self, stamp) -> None:
         """Publish the persistent cone landmark database to /Conos.

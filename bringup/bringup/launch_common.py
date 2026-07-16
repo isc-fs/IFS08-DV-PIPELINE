@@ -240,6 +240,7 @@ def watchdog_action() -> list:
 def management_actions(
     include_sim_supervisor: bool = True,
     free_run=None,
+    hard_stop_on_finish=None,
 ) -> list:
     """Pre-baked management trio, all auto-active.
 
@@ -257,14 +258,23 @@ def management_actions(
             mission_control's `free_run` parameter — the always-on
             data-collection floor. None (sim/full) leaves the node
             default (off).
+        hard_stop_on_finish: if given, sets mission_control's
+            `hard_stop_on_finish` parameter — emit DV_STOPPING (an ASB
+            hard stop to standstill) at mission end. SAFETY-CRITICAL:
+            leave None / false for every normal run; only ever set true
+            for a bench-validated run with byte-7 firmware flashed. See
+            docs/HARD_STOP.md and docs/HARD_STOP_BENCH.md. None leaves the
+            node default (false).
     """
     actions: list = []
     actions += auto_active("mode_manager", "mode_manager_node", "mode_manager_node")
-    mc_params = None
+    mc_params_dict = {}
     if free_run is not None:
-        mc_params = [{
-            "free_run": ParameterValue(free_run, value_type=bool),
-        }]
+        mc_params_dict["free_run"] = ParameterValue(free_run, value_type=bool)
+    if hard_stop_on_finish is not None:
+        mc_params_dict["hard_stop_on_finish"] = ParameterValue(
+            hard_stop_on_finish, value_type=bool)
+    mc_params = [mc_params_dict] if mc_params_dict else None
     actions += auto_active(
         "mission_control", "mission_control_node", "mission_control_node",
         parameters=mc_params,

@@ -7,19 +7,37 @@ returns within ``close_radius_m`` of origin AFTER having left by at least
 ``arm_radius_m`` (re-arm hysteresis, so start-line jitter or a slow crawl
 across the line can't double-count).
 
-Finish is reported ONLY when the per-mission target is met AND the car has
-come to a standstill (``speed <= standstill_mps``). This gate is safety
-critical: entering AS Finished fires the EBS and opens the SDC on the
-firmware (`as_actuation`), so signalling `/slam/finished` while the car is
-still moving would trigger a hard EBS stop at speed. FS rules also define
+Completion is reported in TWO stages, and the split is the whole point:
+
+  ``target_met``  the mission criterion is satisfied — the car is past the
+                  finish line — but it may still be rolling.
+  ``finished``    target_met AND standstill (``speed <= standstill_mps``).
+
+Only ``finished`` drives `/slam/finished`. That gate is safety critical:
+entering AS Finished OPENS THE SDC, which cuts the EBS supply path and thereby
+ACTIVATES the EBS (FS-Rules T14.8.1 / T15.2.2) — so signalling it while the car
+is still moving would trigger a full-pressure stop at speed with the TS cut.
+The firmware does NOT check standstill on this byte (uDV#177): it enters
+AS Finished the moment it sees it, at whatever speed. **This gate is the only
+thing standing between a rolling car and that.** FS rules also define
 AS Finished as a stationary state.
+
+Which raises the obvious question: how does the car reach standstill at all?
+It has no separate service brake — regen is commanded and relayed but does
+nothing on the vehicle — so left alone it merely coasts. ``target_met`` exists
+so something else can command the stop: it is the earliest honest moment to
+say "the mission is over, bring it to rest", without asserting the standstill
+that has not happened yet. Consuming it to actuate the brakes is deliberately
+NOT this module's business — mission_control turns it into DV_STOPPING, an ASB
+actuation with the EBS left armed but NOT activated. See
+mission_control.interface_contract for why that distinction is the whole
+compliance argument.
 
 Two mission shapes:
   * lap-based (``laps_to_finish > 0``): autocross = 1, trackdrive = 10.
-    NB trackdrive additionally needs control_node to hold its stop-anchor
-    to the final lap before it actually drives N laps (follow-up); this
-    counter is forward-compatible — it just won't reach the target until
-    then.
+    Trackdrive also needs control_node to hold its stop-anchor to the closing
+    lap, or it brakes at the end of lap 1 and never reaches 10 — that is what
+    ``final_lap`` below drives, via `/slam/final_lap`.
   * distance-based (``finish_distance_m > 0``): straight missions that
     never return to origin, e.g. acceleration (~75 m).
 
@@ -69,6 +87,12 @@ class LapCounter:
         self.lap_count = 0
         self._armed = False
         self.finished = False
+        # Latches true when the mission's completion criterion is met,
+        # REGARDLESS of speed. `finished` is this plus standstill. Split out
+        # because with no working service brake the car cannot reach standstill
+        # on its own — something has to command the stop first, and it needs
+        # this earlier signal to do it. See the `target_met` docs below.
+        self.target_met = False
 
     @property
     def enabled(self) -> bool:
@@ -125,9 +149,16 @@ class LapCounter:
             self.cfg.finish_distance_m > 0.0
             and dist >= self.cfg.finish_distance_m
         )
-        stopped = speed_mps <= self.cfg.standstill_mps
+        # Latch the criterion separately from the standstill gate. Latching
+        # matters: the car is past the finish line and must come to rest, so a
+        # criterion that could un-meet itself (an accel run drifting back under
+        # finish_distance_m, a lap counter reset) would release a stop already
+        # in progress. Once met, always met — until the run resets.
+        if lap_done or dist_done:
+            self.target_met = True
 
-        if (lap_done or dist_done) and stopped:
+        stopped = speed_mps <= self.cfg.standstill_mps
+        if self.target_met and stopped:
             self.finished = True
             return True
         return False

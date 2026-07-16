@@ -53,6 +53,69 @@ DV_RUNNING   = 3   # activated, emitting /ctrl/cmd
 DV_FINISHED  = 4   # mission complete (was RuntimeControl outcome=finished)
 DV_EMERGENCY = 5   # pipeline raised EBS (was outcome=emergency)
 DV_FAILED    = 6   # prepare/activate error (was Result success=false/error)
+# DV_STOPPING — "mission over, bring the car to rest NOW, but this is not an
+# emergency". Requested when the mission criterion is met while the car is
+# still rolling; the pipeline holds it until standstill, then reports
+# DV_FINISHED and the uDV runs the normal AS Finished actuation.
+#
+# *** IT IS AN **ASB** ACTUATION. IT DOES NOT "FIRE THE EBS". ***
+# This distinction is not pedantry — it IS the compliance argument, and getting
+# it backwards is what makes people think this byte is illegal (it isn't).
+#
+#   FS-Rules 2026 T15.1.1: the vehicle has an **ASB** (Autonomous System Brake)
+#   "that features an EBS ... as part of it". The ASB is the brake system; the
+#   EBS is its fail-safe subset. T14.4.1 names the concept we use directly:
+#   "autonomous brake actuation".
+#
+#   T14.8.1: the EBS is "activated" ONLY IF **the T15.2.2 power supply path is
+#   cut** — NOT merely when the brakes are applied. T15.2.2 lists that path
+#   exhaustively: LVMS + ASMS + the RES-bypass relay's NO contact + a relay
+#   supplied by the SDC. The uDV's actuator lines (D1/D2) are NOT in it.
+#
+# So with all four supply elements intact — and in particular **the SDC CLOSED**
+# — asserting the actuators applies brake pressure while the EBS is NOT
+# "activated". Figure 15 (T14.8.3) then takes its left branch, R2D is still
+# true, and the car is legitimately in **AS Driving** while braking.
+#
+# The existence proof is AS Ready: T14.4.1 closes the SDC precisely BECAUSE
+# "sufficient brake pressure is built up, i.e. brakes are closed". Brakes on +
+# SDC closed + EBS not activated is the state every FS car sits in before every
+# run. If actuating the brakes counted as EBS activation, no car could ever arm.
+#
+# Corollary, and why DV_FINISHED is different: AS Finished REQUIRES
+# "EBS activated? yes" (Figure 15, right branch). So the uDV opening the SDC at
+# standstill is not incidental — cutting the supply path is what makes AS
+# Finished reachable at all. DV_FINISHED genuinely does activate the EBS.
+# DV_STOPPING genuinely does not. Do not conflate them.
+#
+# *** FULL BRAKE PRESSURE. END-OF-MISSION ONLY. NEVER TO MODULATE SPEED. ***
+# There is NO separate service brake on the IFS08 (uDV#176): the ASB's only
+# actuators are the EBS's actuators, and they are BINARY — apply or release,
+# nothing to ramp or PWM. So this byte is not "brake a bit", it is "stop, now,
+# hard". It buys exactly one thing: reaching standstill at the end of a mission
+# so AS Finished becomes reachable. Using it mid-run to trim speed would be a
+# full-pressure stop at every application, and the uDV team asked explicitly
+# that `hard_stop_on_finish` stay strictly end-of-mission. `LapCounter.
+# target_met` enforces that — it only latches on the mission's criterion.
+#
+# The uDV team will still run this past scrutineering before a real run; if
+# push-back comes, it stays gated off. Note T14.11.1 requires the ASF to
+# document the entire AS "including ASB" — so describe this as an ASB actuation
+# there too, not as an EBS trigger.
+#
+# *** SAFE TO SHIP AHEAD OF FIRMWARE — but keep the gate closed for now. ***
+# The firmware compares /dv/status for EQUALITY against only the bytes it acts
+# on (READY=2, FINISHED=4, EMERGENCY=5, FAILED=6), so byte 7 is inert on today's
+# build — RUNNING=3 has always been "unknown" to it in exactly the same way. No
+# lockstep flash needed. `hard_stop_on_finish` still defaults FALSE, now for a
+# different reason than when it was written: not "unknown byte, unknown risk"
+# (that is resolved) but "the pairing has not been bench-validated yet".
+#
+# ONE EXCEPTION, and it is a footgun: in AS READY an unrecognised byte makes
+# `dv_ready` false and the uDV REFUSES GO — the car silently never launches.
+# So this byte must never be emitted while arming. mission_control gates its
+# emission on the real AS state being AS_DRIVING; see _current_dv_status.
+DV_STOPPING  = 7   # hard stop requested — brake to standstill, SDC stays closed
 
 # Free-run (always-on data-collection) default mission. When the free_run
 # flag is set, mission_control brings the autonomy floor — everything but
@@ -72,6 +135,12 @@ TOPIC_AMI_MISSION = "/ami/mission"
 TOPIC_DV_STATUS   = "/dv/status"
 TOPIC_CTRL_CMD    = "/ctrl/cmd"
 SERVICE_FORCE_EBS = "/force_ebs"
+
+# DVPC-INTERNAL: slam → mission_control. "The mission criterion is met but the
+# car is still rolling" — the trigger for the DV_STOPPING hard stop. Distinct
+# from /slam/finished, which additionally requires standstill; see
+# cone_slam.lap_counter for why the two must not be conflated.
+TOPIC_SLAM_STOP_REQUEST = "/slam/stop_request"
 
 # DVPC-INTERNAL emergency channel — not part of the uDV wire contract above.
 # pipeline_watchdog (the independent supervisor) latches this true when the

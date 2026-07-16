@@ -65,6 +65,14 @@ def generate_launch_description() -> LaunchDescription:
         # Always-on data-collection floor (see module docstring). Default on
         # for now; flip to false for a lighter-CPU build.
         DeclareLaunchArgument("free_run", default_value="true"),
+        # ASB hard stop at mission end (DV_STOPPING). SAFETY-CRITICAL, so it is
+        # a launch arg rather than a source default: it stays FALSE for every
+        # normal run and is only ever set true for a bench-validated run with
+        # byte-7 firmware flashed:
+        #     ros2 launch bringup car_pipeline.launch.py hard_stop_on_finish:=true
+        # See docs/HARD_STOP_BENCH.md for the three-stage validation that must
+        # pass BEFORE this is enabled on a real run.
+        DeclareLaunchArgument("hard_stop_on_finish", default_value="false"),
 
         # ------------------ Bag recorder ------------------
         # Always-on service host (/bag_recorder/start + /bag_recorder/stop);
@@ -83,6 +91,7 @@ def generate_launch_description() -> LaunchDescription:
     actions += management_actions(
         include_sim_supervisor=False,
         free_run=LaunchConfiguration("free_run"),
+        hard_stop_on_finish=LaunchConfiguration("hard_stop_on_finish"),
     )
     # Autonomy wired onto the real-vehicle topic surface.
     actions += autonomy_actions(profile="car")

@@ -191,3 +191,70 @@ def test_trackdrive_finishes_only_after_ten_laps_and_standstill():
     # Control brakes at the anchor; the car comes to rest on the line.
     assert c.update(0.0, 0.0, STOPPED) is True
     assert c.finished
+
+
+# ---------------------------------------------------------------------
+# target_met — the hard-stop trigger
+#
+# The car has no working service brake (regen is commanded and relayed but
+# does nothing on the vehicle), so it cannot reach standstill unaided and
+# `finished` would never fire. target_met is the earliest honest moment to say
+# "the mission is over, bring it to rest" WITHOUT asserting a standstill that
+# has not happened. Conflating the two would signal AS Finished at speed — which
+# opens the SDC, cutting the EBS supply path and activating the EBS (T14.8.1),
+# i.e. a full-pressure stop with the TS cut. target_met instead drives an ASB
+# actuation (DV_STOPPING) with the EBS left armed.
+# ---------------------------------------------------------------------
+
+def test_target_met_false_before_the_criterion():
+    c = LapCounter(LapCounterConfig(laps_to_finish=1))
+    assert c.target_met is False
+    c.update(20.0, 0.0, MOVING)          # out, not back yet
+    assert c.target_met is False
+
+
+def test_target_met_rises_while_still_moving():
+    """The whole point: it must NOT wait for standstill."""
+    c = LapCounter(LapCounterConfig(laps_to_finish=1))
+    _drive_out_and_back(c, MOVING)
+    assert c.lap_count == 1
+    assert c.target_met is True
+    assert c.finished is False, "finished must still require standstill"
+
+
+def test_target_met_on_distance_missions():
+    """Accel: crossing the finish distance at speed."""
+    c = LapCounter(LapCounterConfig(finish_distance_m=75.0))
+    c.update(50.0, 0.0, MOVING)
+    assert c.target_met is False
+    c.update(80.0, 0.0, MOVING)
+    assert c.target_met is True
+    assert c.finished is False
+
+
+def test_target_met_latches_through_the_stop():
+    """A criterion that could un-meet itself would release a stop already in
+    progress. Accel drifting back under the distance must not do that."""
+    c = LapCounter(LapCounterConfig(finish_distance_m=75.0))
+    c.update(80.0, 0.0, MOVING)
+    assert c.target_met
+    c.update(70.0, 0.0, MOVING)          # back under the line
+    assert c.target_met, "stop request released mid-stop"
+
+
+def test_target_met_never_true_without_a_criterion():
+    """Skidpad has no criterion — must never request a hard stop."""
+    c = LapCounter(LapCounterConfig())
+    for _ in range(5):
+        _drive_out_and_back(c, MOVING)
+    assert c.target_met is False
+
+
+def test_target_met_precedes_finished_then_finished_follows():
+    """The intended sequence: criterion → (brakes) → standstill → finished."""
+    c = LapCounter(LapCounterConfig(laps_to_finish=1))
+    _drive_out_and_back(c, MOVING)
+    assert c.target_met and not c.finished     # request the hard stop
+    assert c.update(0.0, 0.0, MOVING) is False  # still rolling
+    assert c.update(0.0, 0.0, STOPPED) is True  # uDV braked it to rest
+    assert c.finished
