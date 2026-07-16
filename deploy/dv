@@ -1,16 +1,30 @@
 #!/usr/bin/env bash
 # dv — DVPC racing-operation control + status
-# Usage: dv {race|stop|restart|update|mode [race|umbilical|auto]|status}
+# Usage: dv {race|manual [stop]|stop|restart|update|mode [race|umbilical|auto]|status}
 #
 # Versioned in IFS08-DV-PIPELINE/deploy/ (installed to /usr/local/bin by
 # install_dv_pipeline_service.sh). Racing operation = dv-pipeline.service
 # (the real pipeline from dv_ws); the old isc-startup stub stack is legacy.
+# `dv manual` = dv-manual.service: record a manual-driving bag (sensors only,
+# no autonomy). `dv stop` stops BOTH units.
 set -uo pipefail
 _mark(){ cat /proc/sys/kernel/random/boot_id > "$HOME/.dv_decision" 2>/dev/null || true; }
 
 case "${1:-status}" in
   race)    sudo -n systemctl start   dv-pipeline.service && echo "[dv] racing operation started"   ; _mark ;;
-  stop)    sudo -n systemctl stop    dv-pipeline.service && echo "[dv] racing operation stopped"   ; _mark ;;
+  # Manual-driving recorder: sensors + bag, no pipeline. `dv manual` starts,
+  # `dv manual stop` stops just this unit. Refuses to start while the pipeline
+  # is up (both launch the Hesai driver — running both fights over it).
+  manual)
+    if [ "${2:-}" = "stop" ]; then
+      sudo -n systemctl stop dv-manual.service && echo "[dv] manual recording stopped"
+    elif systemctl is-active --quiet dv-pipeline.service; then
+      echo "[dv] pipeline is running — 'dv stop' it first (both use the Hesai driver)"; exit 1
+    else
+      sudo -n systemctl start dv-manual.service && echo "[dv] manual recording started (sensors only, bag: manual_*)"
+    fi ;;
+  # Stop BOTH the racing pipeline and the manual recorder, whichever is up.
+  stop)    sudo -n systemctl stop dv-pipeline.service dv-manual.service && echo "[dv] stopped (pipeline + manual)" ; _mark ;;
   restart) sudo -n systemctl restart dv-pipeline.service && echo "[dv] racing operation restarted" ;;
   # After a successful update, re-bake the Numba JIT cache: the update
   # rewrites sources, which is exactly what invalidates it. Baking now (on
@@ -37,11 +51,11 @@ case "${1:-status}" in
   status)
     echo "mode:         $(cat /run/dv_mode 2>/dev/null || echo unknown)  (enp2s0 carrier=$(cat /sys/class/net/enp2s0/carrier 2>/dev/null || echo ?), override=$(cat /etc/dv/mode 2>/dev/null || echo auto))"
     echo "pipeline:     health=$(cat /run/dv_pipeline_health 2>/dev/null || echo unknown)"
-    for s in dv-pipeline dv-record microros-agent ptp4l dv-mode isc-startup; do
+    for s in dv-pipeline dv-manual dv-record microros-agent ptp4l dv-mode isc-startup; do
       printf "%-16s %s\n" "$s:" "$(systemctl is-active "$s" 2>/dev/null)"
     done
-    echo "last bag:     $(ls -1dt /home/isc/bags/race_* /home/isc/bags/umbilical_* 2>/dev/null | head -1 || echo none)"
+    echo "last bag:     $(ls -1dt /home/isc/bags/race_* /home/isc/bags/umbilical_* /home/isc/bags/manual_* 2>/dev/null | head -1 || echo none)"
     echo "last update:  $(tail -1 /home/isc/dv_ws/update_status.txt 2>/dev/null || echo none)"
     ;;
-  *) echo "usage: dv {race|stop|restart|update|mode [race|umbilical|auto]|status}"; exit 1 ;;
+  *) echo "usage: dv {race|manual [stop]|stop|restart|update|mode [race|umbilical|auto]|status}"; exit 1 ;;
 esac

@@ -34,10 +34,12 @@ mkdir -p "$BK"
 
 for f in /etc/systemd/system/dv-pipeline.service \
          /etc/systemd/system/dv-record.service \
+         /etc/systemd/system/dv-manual.service \
          /usr/local/bin/dv \
          /usr/local/bin/dv_mode_boot.sh \
          /usr/local/bin/dv_detect_mode.sh \
          /usr/local/bin/dv_record.sh \
+         /usr/local/bin/dv_manual.sh \
          /usr/local/bin/dv_warm_numba.sh \
          /etc/profile.d/zz-dv-mode-prompt.sh; do
   [ -f "$f" ] && cp -a "$f" "$BK/" && echo "backed up $f"
@@ -45,10 +47,12 @@ done
 
 install -m 644 "$HERE/dv-pipeline.service" /etc/systemd/system/dv-pipeline.service
 install -m 644 "$HERE/dv-record.service"   /etc/systemd/system/dv-record.service
+install -m 644 "$HERE/dv-manual.service"   /etc/systemd/system/dv-manual.service
 install -m 755 "$HERE/dv"                  /usr/local/bin/dv
 install -m 755 "$HERE/dv_mode_boot.sh"     /usr/local/bin/dv_mode_boot.sh
 install -m 755 "$HERE/dv_detect_mode.sh"   /usr/local/bin/dv_detect_mode.sh
 install -m 755 "$HERE/dv_record.sh"        /usr/local/bin/dv_record.sh
+install -m 755 "$HERE/dv_manual.sh"        /usr/local/bin/dv_manual.sh
 install -m 755 "$HERE/dv_warm_numba.sh"    /usr/local/bin/dv_warm_numba.sh
 
 # Boot-mode override dir: isc-owned so `dv mode {race|umbilical|auto}` can
