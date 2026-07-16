@@ -48,8 +48,33 @@ start `mission_control` or the autonomy nodes.
 dv manual         # start: sensors + recorder, bag = manual_<timestamp>
 dv manual stop    # stop just the manual recorder
 dv stop           # stop everything (pipeline + manual)
-dv status         # shows dv-manual state + last bag
+dv status         # shows dv-manual + dv-automission state + last bag
 ```
+
+### Automatic on AMI Manual (the default)
+
+You normally don't run `dv manual` by hand. `dv-automission.service` (enabled at
+boot) watches `/ami/mission` and reconciles the manual recorder to it:
+
+| AMI selection | Automission does |
+|---|---|
+| **Manual (0)**, no pipeline | **starts** `dv-manual` → records |
+| a real DV mission (1–9) | **stops** `dv-manual` (so `dv race` gets a clean Hesai + its own recorder) |
+| `/ami/mission` not seen | leaves current state (no thrash on an agent blip) |
+| `/etc/dv/norecord` present | stops + stays idle |
+
+Manual is index 0 = the default, so **power on with the dial at Manual → it
+records itself**, no pipeline, no commands to the car. Dial a real mission and
+`dv race`; dial back to Manual after `dv stop` and it resumes (within ~2 s).
+
+> ⚠️ **Blocked on isc-fs/IFS08-DV-uDV#189.** Auto-trigger only fires if the uDV
+> publishes `/ami/mission` with the **ASMS off** (manual driving). Until that
+> lands, `/ami/mission` isn't seen in this state and the watcher stays **idle** —
+> `dv manual` by hand still works. Once the uDV confirms, no pipeline change is
+> needed.
+
+**Opt out:** `touch /etc/dv/norecord` (honoured live) or
+`sudo systemctl disable --now dv-automission.service`.
 
 ### The full car sensor set
 

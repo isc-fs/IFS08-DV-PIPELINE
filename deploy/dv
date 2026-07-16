@@ -51,7 +51,7 @@ case "${1:-status}" in
   status)
     echo "mode:         $(cat /run/dv_mode 2>/dev/null || echo unknown)  (enp2s0 carrier=$(cat /sys/class/net/enp2s0/carrier 2>/dev/null || echo ?), override=$(cat /etc/dv/mode 2>/dev/null || echo auto))"
     echo "pipeline:     health=$(cat /run/dv_pipeline_health 2>/dev/null || echo unknown)"
-    for s in dv-pipeline dv-manual dv-record microros-agent ptp4l dv-mode isc-startup; do
+    for s in dv-pipeline dv-manual dv-automission dv-record microros-agent ptp4l dv-mode isc-startup; do
       printf "%-16s %s\n" "$s:" "$(systemctl is-active "$s" 2>/dev/null)"
     done
     echo "last bag:     $(ls -1dt /home/isc/bags/race_* /home/isc/bags/umbilical_* /home/isc/bags/manual_* 2>/dev/null | head -1 || echo none)"
