@@ -51,27 +51,33 @@ dv stop           # stop everything (pipeline + manual)
 dv status         # shows dv-manual + dv-automission state + last bag
 ```
 
-### Automatic on AMI Manual (the default)
+### Automatic whenever the car is powered (zero-touch, no AMI)
 
 You normally don't run `dv manual` by hand. `dv-automission.service` (enabled at
-boot) watches `/ami/mission` and reconciles the manual recorder to it:
+boot) watches the **uDV sensor stream** (`/imu`) and reconciles the manual
+recorder to it — it keys off *"is the car on?"*, not any AMI selection:
 
-| AMI selection | Automission does |
+| Condition | Automission does |
 |---|---|
-| **Manual (0)**, no pipeline | **starts** `dv-manual` → records |
-| a real DV mission (1–9) | **stops** `dv-manual` (so `dv race` gets a clean Hesai + its own recorder) |
-| `/ami/mission` not seen | leaves current state (no thrash on an agent blip) |
+| car powered (`/imu` live), no pipeline | **starts** `dv-manual` → records |
+| pipeline running (`dv race`) | **stops** `dv-manual` (pipeline's own recorder takes over) |
+| `/imu` silent ≥ ~6 s (car off / uDV down) | **stops** `dv-manual` (finalizes the bag) |
+| brief `/imu` blip | leaves current state (no thrash) |
 | `/etc/dv/norecord` present | stops + stays idle |
 
-Manual is index 0 = the default, so **power on with the dial at Manual → it
-records itself**, no pipeline, no commands to the car. Dial a real mission and
-`dv race`; dial back to Manual after `dv stop` and it resumes (within ~2 s).
+So: **power the car → it records.** No AMI, no button, no commands to the car.
+`dv race` hands off cleanly; `dv stop` (car still on) resumes manual recording.
 
-> ⚠️ **Blocked on isc-fs/IFS08-DV-uDV#189.** Auto-trigger only fires if the uDV
-> publishes `/ami/mission` with the **ASMS off** (manual driving). Until that
-> lands, `/ami/mission` isn't seen in this state and the watcher stays **idle** —
-> `dv manual` by hand still works. Once the uDV confirms, no pipeline change is
-> needed.
+**No firmware dependency** — `/imu` already publishes continuously with the ASMS
+off (confirmed uDV#189). (We dropped the earlier `/ami/mission` trigger: the AMI
+board only emits an index after the operator *confirms* a mission, so it needed
+a button press — see uDV#189.)
+
+> ⚠️ **Disk:** this records from power-on, **including idle setup time**, and the
+> bag includes the ~45 MB/s lidar cloud — long powered-but-idle periods burn disk
+> fast (~2.7 GB/min). `touch /etc/dv/norecord` to pause, `dv stop` when done, or
+> `DV_RECORD_EXCLUDE='^/lidar_points$'` for a light telemetry-only bag. The
+> `DV_RECORD_MIN_FREE_GB` floor still refuses to start below the free-space limit.
 
 **Opt out:** `touch /etc/dv/norecord` (honoured live) or
 `sudo systemctl disable --now dv-automission.service`.
