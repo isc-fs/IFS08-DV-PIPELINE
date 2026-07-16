@@ -1,0 +1,37 @@
+# dv-manual.service — record a rosbag during MANUAL driving, no pipeline.
+# Brings up ONLY the sensor layer (Hesai + TFs) and records the full sensor
+# graph (incl. raw /lidar_points) with a `manual_` bag prefix. Does NOT start
+# mission_control or the autonomy nodes — so a manual lap can be recorded for
+# offline replay without the autonomy stack running.
+#
+# Deliberately NOT enabled and NOT tied to dv-pipeline.service: the operator
+# starts it with `dv manual` and stops it with `dv manual stop` (or `dv stop`,
+# which stops both units). Mutually exclusive with dv-pipeline in practice —
+# both launch the Hesai driver, so don't run them at once.
+#
+# Versioned in IFS08-DV-PIPELINE/deploy/ — install with
+#   sudo ~/dv_ws/src/IFS08-DV-PIPELINE/deploy/install_dv_pipeline_service.sh
+
+[Unit]
+Description=ISC DV manual-driving rosbag recorder (sensors only, no autonomy)
+Documentation=https://github.com/isc-fs/IFS08-DV-PIPELINE
+# The uDV link supplies /imu + /motor_rpm + /steering_angle; nice to have in
+# the bag but not required (the cloud alone is still useful), so Wants not
+# Requires — a manual bag should record even if the agent is down.
+After=network.target microros-agent.service
+Wants=microros-agent.service
+
+[Service]
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+Environment=NUMBA_CACHE_DIR=/home/isc/.cache/dv_numba
+User=isc
+ExecStart=/usr/local/bin/dv_manual.sh
+# SIGINT (not SIGTERM) so ros2 bag record finalizes the bag metadata; the
+# default control-group kill mode propagates it to the backgrounded sensor
+# launch in the same cgroup, shutting the Hesai driver down cleanly too.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=15
+
+# Not enabled — started on demand by `dv manual`.
