@@ -204,7 +204,23 @@ _LATCHED_QOS = QoSProfile(
 )
 # /dv/status + /ctrl/cmd: steady streams, latest-wins. /dv/status is
 # latched so a late-joining uDV/emulator immediately sees the last byte.
-_STATUS_QOS = _LATCHED_QOS
+# /dv/status heartbeat QoS. RELIABLE + TRANSIENT_LOCAL forces the uDV reader to
+# ACKNACK every sample back over its single blocking TX, which congestion-
+# collapses the link under driving load (dv_lost_driving; see IFS08-DV-uDV#166).
+# BEST_EFFORT + VOLATILE = latest-wins: a delayed heartbeat is superseded, not
+# head-of-line-blocked, and the reader emits no ACKs.
+#
+# BLOCKED — merge ONLY in lockstep with the uDV reader going best_effort
+# (IFS08-DV-uDV ros_task.c). A best-effort writer + reliable reader is
+# INCOMPATIBLE under DDS RxO and the link goes dark.
+# TODO before merge: continuous READY/RUNNING is safe best-effort, but edge
+# codes (FINISHED/EMERGENCY) can be dropped — repeat the edge code for N cycles
+# or carry it on a separate low-rate latched byte. Coordinate with uDV#166.
+_STATUS_QOS = QoSProfile(
+    depth=10,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE,
+)
 _CMD_QOS = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
 
