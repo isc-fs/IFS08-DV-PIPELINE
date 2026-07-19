@@ -81,6 +81,11 @@ from path_planning.planner_strategies import (
     PATH_PLANNING_STRATEGY_MAP,
     PathPlannerStrategy,
 )
+# Deterministic-skidpad runtime. Imported lazily-in-spirit (module-level import
+# is fine — skidpad is a pure package with only rclpy/nav_msgs/std_msgs deps),
+# entered ONLY when the behavior is skidpad. The FaSTTUBe path below is
+# untouched for every other mission.
+from skidpad.skidpad_planner_runtime import SkidpadPlannerRuntime
 
 
 def _build_debug_markers(debug: PlanDebug) -> MarkerArray:
@@ -192,6 +197,11 @@ class PathPlanningNode(BaseLifecycleNode):
 
         self._adapter: Optional[FasttubeAdapter] = None
 
+        # Deterministic-skidpad runtime. Non-None ONLY in skidpad mode; when set,
+        # every lifecycle transition and all I/O is delegated to it and the
+        # FaSTTUBe machinery below is never created or entered.
+        self._skidpad: Optional[SkidpadPlannerRuntime] = None
+
         # Per-second instrumentation. Each callback falls into exactly
         # one bucket; rates are logged every ~1 s in _maybe_log_stats.
         # In a healthy run cb≈publish; everything else is a starvation
@@ -231,6 +241,19 @@ class PathPlanningNode(BaseLifecycleNode):
             self.get_logger().error("Strategy is not a PathPlannerStrategy")
             return TransitionCallbackReturn.FAILURE
         self._strategy = strategy
+
+        # Deterministic missions (skidpad) never touch FaSTTUBe: hand the whole
+        # node over to the skidpad runtime and return before any cone planner,
+        # TF, Numba warmup or /Conos wiring is created. Everything below stays
+        # exactly as it was for trackdrive / autocross / accel.
+        if strategy.is_deterministic():
+            self.get_logger().info(
+                f"behavior={self._behavior!r} is deterministic — routing to the "
+                "skidpad reference planner (no FaSTTUBe)")
+            self._skidpad = SkidpadPlannerRuntime(self)
+            self._skidpad.on_configure()
+            return TransitionCallbackReturn.SUCCESS
+
         mission_type = strategy.get_mission_type()
 
         self.publisher_path = self.create_lifecycle_publisher(
@@ -279,6 +302,10 @@ class PathPlanningNode(BaseLifecycleNode):
     def on_activate(
         self, state: LifecycleState
     ) -> TransitionCallbackReturn:
+        if self._skidpad is not None:
+            self.get_logger().info("on_activate: skidpad reference planner")
+            self._skidpad.on_activate()
+            return super().on_activate(state)
         self.get_logger().info("on_activate: subscribing to /Conos")
         self._reset_stats()
         self._sub = self.create_subscription(
@@ -288,6 +315,10 @@ class PathPlanningNode(BaseLifecycleNode):
     def on_deactivate(
         self, state: LifecycleState
     ) -> TransitionCallbackReturn:
+        if self._skidpad is not None:
+            self.get_logger().info("on_deactivate: skidpad reference planner")
+            self._skidpad.on_deactivate()
+            return super().on_deactivate(state)
         self.get_logger().info("on_deactivate: dropping /Conos subscription")
         if self._sub is not None:
             self.destroy_subscription(self._sub)
@@ -297,6 +328,12 @@ class PathPlanningNode(BaseLifecycleNode):
     def on_cleanup(
         self, state: LifecycleState
     ) -> TransitionCallbackReturn:
+        if self._skidpad is not None:
+            self.get_logger().info("on_cleanup: skidpad reference planner")
+            self._skidpad.on_cleanup()
+            self._skidpad = None
+            self._reset_stats()
+            return super().on_cleanup(state)
         self.get_logger().info("on_cleanup: destroying publishers + TF")
         if self._sub is not None:
             self.destroy_subscription(self._sub)

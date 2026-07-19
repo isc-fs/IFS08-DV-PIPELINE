@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>skidpad</name>
+  <version>0.0.0</version>
+  <description>Deterministic skidpad: the FS-Rules figure-eight as a fixed pre-computed reference path (skidpad_reference), a per-tick driver that tracks arc-length progress from the EKF pose and emits the forward window + finish flag (skidpad_driver), and a thin ROS runtime (skidpad_planner_runtime) that path_planning_node delegates to in skidpad mode. No perception, no cone map — the track is fully rule-defined. Pure-Python core is unit-tested off-node.</description>
+  <maintainer email="agonzaleztabernero@gmail.com">alvaro</maintainer>
+  <license>GPL-3.0-or-later</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

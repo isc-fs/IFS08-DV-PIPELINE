@@ -56,6 +56,10 @@ from cone_slam.factor_graph import FactorGraph, ScanResult
 from cone_slam.imu_preintegrator import ImuPreintegrator, ImuSample
 from cone_slam.landmark_db import LandmarkDb
 from cone_slam.lap_counter import LapCounter, LapCounterConfig
+from cone_slam.skidpad_passthrough import (
+    identity_map_to_odom,
+    passthrough_pose,
+)
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from node_base.base_lifecycle_node import BaseLifecycleNode
@@ -496,6 +500,14 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         # scan tick.
         self._sub_supervisor_odom = None
         self._latest_supervisor_odom: Optional[Odometry] = None
+        # Deterministic-skidpad pose passthrough. In skidpad mode the
+        # figure-eight breaks cone-graph data association (the same physical
+        # arcs are revisited across laps), so we do NOT run the graph: /slam/pose
+        # is the EKF /odom pose republished as-is and map→odom is identity. The
+        # deterministic planner (skidpad package, in path_planning_node) owns the
+        # path + /slam/finished. Set from the behavior in on_configure. See
+        # skidpad-deterministic-design memory.
+        self._skidpad_passthrough = False
         # /odom pose at the previous SCAN tick (not the previous /odom
         # message). Used to compute the EKF's per-scan delta-pose and
         # stage it as a BetweenFactor on X(k-1)→X(k). Reset on activate.
@@ -595,6 +607,17 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self.map_frame = self.get_parameter("map_frame").value
         self.odom_frame = self.get_parameter("odom_frame").value
         self.base_frame = self.get_parameter("base_frame").value
+
+        # Deterministic skidpad: publish /slam/pose straight from the EKF /odom
+        # and skip the cone graph entirely (see the flag's init + the guards in
+        # _on_cones / _on_supervisor_odom). All graph machinery below is still
+        # built but simply never fed, so no other mission is affected.
+        self._skidpad_passthrough = (self._behavior == "skidpad")
+        if self._skidpad_passthrough:
+            self.get_logger().warn(
+                "behavior=skidpad — POSE PASSTHROUGH mode: /slam/pose = EKF "
+                "/odom, map→odom identity, cone graph DISABLED. The "
+                "deterministic planner owns /Path + /slam/finished.")
 
         motion_model = str(self.get_parameter("motion_model").value).lower()
         if motion_model not in ("odom", "imu"):
@@ -1169,6 +1192,11 @@ class ConeGraphSlamNode(BaseLifecycleNode):
     # ----- Cone observation callback (scan trigger) -------------------------
 
     def _on_cones(self, msg: MarkerArray) -> None:
+        # Deterministic skidpad: the cone graph is disabled — /slam/pose comes
+        # from the EKF /odom passthrough in _on_supervisor_odom, so there is
+        # nothing to do with a scan. Drop it before any graph state is touched.
+        if self._skidpad_passthrough:
+            return
         if self._state != State.SLAM_RUNNING:
             return
         if self._latest_result is None:
@@ -1834,6 +1862,27 @@ class ConeGraphSlamNode(BaseLifecycleNode):
     def _on_supervisor_odom(self, msg: Odometry) -> None:
         """Cache sim_supervisor's latest /odom sample for map→odom math."""
         self._latest_supervisor_odom = msg
+        # Deterministic skidpad: this callback IS the pose source. Republish the
+        # EKF pose on /slam/pose (map frame ≡ odom frame, identity correction)
+        # at the full 100 Hz /odom rate — better for the controller than the
+        # ~10 Hz scan rate, and immune to the figure-eight's cone-association
+        # failure. The scan callback is a no-op in this mode.
+        if self._skidpad_passthrough:
+            self._publish_skidpad_passthrough(msg)
+
+    def _publish_skidpad_passthrough(self, msg: Odometry) -> None:
+        """Deterministic-skidpad pose output: /slam/pose = the EKF /odom pose
+        verbatim (map frame ≡ odom frame), plus an identity map→odom so the TF
+        tree stays rooted. No graph, no drift correction — the pose the operator
+        trusts, unmodified. /Path and /slam/finished come from the planner."""
+        if self._state_pub is None:
+            return
+        self._state_pub.publish(
+            passthrough_pose(msg, self.map_frame, self.base_frame))
+        if self._tf_broadcaster is not None:
+            self._tf_broadcaster.sendTransform(
+                identity_map_to_odom(
+                    msg.header.stamp, self.map_frame, self.odom_frame))
 
     def _ekf_holdover_result(self) -> Optional[ScanResult]:
         """EKF-dead-reckoned pose for a scan with no cone correction.
