@@ -22,6 +22,16 @@ cd ~/dv_ws/src/IFS08-DV-PIPELINE/tools
 ./record_pipeline_replay.sh ~/bags/your_manual_bag trackdrive
 ```
 
+On the DVPC this is also wired into the `dv` control command, so it can be run
+from anywhere without cd-ing into the tools dir:
+
+```bash
+dv replay ~/bags/your_manual_bag trackdrive
+```
+
+`dv replay` refuses to run while the racing pipeline or manual recorder is up
+(`dv stop` them first) — replay spins up its own sim-time pipeline.
+
 See **REPLAY_SETUP_SUMMARY.md** for detailed usage instructions.
 
 ## Documentation
