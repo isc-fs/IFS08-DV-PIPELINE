@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # dv — DVPC racing-operation control + status
-# Usage: dv {race|manual [stop]|stop|restart|update|mode [race|umbilical|auto]|status}
+# Usage: dv {race|manual [stop]|replay <bag> [mission]|stop|restart|update|mode [race|umbilical|auto]|status}
 #
 # Versioned in IFS08-DV-PIPELINE/deploy/ (installed to /usr/local/bin by
 # install_dv_pipeline_service.sh). Racing operation = dv-pipeline.service
 # (the real pipeline from dv_ws); the old isc-startup stub stack is legacy.
 # `dv manual` = dv-manual.service: record a manual-driving bag (sensors only,
-# no autonomy). `dv stop` stops BOTH units.
+# no autonomy). `dv stop` stops BOTH units. `dv replay` = off-line bench tool
+# (tools/record_pipeline_replay.sh): replays a bag through the pipeline in
+# sim-time with a simulated uDV mission and records inputs+outputs; not a
+# systemd unit, runs in the foreground from the workspace checkout.
 set -uo pipefail
 _mark(){ cat /proc/sys/kernel/random/boot_id > "$HOME/.dv_decision" 2>/dev/null || true; }
 
@@ -28,6 +31,25 @@ case "${1:-status}" in
     else
       sudo -n systemctl start dv-manual.service && echo "[dv] manual recording started (sensors only, bag: manual_*)"
     fi ;;
+  # Off-line bench replay: feed a recorded bag back through the pipeline in
+  # sim-time with a simulated uDV mission, recording inputs+outputs to a new
+  # ~/bags/bench_* bag for perf/offline analysis. Not a systemd unit — it runs
+  # the workspace tool in the foreground and passes args straight through
+  # (dv replay <source_bag> [mission] [output_name]). Refused while the pipeline
+  # or manual recorder is up: replay spins its own sim pipeline on the ROS graph
+  # and would collide with a live one.
+  replay)
+    shift
+    tool="$HOME/dv_ws/src/IFS08-DV-PIPELINE/tools/record_pipeline_replay.sh"
+    if systemctl is-active --quiet dv-pipeline.service || systemctl is-active --quiet dv-manual.service; then
+      echo "[dv] pipeline/manual is running — 'dv stop' first (replay drives its own sim pipeline)"; exit 1
+    fi
+    [ -x "$tool" ] || { echo "[dv] replay tool missing: $tool (update the workspace)"; exit 1; }
+    if [ -z "${1:-}" ]; then
+      echo "usage: dv replay <source_bag> [mission] [output_name]"
+      echo "  e.g. dv replay ~/bags/manual_20260720_2130 trackdrive"; exit 1
+    fi
+    "$tool" "$@" ;;
   # Stop BOTH the racing pipeline and the manual recorder, whichever is up.
   stop)    sudo -n systemctl stop dv-pipeline.service dv-manual.service && echo "[dv] stopped (pipeline + manual)" ; _mark ;;
   restart) sudo -n systemctl stop dv-manual.service 2>/dev/null; \
@@ -63,5 +85,5 @@ case "${1:-status}" in
     echo "last bag:     $(ls -1dt /home/isc/bags/*/ 2>/dev/null | head -1 || echo none)"
     echo "last update:  $(tail -1 /home/isc/dv_ws/update_status.txt 2>/dev/null || echo none)"
     ;;
-  *) echo "usage: dv {race|manual [stop]|stop|restart|update|mode [race|umbilical|auto]|status}"; exit 1 ;;
+  *) echo "usage: dv {race|manual [stop]|replay <bag> [mission]|stop|restart|update|mode [race|umbilical|auto]|status}"; exit 1 ;;
 esac
