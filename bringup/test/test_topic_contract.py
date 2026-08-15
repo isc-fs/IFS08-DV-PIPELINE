@@ -103,7 +103,9 @@ def test_sim_profile_preserves_fsds_surface():
     assert ("/fsds/motor_rpm", "/motor_rpm") in sim["odometry_filter_node"]
     assert ("/fsds/steering_angle", "/steering_angle") in \
         sim["odometry_filter_node"]
-    assert ("/fsds/lidar/Lidar1", "/lidar/Lidar1") in sim["cone_detection_node"]
+    # The IFSSIM bridge publishes on /lidar_points (unified with the car's
+    # Hesai topic), so the sim lidar remap now matches the car's exactly.
+    assert ("/fsds/lidar/Lidar1", "/lidar_points") in sim["cone_detection_node"]
 
 
 # --------------------------------------------------------------------
