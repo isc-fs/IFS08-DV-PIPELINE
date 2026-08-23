@@ -1,0 +1,145 @@
+name: CI
+
+# The pipeline had no build/test CI: 23 test files (~4,400 lines) covering the
+# safety state machines, the topic-remap contract, DA gating and the lap
+# counter existed but were never run automatically. The whole suite is green
+# and takes ~9 s, so there is no reason for it not to gate every PR.
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Pipeline — pytest
+    runs-on: ubuntu-latest
+    # Same base the runtime image is built from, so the ROS message packages
+    # the tests import (geometry_msgs, nav_msgs, ...) are already present.
+    container: ros:humble-ros-base
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install apt deps
+        # ros:humble-ros-base ships without pip or colcon; the runtime image
+        # (docker/dv_pipeline_stack/Dockerfile) apt-installs both, so match it.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            python3-pip python3-colcon-common-extensions python3-pytest
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Install Python deps
+        # Mirrors docker/dv_pipeline_stack/Dockerfile in the IFSSIM repo.
+        # NOTE: pytest is deliberately NOT pip-installed. pip resolves to
+        # pytest 9, whose plugin API breaks ROS Humble's bundled
+        # `launch_testing` plugin (PluginValidationError on
+        # pytest_pycollect_makemodule) and which also silently collected a
+        # single test under bare discovery. The apt python3-pytest (6.2.5)
+        # is what ros:humble ships and what the runtime container runs, so
+        # CI exercises the same pytest the team does.
+        # numpy is pinned <2 there because cv_bridge in ros:humble is ABI
+        # locked to 1.x; keep the pin so CI matches runtime.
+        run: |
+          python3 -m pip install --no-cache-dir "numpy==1.24.*"
+          python3 -m pip install --no-cache-dir \
+            "numba>=0.59" scipy scikit-learn transforms3d \
+            typing_extensions icecream
+          # cone_slam imports gtsam at module scope, so the SLAM tests cannot
+          # even be collected without it. Pin matches the runtime image.
+          python3 -m pip install --no-cache-dir "gtsam==4.3a0"
+
+      - name: Install the FaSTTUBe planner
+        # path_planning's tests importorskip('fsd_path_planning'). Under the
+        # pytest 6 that ROS Humble ships, that module-level skip aborts the
+        # WHOLE collection session — every other package silently reported
+        # zero tests and the run exited 5. Installing the planner is the real
+        # fix: it removes the abort AND actually exercises the planner code
+        # the car runs, instead of skipping it.
+        #
+        # Recipe mirrors docker/dv_pipeline_stack/Dockerfile: upstream's
+        # pyproject.toml breaks under pip's build isolation (setuptools-scm in
+        # build-requires overrides the static version), so clone the pinned
+        # commit, replace pyproject with a minimal setup.py, install --no-deps.
+        shell: bash
+        run: |
+          git clone --depth 1 -q https://github.com/papalotis/ft-fsd-path-planning.git /tmp/fsd
+          cd /tmp/fsd
+          git fetch --depth 1 -q origin 0283c83125d1ad5d008d80b62f8750dad5f28fb3
+          git checkout -q 0283c83125d1ad5d008d80b62f8750dad5f28fb3
+          rm -f pyproject.toml
+          printf 'from setuptools import find_namespace_packages, setup\nsetup(name="fsd_path_planning", version="0.4.3.2", packages=find_namespace_packages(include=["fsd_path_planning", "fsd_path_planning.*"]), include_package_data=True)\n' > setup.py
+          pip install --no-cache-dir --no-deps .
+          python3 -c "import fsd_path_planning"
+
+      - name: Build interface packages
+        # dv_msgs / fs_msgs are ROS interface packages: their Python bindings
+        # are GENERATED at build time, so `from dv_msgs.srv import Setup`
+        # cannot resolve from source alone. Only these two need building —
+        # every other package under test is pure Python and is reached via
+        # PYTHONPATH below. Takes ~7 s versus minutes for a full workspace build.
+        # shell: bash is REQUIRED — container jobs default to sh, where the
+        # `source` used by every ROS setup script does not exist.
+        shell: bash
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon build --packages-select dv_msgs fs_msgs \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+      - name: pytest
+        env:
+          RCUTILS_LOGGING_SEVERITY: FATAL
+        shell: bash
+        run: |
+          source /opt/ros/humble/setup.bash
+          source install/setup.bash
+          # Pure-Python ament packages resolve from source; build/install/log
+          # are colcon artifacts, not source, so keep them off the path.
+          export PYTHONPATH="$(ls -d */ | sed 's:/$::' | grep -vE '^(build|install|log)$' | tr '\n' ':')$PYTHONPATH"
+          # Log the resolved pytest — the base image ships an OS pytest in
+          # dist-packages alongside the pip one, so knowing which ran makes
+          # any future collection oddity diagnosable from the log alone.
+          python3 -c "import pytest; print('pytest', pytest.__version__, pytest.__file__)"
+          echo "--- test directories ---"
+          TEST_DIRS=$(ls -d */test 2>/dev/null | tr '\n' ' ')
+          echo "$TEST_DIRS"
+          test -n "$TEST_DIRS" || { echo "::error::no test directories found"; exit 1; }
+          echo "--- running ---"
+          # Point pytest at the test directories explicitly. Bare discovery
+          # (`pytest .`) collected only one test on the GitHub runner while
+          # finding all 244 in the same image locally, so do not rely on it.
+          # The glob keeps this self-maintaining: a new <pkg>/test is picked
+          # up automatically.
+          python3 -m pytest $TEST_DIRS -q --no-header --junit-xml=pytest-results.xml
+          # Guard against the silent-abort mode returning: a real run is
+          # ~244 tests, so anything under 200 means collection broke even
+          # though pytest exited 0.
+          COLLECTED=$(sed -n 's/.*<testsuite[^>]*tests="\([0-9]*\)".*/\1/p' pytest-results.xml | head -1)
+          echo "collected: ${COLLECTED:-0} tests"
+          [ "${COLLECTED:-0}" -ge 200 ] || { echo "::error::only ${COLLECTED:-0} tests collected (expected ~244) — collection is broken"; exit 1; }
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results
+          path: pytest-results.xml
+          if-no-files-found: ignore
+
+  ci-summary:
+    name: CI summary
+    runs-on: ubuntu-latest
+    needs: [tests]
+    if: always()
+    steps:
+      - name: Report
+        run: |
+          echo "tests: ${{ needs.tests.result }}"
+          [ "${{ needs.tests.result }}" = "success" ] || exit 1
