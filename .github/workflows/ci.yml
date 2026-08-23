@@ -73,20 +73,21 @@ jobs:
           # Pure-Python ament packages resolve from source; build/install/log
           # are colcon artifacts, not source, so keep them off the path.
           export PYTHONPATH="$(ls -d */ | sed 's:/$::' | grep -vE '^(build|install|log)$' | tr '\n' ':')$PYTHONPATH"
-          # ros:humble-ros-base ships an OS pytest in dist-packages that can
-          # shadow the pip one and collects differently (it found 1 test where
-          # pip's pytest finds 271). Print what actually resolved so a version
-          # regression is visible rather than mysterious.
+          # Log the resolved pytest — the base image ships an OS pytest in
+          # dist-packages alongside the pip one, so knowing which ran makes
+          # any future collection oddity diagnosable from the log alone.
           python3 -c "import pytest; print('pytest', pytest.__version__, pytest.__file__)"
-          echo "--- test files present ---"
-          find . -name 'test_*.py' -not -path './build/*' -not -path './install/*' | sort
+          echo "--- test directories ---"
+          TEST_DIRS=$(ls -d */test 2>/dev/null | tr '\n' ' ')
+          echo "$TEST_DIRS"
+          test -n "$TEST_DIRS" || { echo "::error::no test directories found"; exit 1; }
           echo "--- running ---"
-          # Let pytest discover rather than passing a shell-expanded list:
-          # discovery is order-stable and cannot silently collapse to a
-          # partial set through word splitting.
-          python3 -m pytest . \
-            --ignore=build --ignore=install --ignore=log \
-            -q --no-header --junit-xml=pytest-results.xml
+          # Point pytest at the test directories explicitly. Bare discovery
+          # (`pytest .`) collected only one test on the GitHub runner while
+          # finding all 244 in the same image locally, so do not rely on it.
+          # The glob keeps this self-maintaining: a new <pkg>/test is picked
+          # up automatically.
+          python3 -m pytest $TEST_DIRS -q --no-header --junit-xml=pytest-results.xml
 
       - name: Upload results
         if: always()
