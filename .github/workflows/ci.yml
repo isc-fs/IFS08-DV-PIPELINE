@@ -33,18 +33,25 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            python3-pip python3-colcon-common-extensions
+            python3-pip python3-colcon-common-extensions python3-pytest
           rm -rf /var/lib/apt/lists/*
 
       - name: Install Python deps
         # Mirrors docker/dv_pipeline_stack/Dockerfile in the IFSSIM repo.
+        # NOTE: pytest is deliberately NOT pip-installed. pip resolves to
+        # pytest 9, whose plugin API breaks ROS Humble's bundled
+        # `launch_testing` plugin (PluginValidationError on
+        # pytest_pycollect_makemodule) and which also silently collected a
+        # single test under bare discovery. The apt python3-pytest (6.2.5)
+        # is what ros:humble ships and what the runtime container runs, so
+        # CI exercises the same pytest the team does.
         # numpy is pinned <2 there because cv_bridge in ros:humble is ABI
         # locked to 1.x; keep the pin so CI matches runtime.
         run: |
           python3 -m pip install --no-cache-dir "numpy==1.24.*"
           python3 -m pip install --no-cache-dir \
             "numba>=0.59" scipy scikit-learn transforms3d \
-            typing_extensions "pytest>=7.4"
+            typing_extensions
           # cone_slam imports gtsam at module scope, so the SLAM tests cannot
           # even be collected without it. Pin matches the runtime image.
           python3 -m pip install --no-cache-dir "gtsam==4.3a0"
