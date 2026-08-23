@@ -44,7 +44,7 @@ jobs:
           python3 -m pip install --no-cache-dir "numpy==1.24.*"
           python3 -m pip install --no-cache-dir \
             "numba>=0.59" scipy scikit-learn transforms3d \
-            typing_extensions pytest
+            typing_extensions "pytest>=7.4"
           # cone_slam imports gtsam at module scope, so the SLAM tests cannot
           # even be collected without it. Pin matches the runtime image.
           python3 -m pip install --no-cache-dir "gtsam==4.3a0"
@@ -73,6 +73,11 @@ jobs:
           # Pure-Python ament packages resolve from source; build/install/log
           # are colcon artifacts, not source, so keep them off the path.
           export PYTHONPATH="$(ls -d */ | sed 's:/$::' | grep -vE '^(build|install|log)$' | tr '\n' ':')$PYTHONPATH"
+          # ros:humble-ros-base ships an OS pytest in dist-packages that can
+          # shadow the pip one and collects differently (it found 1 test where
+          # pip's pytest finds 271). Print what actually resolved so a version
+          # regression is visible rather than mysterious.
+          python3 -c "import pytest; print('pytest', pytest.__version__, pytest.__file__)"
           echo "--- test files present ---"
           find . -name 'test_*.py' -not -path './build/*' -not -path './install/*' | sort
           echo "--- running ---"
