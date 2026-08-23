@@ -45,6 +45,9 @@ jobs:
           python3 -m pip install --no-cache-dir \
             "numba>=0.59" scipy scikit-learn transforms3d \
             typing_extensions pytest
+          # cone_slam imports gtsam at module scope, so the SLAM tests cannot
+          # even be collected without it. Pin matches the runtime image.
+          python3 -m pip install --no-cache-dir "gtsam==4.3a0"
 
       - name: Build interface packages
         # dv_msgs / fs_msgs are ROS interface packages: their Python bindings
