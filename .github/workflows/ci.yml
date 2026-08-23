@@ -51,10 +51,33 @@ jobs:
           python3 -m pip install --no-cache-dir "numpy==1.24.*"
           python3 -m pip install --no-cache-dir \
             "numba>=0.59" scipy scikit-learn transforms3d \
-            typing_extensions
+            typing_extensions icecream
           # cone_slam imports gtsam at module scope, so the SLAM tests cannot
           # even be collected without it. Pin matches the runtime image.
           python3 -m pip install --no-cache-dir "gtsam==4.3a0"
+
+      - name: Install the FaSTTUBe planner
+        # path_planning's tests importorskip('fsd_path_planning'). Under the
+        # pytest 6 that ROS Humble ships, that module-level skip aborts the
+        # WHOLE collection session — every other package silently reported
+        # zero tests and the run exited 5. Installing the planner is the real
+        # fix: it removes the abort AND actually exercises the planner code
+        # the car runs, instead of skipping it.
+        #
+        # Recipe mirrors docker/dv_pipeline_stack/Dockerfile: upstream's
+        # pyproject.toml breaks under pip's build isolation (setuptools-scm in
+        # build-requires overrides the static version), so clone the pinned
+        # commit, replace pyproject with a minimal setup.py, install --no-deps.
+        shell: bash
+        run: |
+          git clone --depth 1 -q https://github.com/papalotis/ft-fsd-path-planning.git /tmp/fsd
+          cd /tmp/fsd
+          git fetch --depth 1 -q origin 0283c83125d1ad5d008d80b62f8750dad5f28fb3
+          git checkout -q 0283c83125d1ad5d008d80b62f8750dad5f28fb3
+          rm -f pyproject.toml
+          printf 'from setuptools import find_namespace_packages, setup\nsetup(name="fsd_path_planning", version="0.4.3.2", packages=find_namespace_packages(include=["fsd_path_planning", "fsd_path_planning.*"]), include_package_data=True)\n' > setup.py
+          pip install --no-cache-dir --no-deps .
+          python3 -c "import fsd_path_planning"
 
       - name: Build interface packages
         # dv_msgs / fs_msgs are ROS interface packages: their Python bindings
@@ -95,6 +118,12 @@ jobs:
           # The glob keeps this self-maintaining: a new <pkg>/test is picked
           # up automatically.
           python3 -m pytest $TEST_DIRS -q --no-header --junit-xml=pytest-results.xml
+          # Guard against the silent-abort mode returning: a real run is
+          # ~244 tests, so anything under 200 means collection broke even
+          # though pytest exited 0.
+          COLLECTED=$(sed -n 's/.*<testsuite[^>]*tests="\([0-9]*\)".*/\1/p' pytest-results.xml | head -1)
+          echo "collected: ${COLLECTED:-0} tests"
+          [ "${COLLECTED:-0}" -ge 200 ] || { echo "::error::only ${COLLECTED:-0} tests collected (expected ~244) — collection is broken"; exit 1; }
 
       - name: Upload results
         if: always()
