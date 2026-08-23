@@ -52,6 +52,9 @@ jobs:
         # cannot resolve from source alone. Only these two need building —
         # every other package under test is pure Python and is reached via
         # PYTHONPATH below. Takes ~7 s versus minutes for a full workspace build.
+        # shell: bash is REQUIRED — container jobs default to sh, where the
+        # `source` used by every ROS setup script does not exist.
+        shell: bash
         run: |
           source /opt/ros/humble/setup.bash
           colcon build --packages-select dv_msgs fs_msgs \
@@ -60,6 +63,7 @@ jobs:
       - name: pytest
         env:
           RCUTILS_LOGGING_SEVERITY: FATAL
+        shell: bash
         run: |
           source /opt/ros/humble/setup.bash
           source install/setup.bash
