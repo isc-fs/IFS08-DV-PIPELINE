@@ -70,9 +70,17 @@ jobs:
         run: |
           source /opt/ros/humble/setup.bash
           source install/setup.bash
+          # Pure-Python ament packages resolve from source; build/install/log
+          # are colcon artifacts, not source, so keep them off the path.
           export PYTHONPATH="$(ls -d */ | sed 's:/$::' | grep -vE '^(build|install|log)$' | tr '\n' ':')$PYTHONPATH"
-          python3 -m pytest \
-            $(find . -name 'test_*.py' -not -path './.git/*' -not -path './build/*' -not -path './install/*') \
+          echo "--- test files present ---"
+          find . -name 'test_*.py' -not -path './build/*' -not -path './install/*' | sort
+          echo "--- running ---"
+          # Let pytest discover rather than passing a shell-expanded list:
+          # discovery is order-stable and cannot silently collapse to a
+          # partial set through word splitting.
+          python3 -m pytest . \
+            --ignore=build --ignore=install --ignore=log \
             -q --no-header --junit-xml=pytest-results.xml
 
       - name: Upload results
