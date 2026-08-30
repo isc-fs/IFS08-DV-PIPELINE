@@ -387,6 +387,16 @@ class ControlNode(BaseLifecycleNode):
         # (found with tools/long_tuning/long_harness.py).
         self.declare_parameter("deadband_v", 0.05)
         self.declare_parameter("throttle_max", 0.2)
+        # v_meas conditioning for the longitudinal PI — real-car spike
+        # rejection at the INPUT (see pi_velocity._condition_velocity).
+        # Complements the deadband_v tune above: the deadband widens the
+        # region where small errors coast instead of flip-flopping, while
+        # this rejects the single-sample velocity glitches that make kp
+        # slam the throttle for a tick. tau is the EMA time constant;
+        # max_accel is the plausibility-clamp ceiling, set well above the
+        # true accel/decel envelope so it only rejects non-physical jumps.
+        self.declare_parameter("v_meas_tau", 0.15)
+        self.declare_parameter("v_meas_max_accel", 20.0)
         # Actuator slew limits (units = command-units per second). The
         # sim takes commands instantaneously; real actuators don't.
         # These rate-limit the published command at the boundary so
@@ -462,6 +472,8 @@ class ControlNode(BaseLifecycleNode):
                 ki=self._p("ki_v"),
                 deadband=self._p("deadband_v"),
                 throttle_max=self._p("throttle_max"),
+                v_meas_tau=self._p("v_meas_tau"),
+                v_meas_max_accel=self._p("v_meas_max_accel"),
             )
         else:
             raise ValueError(f"unknown longitudinal_controller={lon_name!r}")

@@ -32,9 +32,9 @@ from bringup.launch_common import (
 )
 
 
-# Opt-in /lidar/Lidar1/viz subsampling for browser-based visualisers.
+# Opt-in /lidar_points/viz subsampling for browser-based visualisers.
 # 0 (default) = disabled; >=2 = every-Nth-point cloud alongside the
-# full /lidar/Lidar1 feed. Autonomy stack always subscribes to the
+# full /lidar_points feed. Autonomy stack always subscribes to the
 # full cloud.
 try:
     LIDAR_VIZ_DECIMATION = int(os.environ.get("LIDAR_VIZ_DECIMATION", "0"))
@@ -59,7 +59,7 @@ _FOXGLOVE_TOPIC_WHITELIST = [
     "/control/v_set_mps", "/control/kappa_max_per_m",
     "/ctrl/cmd_internal",
     # Sensors actually plotted (no full LiDAR — viz only)
-    "/lidar/Lidar1/viz", "/imu", "/motor_rpm",
+    "/lidar_points/viz", "/imu", "/motor_rpm",
     # Diagnostic GT
     "/testing_only/odom", "/testing_only/track",
     # Lichtblick built-ins (interactive feature topics)

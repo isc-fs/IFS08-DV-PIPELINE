@@ -12,7 +12,7 @@
     Why not record from mc_backend directly: mc_backend is forced to
     FASTDDS_BUILTIN_TRANSPORTS=UDPv4 so its StartMission action client
     works cross-container. UDP fragmentation reassembly drops most of
-    the 1.4 MB /lidar/Lidar1 scans (96% loss measured in #465). Running
+    the 1.4 MB /lidar_points scans (96% loss measured in #465). Running
     the recorder in dv_pipeline_stack avoids that entirely.
 
     Always-on (started from pipeline.launch.py alongside ifssim_bridge

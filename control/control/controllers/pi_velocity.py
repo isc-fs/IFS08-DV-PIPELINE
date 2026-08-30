@@ -53,7 +53,9 @@ class PIVelocity(LongitudinalController):
                  ki: float = 0.05,
                  deadband: float = 0.2,
                  lookahead_curvature_s: float = 3.0,
-                 throttle_max: float = 0.6):
+                 throttle_max: float = 0.6,
+                 v_meas_tau: float = 0.15,
+                 v_meas_max_accel: float = 20.0):
         self.v_max = v_max
         self.a_lat_max = a_lat_max
         self.a_dec_max = a_dec_max
@@ -69,6 +71,27 @@ class PIVelocity(LongitudinalController):
         # state-estimator divergence can blow up. Regen stays at 1.0 so
         # the controller can still demand max stopping power.
         self.throttle_max = throttle_max
+        # v_meas conditioning. In the sim /odom.vx is clean (divergence from
+        # true ground speed measured at std 0.024 m/s on a 200 s autocross
+        # bag), so feeding it raw to kp is harmless. On the REAL car state.vx
+        # is uDV dead-reckoning / GSS — noisier, and it occasionally emits a
+        # spurious single-tick value (e.g. a 0 during a filter reset). Fed
+        # raw to kp that becomes an intermittent full-throttle/regen SPIKE:
+        # err jumps by ~v, u = kp·err saturates for a tick, then recovers.
+        # Two-stage conditioning rejects it at the INPUT — the #306 output
+        # slew can only delay a sustained spike, it cannot reject a glitch:
+        #   1. plausibility clamp — reject |Δv| beyond v_meas_max_accel·dt,
+        #      which no real vehicle can produce in one tick, so a glitch
+        #      sample is clipped to the achievable bound. Set well ABOVE the
+        #      car's true accel/decel envelope (~4-8 m/s²) so it only ever
+        #      catches non-physical jumps, never real dynamics.
+        #   2. EMA low-pass (τ = v_meas_tau) — smooth the residual noise the
+        #      P-term would otherwise amplify straight into torque.
+        # Loop gains are slow (kp=0.5, ki=0.05) so the ~0.15 s filter lag
+        # costs negligible phase margin.
+        self.v_meas_tau = v_meas_tau
+        self.v_meas_max_accel = v_meas_max_accel
+        self._v_filt: float | None = None
         self._integral = 0.0
         # Diagnostic side-channel — last computed values, for the
         # control node to publish on debug topics. Read these *after*
@@ -78,6 +101,7 @@ class PIVelocity(LongitudinalController):
 
     def reset(self) -> None:
         self._integral = 0.0
+        self._v_filt = None
 
     def compute(self, state: VehicleState, ref: ReferenceTrajectory) -> Tuple[float, float]:
         v_set = self._setpoint(state, ref)
@@ -93,7 +117,38 @@ class PIVelocity(LongitudinalController):
         # The sim-side single-quadrant regen fix (PR #160) ensures regen
         # commanded at vx ≤ 0 produces zero motor torque, so this can't
         # spiral even on transient reverse motion from collisions.
-        return self._track(state.vx, v_set)
+        return self._track(self._condition_velocity(state.vx), v_set)
+
+    # ----------------------------------------------------- v_meas conditioning
+
+    def _condition_velocity(self, v_raw: float) -> float:
+        """Reject non-physical single-tick jumps, then EMA low-pass. See the
+        __init__ rationale. Returns the raw sample on the first call (seeds
+        the filter)."""
+        if self._v_filt is None:
+            self._v_filt = v_raw
+            self._v_prev_raw = v_raw
+            return v_raw
+        # 1. Plausibility clamp, applied to the RAW stream — compared against
+        #    the previous RAW sample, NOT against the filtered estimate. The
+        #    filter legitimately lags during real acceleration, so clamping
+        #    against it would read that lag as a jump, clip genuine dynamics,
+        #    and compound its own lag (measured: 3.2 m/s error tracking a real
+        #    6 m/s² decel, vs 0.9 m/s from the EMA alone).
+        #    The CLAMPED value becomes the next reference: a one-sample glitch
+        #    must not capture the reference and make the following (correct)
+        #    sample look like a jump in the opposite direction.
+        max_dv = self.v_meas_max_accel * _DT
+        dv = v_raw - self._v_prev_raw
+        if dv > max_dv:
+            v_raw = self._v_prev_raw + max_dv
+        elif dv < -max_dv:
+            v_raw = self._v_prev_raw - max_dv
+        self._v_prev_raw = v_raw
+        # 2. EMA low-pass. alpha = dt / (tau + dt).
+        alpha = _DT / (self.v_meas_tau + _DT)
+        self._v_filt += alpha * (v_raw - self._v_filt)
+        return self._v_filt
 
     # ------------------------------------------------------------- setpoint
 

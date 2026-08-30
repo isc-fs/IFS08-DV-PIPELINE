@@ -1,0 +1,79 @@
+name: Stale branch report
+
+# This repo accumulated ~40 dead branches before a manual audit cleared them.
+# Most were not "unmerged work" — they were superseded (their content landed
+# under a different commit or a consolidated PR), which `git branch --merged`
+# cannot see, so nothing flagged them and they just piled up.
+#
+# This job reports; it never deletes. Auto-deleting on merge is handled by the
+# repo's "Automatically delete head branches" setting, which covers the easy
+# case. What is left needs a human to judge, so we surface it weekly instead
+# of guessing.
+on:
+  schedule:
+    - cron: '0 9 * * 1'   # Mondays 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  report:
+    name: Report stale branches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STALE_DAYS: '60'
+        shell: bash
+        run: |
+          DEFAULT=dev
+          git remote set-head origin -a >/dev/null 2>&1 || true
+          # Branches that head an OPEN pr are in flight by definition.
+          gh pr list --state open --json headRefName --jq '.[].headRefName' > /tmp/open_heads.txt || : > /tmp/open_heads.txt
+
+          NOW=$(date +%s)
+          {
+            echo "### Stale branch report"
+            echo
+            echo "Branches with no open PR and no commit in the last ${STALE_DAYS} days."
+            echo "\`merged\` means fully contained in \`${DEFAULT}\`; anything else needs a human"
+            echo "to check whether its content landed some other way before deleting."
+            echo
+            echo "| branch | last commit | ahead of ${DEFAULT} | state |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          COUNT=0
+          for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin \
+                        | grep -vE "^origin/(HEAD|${DEFAULT}|main)$"); do
+            b=${ref#origin/}
+            grep -qx "$b" /tmp/open_heads.txt && continue
+
+            ts=$(git log -1 --format=%ct "$ref" 2>/dev/null || echo "$NOW")
+            age=$(( (NOW - ts) / 86400 ))
+            [ "$age" -lt "${STALE_DAYS}" ] && continue
+
+            ahead=$(git rev-list --count "origin/${DEFAULT}..${ref}" 2>/dev/null || echo '?')
+            if [ "$ahead" = "0" ]; then state='merged — safe to delete'; else state="$ahead unmerged commit(s) — review"; fi
+            echo "| \`$b\` | ${age}d ago | $ahead | $state |" >> "$GITHUB_STEP_SUMMARY"
+            COUNT=$((COUNT+1))
+          done
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "| _none_ | | | nothing stale |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo
+            echo "**${COUNT}** stale branch(es). Delete one with:"
+            echo '```bash'
+            echo "git push origin --delete <branch>"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

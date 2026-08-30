@@ -16,7 +16,7 @@ record` locally inside mc_backend. That broke for LiDAR + cameras
 because mc_backend is forced to FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 (SHM cross-container doesn't work for its StartMission action
 client). UDP-only subscriber on multi-fragment messages drops 96 %
-of /lidar/Lidar1 scans. Running the recorder INSIDE dv_pipeline_stack
+of /lidar_points scans. Running the recorder INSIDE dv_pipeline_stack
 puts it in the same DDS context as the publishers — SHM transport,
 preallocated histories, no UDP fragmentation. Full 10 Hz LiDAR is
 captured cleanly.

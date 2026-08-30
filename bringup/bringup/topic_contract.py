@@ -28,7 +28,11 @@ from __future__ import annotations
 # Mirrors the pre-refactor table from
 # docker/dv_pipeline_stack/pipeline.launch.py.
 # ---------------------------------------------------------------------
-REMAP_LIDAR    = ("/fsds/lidar/Lidar1", "/lidar/Lidar1")
+# The IFSSIM bridge publishes the LiDAR on /lidar_points — the SAME topic
+# the car's Hesai driver uses — so sim and car are topic-identical for
+# perception and this sim remap matches REMAP_LIDAR_CAR exactly. A sim bag
+# then replays into either profile with no extra --remap.
+REMAP_LIDAR    = ("/fsds/lidar/Lidar1", "/lidar_points")
 REMAP_GSS      = ("/fsds/gss",          "/gss")
 REMAP_IMU      = ("/fsds/imu",          "/imu")
 REMAP_GT       = ("/fsds/testing_only/odom", "/testing_only/odom")
