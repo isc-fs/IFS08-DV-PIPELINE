@@ -48,7 +48,7 @@ type here is in the standard micro-ROS interface set.
 |---|---|---|
 | `/dv/status` | `std_msgs/UInt8` | pipeline lifecycle byte (IDLE/PREPARING/READY/RUNNING/FINISHED/EMERGENCY/FAILED). The prepare/run **handshake** — the uDV gates "go" on `READY`. **Publish ≥2 Hz** (the uDV's liveness watchdog on the DVPC). |
 | `/ctrl/cmd` | `geometry_msgs/Twist` | normalised command: `linear.x`=throttle, `angular.z`=steering, both [-1,1]. The uDV scales to physical units + clamps + actuates **only while AS Driving**. |
-| `/force_ebs` | `std_srvs/SetBool` (service, **served by the uDV**) | mission_control requests EBS here on emergency. |
+| `/force_ebs` | `std_srvs/SetBool` (service, **served by the uDV**) | mission_control also calls this on emergency, but it is **redundant + non-latching** — `/dv/status = EMERGENCY` is what actually latches the uDV's EBS. Treat `/force_ebs` as a bench actuator test / defense-in-depth hook. |
 
 The two `UInt8` byte topics are each other's heartbeats: a stale
 `/assi/state` makes mission_control reconcile to torn-down; a stale
