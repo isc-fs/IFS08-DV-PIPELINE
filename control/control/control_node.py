@@ -27,6 +27,7 @@ the longitudinal controller guarantees only one of them is non-zero.
 """
 from __future__ import annotations
 import math
+import time
 from typing import Optional
 
 import rclpy
@@ -132,6 +133,7 @@ class ControlNode(BaseLifecycleNode):
         self._emergency_pub = None
         self._v_set_pub = None
         self._kappa_max_pub = None
+        self._latency_pub = None
         self._sub_path = None
         self._sub_pose = None
         self._sub_odom = None
@@ -183,6 +185,8 @@ class ControlNode(BaseLifecycleNode):
             Float32, "/control/v_set_mps", 10)
         self._kappa_max_pub = self.create_lifecycle_publisher(
             Float32, "/control/kappa_max_per_m", 10)
+        self._latency_pub = self.create_lifecycle_publisher(
+            Float32, "/control/latency_ms", 10)
 
         # TF listener — post-#382 sim_supervisor publishes
         # odom→base_link (100 Hz dead-reckoning) and slam_node
@@ -190,7 +194,12 @@ class ControlNode(BaseLifecycleNode):
         # map→odom→base_link gives the leaf-pose used for waypoint
         # projection.
         self._tf_buffer = Buffer()
-        self._tf_listener = TransformListener(self._tf_buffer, self)
+        # spin_thread=False: this process already rclpy.spin()s the node.
+        # Humble's TransformListener default (True) adds the same node to a
+        # second executor, so every /tf sample is inserted twice and the
+        # second hit logs TF_OLD_DATA (equal timestamps are "from the past").
+        self._tf_listener = TransformListener(
+            self._tf_buffer, self, spin_thread=False)
 
         return TransitionCallbackReturn.SUCCESS
 
@@ -294,13 +303,14 @@ class ControlNode(BaseLifecycleNode):
             self.destroy_timer(self._tick_timer)
         self._tick_timer = None
         for pub in (self._cmd_pub, self._emergency_pub,
-                    self._v_set_pub, self._kappa_max_pub):
+                    self._v_set_pub, self._kappa_max_pub, self._latency_pub):
             if pub is not None:
                 self.destroy_publisher(pub)
         self._cmd_pub = None
         self._emergency_pub = None
         self._v_set_pub = None
         self._kappa_max_pub = None
+        self._latency_pub = None
         self._tf_listener = None
         self._tf_buffer = None
         self._drive = None
@@ -587,6 +597,7 @@ class ControlNode(BaseLifecycleNode):
         # Default: zero output. Anything that fails below leaves the car
         # commanding nothing rather than the previous tick's cached
         # response — fail-safe under SLAM/path dropout.
+        t0 = time.perf_counter()
         cmd = ControlCommand()
         cmd.throttle = 0.0
         cmd.steering = 0.0
@@ -600,6 +611,7 @@ class ControlNode(BaseLifecycleNode):
 
         if state is None or ref.empty:
             self._cmd_pub.publish(cmd)
+            self._publish_latency_ms(t0)
             return
 
         # Accumulate travel distance — used by the stop-latch guard to
@@ -624,6 +636,7 @@ class ControlNode(BaseLifecycleNode):
         # any internal accumulator (PI integral) lives on the drive controller.
         if self._drive is None:
             self._cmd_pub.publish(cmd)
+            self._publish_latency_ms(t0)
             return
 
         act = self._drive.compute(state, ref)
@@ -710,6 +723,21 @@ class ControlNode(BaseLifecycleNode):
                 f"path_n={len(ref.x)} path_len={ref.length:.1f}m "
                 f"stop_d={ref.stop_distance:.1f} latched={ref.stop_latched}"
             )
+        self._publish_latency_ms(t0)
+
+    def _publish_latency_ms(self, t0: float) -> None:
+        if self._latency_pub is None:
+            return
+        getter = getattr(self._latency_pub, "get_subscription_count", None)
+        if getter is not None:
+            try:
+                if int(getter()) <= 0:
+                    return
+            except Exception:
+                pass
+        msg = Float32()
+        msg.data = (time.perf_counter() - t0) * 1000.0
+        self._latency_pub.publish(msg)
 
     def _build_state(self) -> Optional[VehicleState]:
         """Compose VehicleState from two sources:

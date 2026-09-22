@@ -48,6 +48,78 @@ from cone_detection.rotations import vectors2matrix
 
 ConeFitBackend = Literal["template_dispatch", "two_param"]
 
+# Cap for the /lidar_points/ground viz cloud. Full cropped scans are still
+# tens of thousands of returns; Foxglove chokes before the multiply does.
+VIZ_GROUND_CLOUD_MAX_POINTS = 15_000
+
+
+def ground_rotation_matrix(plane_coefs: np.ndarray) -> np.ndarray:
+    """3×3 rotation that maps the RANSAC plane normal onto +z.
+
+    ``plane_coefs`` is ``[bias, n_x, n_y, n_z]`` from ``ransac2`` /
+    ``clustering_separation_rt``. Degenerate normals return identity.
+    """
+    k = np.zeros(3, dtype=np.float64)
+    k[-1] = 1.0
+    normal = np.asarray(plane_coefs[1:], dtype=np.float64)
+    nrm = float(np.linalg.norm(normal))
+    if nrm < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    return vectors2matrix(k, normal / nrm)
+
+
+def plane_floor_z(plane_coefs: np.ndarray) -> float:
+    """Signed height of the LiDAR origin above the RANSAC plane."""
+    normal = np.asarray(plane_coefs[1:], dtype=np.float64)
+    nrm = float(np.linalg.norm(normal))
+    if nrm < 1e-12:
+        return 0.0
+    return float(
+        np.dot(np.array([0.0, 0.0, -1.0 * float(plane_coefs[0])]), normal) / nrm
+    )
+
+
+def shift_rotated_ground_z0(
+    xyz: np.ndarray,
+    plane_coefs: np.ndarray,
+) -> np.ndarray:
+    """Shift an already-rotated cloud so the fitted floor sits at z=0."""
+    if xyz is None or len(xyz) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    out = np.ascontiguousarray(np.asarray(xyz, dtype=np.float32)[:, :3], dtype=np.float32)
+    out[:, 2] -= np.float32(plane_floor_z(plane_coefs))
+    return out
+
+
+def rotate_xyz_to_ground(
+    xyz: np.ndarray,
+    plane_coefs: np.ndarray,
+    *,
+    max_points: int = VIZ_GROUND_CLOUD_MAX_POINTS,
+    align_ground_z0: bool = True,
+) -> np.ndarray:
+    """Rotate a cloud into the same frame as ``/Conos_raw`` (ground ≈ z=0).
+
+    Detection rotates only above-ground outliers for DBSCAN. This helper
+    rotates a (possibly decimated) copy of the full cropped scan with the
+    same matrix, then optionally shifts z so the fitted floor sits at 0 —
+    matching the markers, which are published at ``z=0`` in ``base_link``.
+    """
+    if xyz is None or len(xyz) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    pts = np.asarray(xyz, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        return np.zeros((0, 3), dtype=np.float32)
+    if max_points > 0 and len(pts) > max_points:
+        stride = int(math.ceil(len(pts) / max_points))
+        pts = pts[::stride]
+    normal = np.asarray(plane_coefs[1:], dtype=np.float64)
+    nrm = float(np.linalg.norm(normal))
+    out = pts[:, :3] @ ground_rotation_matrix(plane_coefs)
+    if align_ground_z0 and nrm >= 1e-12:
+        out[:, 2] -= plane_floor_z(plane_coefs)
+    return np.ascontiguousarray(out, dtype=np.float32)
+
 
 @dataclass
 class ConeDetectionConfig:
@@ -258,17 +330,13 @@ def clustering_separation_rt(
     )
     if stage_timings is not None:
         stage_timings["ransac_ms"] = (time.perf_counter() - t_ransac) * 1000.0
-    k = np.zeros(data.shape[1])
-    k[-1] = 1
     outliers = np.ones(data.shape[0], dtype=bool)
     outliers[inliers] = False
     t_rotate = time.perf_counter()
     # Select outliers BEFORE rotating: row selection commutes with the
     # right-multiplied rotation, and rotating only the ~1% above-ground
     # points instead of the full cloud removes the dominant cost here.
-    data = data[outliers] @ vectors2matrix(
-        k, def_coefs[1:] / np.linalg.norm(def_coefs[1:])
-    )
+    data = data[outliers] @ ground_rotation_matrix(def_coefs)
     if stage_timings is not None:
         stage_timings["rotate_ms"] = (time.perf_counter() - t_rotate) * 1000.0
         stage_timings["n_outliers"] = float(len(data))
@@ -310,7 +378,7 @@ def clustering_separation_rt(
 class RealtimeConeDetector:
     """Configurable single-scan cone detector (see :class:`ConeDetectionConfig`)."""
 
-    __slots__ = ("config", "_prev_plane")
+    __slots__ = ("config", "_prev_plane", "last_rotated_xyz", "last_outlier_xyz")
 
     def __init__(self, config: ConeDetectionConfig | None = None) -> None:
         self.config = config or ConeDetectionConfig()
@@ -318,6 +386,12 @@ class RealtimeConeDetector:
         # the plane barely moves frame to frame, so the warm candidate
         # usually wins immediately and collapses the iteration budget.
         self._prev_plane: np.ndarray | None = None
+        # Last scan's cropped cloud after the same RANSAC rotation used
+        # for clustering, ground shifted to z=0. Only filled when
+        # ``viz_full_cloud=True`` (the /lidar_points/ground path).
+        self.last_rotated_xyz: np.ndarray = np.zeros((0, 3), dtype=np.float32)
+        # RANSAC outliers after rotation + z-shift — what DBSCAN sees.
+        self.last_outlier_xyz: np.ndarray = np.zeros((0, 3), dtype=np.float32)
 
     def detect(
         self,
@@ -328,9 +402,13 @@ class RealtimeConeDetector:
         clustering_class: type = DBSCAN,
         stage_timings: dict[str, float] | None = None,
         ransac_iter_subsample_max: int = 5000,
+        viz_full_cloud: bool = False,
     ) -> list[tuple[float, float, float, float]]:
         """Detect cones in a single LiDAR scan (same contract as ``final_cone_result_rt``)."""
         cfg = self.config
+        empty = np.zeros((0, 3), dtype=np.float32)
+        self.last_rotated_xyz = empty
+        self.last_outlier_xyz = empty
         if len(data) == 0:
             return []
         # Range pre-crop: drop far points before the O(n) RANSAC + DBSCAN
@@ -353,6 +431,12 @@ class RealtimeConeDetector:
             initial_plane=self._prev_plane,
         )
         self._prev_plane = def_coefs
+        # Outliers are already rotated inside clustering_separation_rt.
+        # Only the z-shift is extra; the full-crop rotate is deferred
+        # until a viz subscriber actually wants /lidar_points/ground.
+        self.last_outlier_xyz = shift_rotated_ground_z0(clean_data, def_coefs)
+        if viz_full_cloud:
+            self.last_rotated_xyz = rotate_xyz_to_ground(data, def_coefs)
         if len(labels) == 0:
             return []
         t_cluster_prep = time.perf_counter()
