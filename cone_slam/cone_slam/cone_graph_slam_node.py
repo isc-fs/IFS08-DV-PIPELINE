@@ -527,6 +527,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._finished_pub = None
         self._final_lap_pub = None
         self._stop_request_pub = None
+        self._pub_hz = None
+        self._pub_latency_ms = None
+        self._pub_age_ms = None
+        self._pub_commit_ms = None
+        self._pub_map_size = None
+        self._pub_n_obs = None
 
     # ------------------------------------------------------------------
     # Run-memory reset
@@ -731,6 +737,24 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._stop_request_pub = self.create_lifecycle_publisher(
             Bool, "/slam/stop_request", finished_qos
         )
+        self._pub_hz = self.create_lifecycle_publisher(
+            Float32, "/cone_slam/hz", 10
+        )
+        self._pub_latency_ms = self.create_lifecycle_publisher(
+            Float32, "/cone_slam/latency_ms", 10
+        )
+        self._pub_age_ms = self.create_lifecycle_publisher(
+            Float32, "/cone_slam/age_ms", 10
+        )
+        self._pub_commit_ms = self.create_lifecycle_publisher(
+            Float32, "/cone_slam/commit_ms", 10
+        )
+        self._pub_map_size = self.create_lifecycle_publisher(
+            Float32, "/cone_slam/map_size", 10
+        )
+        self._pub_n_obs = self.create_lifecycle_publisher(
+            Float32, "/cone_slam/n_obs", 10
+        )
 
         # TF broadcaster — non-lifecycle (tf2 doesn't ship lifecycle
         # variants). Used to publish the dynamic `map → odom` drift
@@ -933,6 +957,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             self._gt_aligned_pub,
             self._gt_error_pub,
             self._finished_pub,
+            self._pub_hz,
+            self._pub_latency_ms,
+            self._pub_age_ms,
+            self._pub_commit_ms,
+            self._pub_map_size,
+            self._pub_n_obs,
         ):
             if pub is not None:
                 self.destroy_publisher(pub)
@@ -945,6 +975,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         self._finished_pub = None
         self._final_lap_pub = None
         self._stop_request_pub = None
+        self._pub_hz = None
+        self._pub_latency_ms = None
+        self._pub_age_ms = None
+        self._pub_commit_ms = None
+        self._pub_map_size = None
+        self._pub_n_obs = None
 
         # tf2 broadcasters are not lifecycle-aware; drop the ref.
         # The static map→odom broadcaster was retired in #382 (map→odom
@@ -1997,6 +2033,11 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             f"corr=({dx:+.2f},{dy:+.2f}|{corr_mag:.2f}m,"
             f"{np.degrees(dyaw):+.1f}deg)"
         )
+        hz = 1000.0 / dt_pub_ms if dt_pub_ms > 1e-3 else 0.0
+        self._publish_f32(self._pub_hz, hz)
+        self._publish_f32(self._pub_latency_ms, proc_ms)
+        self._publish_f32(self._pub_age_ms, age_ms)
+        self._publish_f32(self._pub_map_size, float(len(self._db)))
 
     def _emit_slam_prof(self, tag: str, n_obs: int) -> None:
         """Emit the per-scan latency breakdown (SLAM_PROF) so we can see
@@ -2071,6 +2112,23 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             f"db={db:5.1f} pub={pub:5.1f} "
             f"obs={n_obs} map={len(self._db)}"
         )
+        if commit == commit:  # skip NaN (cascade-skip path has no commit)
+            self._publish_f32(self._pub_commit_ms, commit)
+        self._publish_f32(self._pub_n_obs, float(n_obs))
+
+    def _publish_f32(self, pub, value: float) -> None:
+        if pub is None:
+            return
+        getter = getattr(pub, "get_subscription_count", None)
+        if getter is not None:
+            try:
+                if int(getter()) <= 0:
+                    return
+            except Exception:
+                pass
+        msg = Float32()
+        msg.data = float(value)
+        pub.publish(msg)
 
     def _publish_state(self, stamp, result: ScanResult) -> None:
         msg = Odometry()
