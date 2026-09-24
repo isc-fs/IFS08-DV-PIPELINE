@@ -37,7 +37,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from fs_msgs.msg import ControlCommand
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, Float32
-from visualization_msgs.msg import MarkerArray
+from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from transforms3d.euler import quat2euler
@@ -217,6 +217,14 @@ class ControlNode(BaseLifecycleNode):
         self._last_steering = 0.0
         self._tick_count = 0
 
+        # Controller-internal state (PI integrator, Stanley steer-rate
+        # warm start) lives in the strategy objects, which are built in
+        # on_configure and survive deactivate→activate. Clear them too,
+        # or a wound-up integral from the previous run produces a
+        # throttle/regen transient on the next start.
+        if self._drive is not None:
+            self._drive.reset()
+
         # Post-#384: the bridge's EBS gate is owned by the supervisor;
         # the supervisor publishes /signal/ebs_reset itself on
         # Phase 1 ready (mirrors what the uDV firmware does on the
@@ -224,7 +232,9 @@ class ControlNode(BaseLifecycleNode):
         # /ctrl/emergency now — publish the initial default-false
         # latched value so a late-joining mission_control sees a
         # defined state immediately.
-        self._emergency_pub.publish(Bool(data=False))
+        # LifecyclePublisher.publish() is a silent no-op until the base
+        # class on_activate() enables the managed publishers, so this
+        # one-shot publish happens after super() below.
 
         # Subscriptions
         self._sub_path = self.create_subscription(
@@ -257,7 +267,11 @@ class ControlNode(BaseLifecycleNode):
         self._tick_timer = self.create_timer(
             1.0 / self.PUBLISH_RATE_HZ, self._tick)
 
-        return super().on_activate(state)
+        ret = super().on_activate(state)
+        if ret != TransitionCallbackReturn.SUCCESS:
+            return ret
+        self._emergency_pub.publish(Bool(data=False))
+        return ret
 
     def on_deactivate(
         self, state: LifecycleState
@@ -538,7 +552,11 @@ class ControlNode(BaseLifecycleNode):
         across laps."""
         if self._stop_latched or self._latest_pose is None:
             return
-        if len(msg.markers) < 2:
+        # cone_detection_node leads every array with a pose-less DELETEALL
+        # marker (viewer refresh); only ADD markers are cones. Including the
+        # leader in the centroid would pull the gate toward the origin.
+        cones = [m for m in msg.markers if m.action != Marker.DELETEALL]
+        if len(cones) < 2:
             return
         if self._travelled < self.get_parameter("stop_latch_min_travel").value:
             return
@@ -556,9 +574,9 @@ class ControlNode(BaseLifecycleNode):
         if not self._final_lap:
             return
         # Centroid in base_link
-        n = len(msg.markers)
-        sx = sum(m.pose.position.x for m in msg.markers) / n
-        sy = sum(m.pose.position.y for m in msg.markers) / n
+        n = len(cones)
+        sx = sum(m.pose.position.x for m in cones) / n
+        sy = sum(m.pose.position.y for m in cones) / n
         # base_link → odom using current absolute pose from SLAM
         o = self._latest_pose
         q = o.pose.pose.orientation

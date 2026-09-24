@@ -1101,9 +1101,19 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             self._latest_rpm is not None
             and abs(self._latest_rpm) <= STATIONARY_SPEED_MS
         )
-        self._preint.push_sample(
-            ImuSample(t=t, accel=accel, gyro=gyro, stationary=stationary)
-        )
+        # Buffer raw samples only while someone will consume them: the
+        # INIT bias calibration (both motion models) and the legacy IMU
+        # preintegration factor (motion_model=imu). In the default
+        # motion_model=odom the EKF's /odom delta is the motion source and
+        # integrate_to() is never called, so an unconditional push would
+        # grow the preintegrator buffer without bound for the whole run
+        # (~400 samples/s → ~100 MB over a 10 min session).
+        if self._preint is not None and (
+            self._state != State.SLAM_RUNNING or self._motion_model == "imu"
+        ):
+            self._preint.push_sample(
+                ImuSample(t=t, accel=accel, gyro=gyro, stationary=stationary)
+            )
 
         if self._state == State.INIT_WAITING_IMU:
             self._calib_started_t = t
@@ -1238,7 +1248,17 @@ class ConeGraphSlamNode(BaseLifecycleNode):
                 self._publish_cone_map(stamp)
                 return
             between_pose = self._prev_scan_odom_pose.inverse().compose(cur_odom_pose)
-            v_world = self._odom_world_velocity(self._latest_supervisor_odom)
+            # Motion prediction at X(k): prev SLAM pose ∘ EKF delta. This is
+            # the same value stage_odom_motion_step seeds X(k) with; computed
+            # here too because the velocity below must be expressed in the
+            # SLAM (map) frame — i.e. rotated through the *predicted map yaw*,
+            # not the /odom-frame yaw. The two frames differ by the map→odom
+            # drift correction, so rotating with the odom yaw would put V(k)
+            # (and the /slam/pose twist derived from it) off by that dyaw.
+            predicted_pose = self._latest_result.pose.compose(between_pose)
+            v_world = self._odom_world_velocity(
+                self._latest_supervisor_odom, predicted_pose.rotation().yaw()
+            )
             # Localization-only fork: once the lap is closed and mapping is
             # frozen, stop growing the smoothed graph. Solve a fixed-size
             # pose-only problem against the frozen map instead — no iSAM2
@@ -1248,7 +1268,7 @@ class ConeGraphSlamNode(BaseLifecycleNode):
             if self._mapping_frozen and bool(self.get_parameter(
                     "localization_only_after_loop_close").value):
                 self._prev_scan_odom_pose = cur_odom_pose
-                predicted_pose = self._latest_result.pose.compose(between_pose)
+                # predicted_pose already computed above from the EKF delta.
                 # Mission-completion (#384): keep counting laps after the
                 # mapping-freeze switched us to the localization-only path.
                 if self._lap_counter.update(
@@ -1807,18 +1827,20 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         )
 
     @staticmethod
-    def _odom_world_velocity(msg: Odometry) -> np.ndarray:
-        """World-frame (nav-frame) velocity from a nav_msgs/Odometry.
+    def _odom_world_velocity(msg: Odometry, map_yaw: float) -> np.ndarray:
+        """SLAM-frame (map / nav-frame) velocity from a nav_msgs/Odometry.
 
         GTSAM's V(k) lives in the navigation frame, but nav_msgs/Odometry
         twist is expressed in child_frame_id (base_link / body). Rotate
-        the planar body velocity through the pose yaw; z is taken as-is
-        (flat track). Used to seed and softly anchor V(k) in
-        ``motion_model='odom'`` so the velocity node stays determined
-        without an IMU factor.
+        the planar body velocity through ``map_yaw`` — the car's yaw in
+        the SLAM map frame (the motion-predicted yaw at X(k)) — NOT the
+        yaw carried in ``msg.pose`` (that one is in the ``odom`` frame,
+        which differs from ``map`` by the map→odom drift correction).
+        z is taken as-is (flat track). Used to seed and softly anchor
+        V(k) in ``motion_model='odom'`` so the velocity node stays
+        determined without an IMU factor.
         """
-        pose = _odom_to_pose3(msg)
-        yaw = pose.rotation().yaw()
+        yaw = float(map_yaw)
         vb = msg.twist.twist.linear
         c, s = np.cos(yaw), np.sin(yaw)
         return np.array(
@@ -2440,7 +2462,12 @@ class ConeGraphSlamNode(BaseLifecycleNode):
         keyframe_every = int(
             self.get_parameter("cone_map_full_publish_every_n_scans").value
         )
-        keyframe = keyframe_every > 0 and (self._graph.step % keyframe_every == 0)
+        # Use the monotonic scan counter, not the bare graph step: once
+        # mapping is frozen and we're in localization-only mode the iSAM2
+        # step stops advancing, so `step % N` would either never fire again
+        # or fire on every scan for the rest of the run.
+        scan_idx = self._graph.step + self._loc_scan
+        keyframe = keyframe_every > 0 and (scan_idx % keyframe_every == 0)
         self._publish_full_cone_map(stamp, min_obs, keyframe=keyframe)
 
         # Periodic diagnostic — every ~5 s of /Conos publishes,
