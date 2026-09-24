@@ -171,6 +171,26 @@ class ConeDetectionConfig:
     dbscan_eps: float = 0.3
     dbscan_min_samples: int = 2
 
+    # DBSCAN memory/time guard. sklearn's DBSCAN materialises EVERY point's
+    # full neighbour list (radius_neighbors), so its cost is
+    # O(N × neighbours-within-eps), i.e. quadratic in point density. A scan
+    # whose above-ground cloud is both large and dense — tire walls, car
+    # off-track facing terrain / an object at close range, or a mis-fitted
+    # ground plane that turns the ground itself into "outliers" — blows
+    # straight through the container: measured 90k pts @ 20k pts/m² → 4.7 GB
+    # peak, 11 s, ~2.6 GB never returned to the OS. Two such scans OOM-kill
+    # the node (8 GB limit) after stalling SLAM for seconds. A cone scene is
+    # nowhere near: ~100 cones × ≤200 pts ≈ 20k worst case, typically 1-2k.
+    #
+    # Above dbscan_max_points the cloud is voxel-deduplicated, starting at
+    # dbscan_guard_voxel_m and doubling the cell up to dbscan_guard_voxel_max_m
+    # until the count fits, then uniformly subsampled to the cap as a last
+    # resort. Normal scans never trigger it. Set dbscan_max_points to 0 to
+    # disable.
+    dbscan_max_points: int = 20_000
+    dbscan_guard_voxel_m: float = 0.02
+    dbscan_guard_voxel_max_m: float = 0.10
+
     # Tall-column veto (tire walls, fences, people): before DBSCAN, drop EVERY
     # point whose xy grid cell (3x3-dilated) contains a return more than
     # tall_column_veto_height_m above the fitted ground plane. No cone exceeds
@@ -289,6 +309,55 @@ def _tall_column_veto_mask(
     return ~np.isin(keys, veto_keys)
 
 
+# Voxel keys for the DBSCAN guard: per-axis index offset into [0, 2^21) and
+# packed into 63 bits. Injective for |index| < 2^20, i.e. any coordinate
+# within ±20 km at the 0.02 m default cell — far beyond LiDAR range.
+_GUARD_KEY_OFFSET = 1 << 20
+_GUARD_KEY_BITS = 21
+
+
+def _voxel_first_points(data: np.ndarray, voxel_m: float) -> np.ndarray:
+    """Keep the first point of every ``voxel_m`` cell (row order preserved)."""
+    ijk = np.floor(data[:, :3] / voxel_m).astype(np.int64) + _GUARD_KEY_OFFSET
+    keys = (
+        (ijk[:, 0] << (2 * _GUARD_KEY_BITS))
+        | (ijk[:, 1] << _GUARD_KEY_BITS)
+        | ijk[:, 2]
+    )
+    _, first = np.unique(keys, return_index=True)
+    return data[np.sort(first)]
+
+
+def _bound_dbscan_input(
+    data: np.ndarray, cfg: ConeDetectionConfig
+) -> np.ndarray:
+    """Cap the density and count of the cloud handed to DBSCAN.
+
+    No-op (returns ``data`` itself) while ``len(data) <= dbscan_max_points``
+    or the guard is disabled. See ``ConeDetectionConfig.dbscan_max_points``
+    for the rationale. Row order is preserved so downstream label handling
+    is unaffected.
+    """
+    cap = int(cfg.dbscan_max_points)
+    if cap <= 0 or len(data) <= cap:
+        return data
+    voxel = float(cfg.dbscan_guard_voxel_m)
+    while (
+        voxel > 0.0
+        and voxel <= cfg.dbscan_guard_voxel_max_m + 1e-9
+        and len(data) > cap
+    ):
+        data = _voxel_first_points(data, voxel)
+        voxel *= 2.0
+    if len(data) > cap:
+        # Seeded per scan size so a given input is reproducible; the choice
+        # itself is uniform, so each cone keeps a proportional share.
+        rng = np.random.default_rng(len(data))
+        keep = rng.choice(len(data), cap, replace=False)
+        data = data[np.sort(keep)]
+    return data
+
+
 def clustering_separation_rt(
     data: np.ndarray,
     config: ConeDetectionConfig | None = None,
@@ -343,6 +412,7 @@ def clustering_separation_rt(
     if len(data) == 0:
         if stage_timings is not None:
             stage_timings["dbscan_ms"] = 0.0
+            stage_timings["n_dbscan_guard_dropped"] = 0.0
         return np.array([]), data, def_coefs
     if cfg.tall_column_veto:
         t_veto = time.perf_counter()
@@ -364,7 +434,13 @@ def clustering_separation_rt(
         if len(data) == 0:
             if stage_timings is not None:
                 stage_timings["dbscan_ms"] = 0.0
+                stage_timings["n_dbscan_guard_dropped"] = 0.0
             return np.array([]), data, def_coefs
+    # Memory guard — see ConeDetectionConfig.dbscan_max_points.
+    n_before_guard = len(data)
+    data = _bound_dbscan_input(data, cfg)
+    if stage_timings is not None:
+        stage_timings["n_dbscan_guard_dropped"] = float(n_before_guard - len(data))
     clust_model = clustering_class(
         eps=cfg.dbscan_eps, min_samples=cfg.dbscan_min_samples
     )
@@ -422,14 +498,22 @@ class RealtimeConeDetector:
                 return []
         if debug_counters is not None:
             debug_counters["n_input_points"] = len(data)
+        # Always collect stage bookkeeping so the DBSCAN guard can be
+        # surfaced through debug_counters even when the caller does not ask
+        # for timings (a handful of perf_counter calls — negligible).
+        st = stage_timings if stage_timings is not None else {}
         labels, clean_data, def_coefs = clustering_separation_rt(
             data,
             cfg,
             clustering_class=clustering_class,
-            stage_timings=stage_timings,
+            stage_timings=st,
             ransac_iter_subsample_max=ransac_iter_subsample_max,
             initial_plane=self._prev_plane,
         )
+        if debug_counters is not None:
+            dropped = int(st.get("n_dbscan_guard_dropped", 0))
+            debug_counters["dbscan_guard_dropped"] = dropped
+            debug_counters["dbscan_guard_scans"] = int(dropped > 0)
         self._prev_plane = def_coefs
         # Outliers are already rotated inside clustering_separation_rt.
         # Only the z-shift is extra; the full-crop rotate is deferred

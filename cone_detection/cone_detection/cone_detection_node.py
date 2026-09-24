@@ -405,6 +405,18 @@ class ConeDetectionNode(BaseLifecycleNode):
             }
         )
 
+        if per_scan.get("dbscan_guard_scans", 0):
+            # Loud but throttled: this scan was NOT a cone scene (car facing
+            # terrain / an object, or a bad ground plane). Without the guard
+            # it would have cost seconds and gigabytes — see
+            # ConeDetectionConfig.dbscan_max_points.
+            self.get_logger().warning(
+                "DBSCAN guard: above-ground cloud too large/dense, dropped "
+                f"{per_scan.get('dbscan_guard_dropped', 0)} pts before "
+                "clustering (car off-track or ground plane mis-fit?)",
+                throttle_duration_sec=5.0,
+            )
+
         for k, v in per_scan.items():
             self._diag[k] = self._diag.get(k, 0) + v
         self._diag_n_scans += 1
@@ -432,6 +444,7 @@ class ConeDetectionNode(BaseLifecycleNode):
                 f"R={self._diag.get('accepted_right', 0) / n:4.1f} "
                 f"C={self._diag.get('accepted_centerline', 0) / n:.1f} "
                 f"BO={self._diag.get('accepted_bigorange', 0) / n:.1f} "
+                f"dbscan_guard={self._diag.get('dbscan_guard_scans', 0)}/{n} "
                 f"hz={hz:4.1f}"
             )
             self._reset_diag()
@@ -459,9 +472,26 @@ class ConeDetectionNode(BaseLifecycleNode):
         stamp: Time,
         big_orange_threshold_m: float,
     ) -> tuple[MarkerArray, MarkerArray]:
-        """Build /Conos_raw and /Conos_Orange MarkerArrays from detections."""
+        """Build /Conos_raw and /Conos_Orange MarkerArrays from detections.
+
+        Both arrays start with a dedicated pose-less ``DELETEALL`` leader
+        so RViz/Foxglove drop the previous scan's cubes, followed by one
+        ``ADD`` marker per cone. The leader carries no cone: every
+        consumer (slam_node, control_node, path_planning) skips markers
+        with ``action == DELETEALL``, so a cone must never ride on it.
+        (Before this, the first *real* cone was emitted as the DELETEALL
+        marker itself and SLAM silently dropped one cone per scan.)
+        """
         marker_array = MarkerArray()
         orange_array = MarkerArray()
+
+        for arr in (marker_array, orange_array):
+            clear = Marker()
+            clear.header.frame_id = "base_link"
+            clear.header.stamp = stamp
+            clear.action = Marker.DELETEALL
+            arr.markers.append(clear)
+
         marker_index = 0
         orange_index = 0
 
@@ -475,8 +505,7 @@ class ConeDetectionNode(BaseLifecycleNode):
             # /Conos_raw is published in the body frame; SLAM transforms to map.
             marker.header.frame_id = "base_link"
             marker.type = Marker.CUBE
-            # First marker clears whatever RViz/Foxglove held (DELETEALL).
-            marker.action = Marker.DELETEALL if marker_index == 0 else Marker.ADD
+            marker.action = Marker.ADD
             marker.header.stamp = stamp
             # marker.scale carries per-cone metadata for downstream SLAM:
             #   scale.x → σ_xy in metres (position uncertainty); sigma_xy < 0
@@ -502,9 +531,7 @@ class ConeDetectionNode(BaseLifecycleNode):
                 orange.header.frame_id = "base_link"
                 orange.header.stamp = stamp
                 orange.type = Marker.CUBE
-                orange.action = (
-                    Marker.DELETEALL if orange_index == 0 else Marker.ADD
-                )
+                orange.action = Marker.ADD
                 orange.pose.position.x = cone.x
                 orange.pose.position.y = cone.y
                 orange.pose.position.z = 0.0
